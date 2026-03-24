@@ -455,6 +455,52 @@ if current_version > cached_version {
 
 ## Security Considerations
 
+### Business Config Immutable Fields (Business-Config Contract)
+
+The Business Config contract enforces immutability guarantees for specific fields to ensure configuration integrity:
+
+#### Immutable Fields
+
+| Field | Description | Behavior |
+|-------|-------------|----------|
+| `business` | Business address identifier | Never changes after initial config creation; acts as primary storage key |
+| `created_at` | Creation timestamp | Set once on initial config creation; preserved across all subsequent updates |
+
+#### Mutable Fields
+
+| Field | Description | Behavior |
+|-------|-------------|----------|
+| `version` | Configuration version | Increments by 1 on each update operation |
+| `updated_at` | Last update timestamp | Changes to current ledger time on each update |
+| All policy fields | Anomaly policy, integrations, expiry, fees, compliance | Can be updated via admin operations |
+
+#### Immutability Guarantees
+
+1. **Business Address Stability**: The business address serves as the primary key for business-specific configuration. Once set via `set_business_config`, the business field remains constant regardless of subsequent updates through any method (`update_anomaly_policy`, `update_integrations`, etc.)
+
+2. **Created Timestamp Preservation**: The `created_at` timestamp is set exactly once during initial configuration creation and is never modified by update operations. This provides a reliable audit trail for when a business configuration was first established.
+
+3. **Cross-Update Consistency**: All update operations (partial updates via specialized methods and full updates via `set_business_config`) preserve both immutable fields while modifying mutable fields appropriately.
+
+#### Regression Test Coverage
+
+The contract includes comprehensive immutable field regression tests covering:
+- Business address immutability across all 6 update methods
+- Created timestamp preservation across all update operations  
+- Version increment correctness (mutable field behavior)
+- Business isolation (configs properly keyed by business address)
+- Full lifecycle tests (create, update, read cycles)
+- Performance tests with many businesses
+- Edge cases: rapid updates, boundary values, empty configs
+
+**Test Location**: `contracts/business-config/src/test.rs`
+**Test Categories**: `immutable_field_tests`, `adversarial_regression_tests`, `performance_regression_tests`
+
+#### Known Design Considerations
+
+- **Global Defaults**: When no custom business config exists, the contract returns global defaults. The business field in global defaults uses the admin/caller address as a placeholder and may change when global defaults are updated. This is a known design quirk - global defaults are not business-specific.
+- **Mock Environment**: In test environments, ledger timestamps may be 0, which affects `created_at` and `updated_at` fields. Tests account for this by verifying immutability rather than specific timestamp values.
+
 ### Validation Rules
 
 - `network_id` cannot be 0 (reserved)
