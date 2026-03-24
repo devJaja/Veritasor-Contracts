@@ -518,6 +518,26 @@ Per distribution record:
 
 **Example:** 50 stakeholders = ~900 bytes per distribution
 
+## Related: Revenue curve pricing and extreme-input assumptions
+
+The **revenue-curve** contract (`contracts/revenue-curve`) prices terms from revenue and anomaly scores and can require a live attestation on `calculate_pricing`. It is **not** the revenue-share distributor, but shares protocol context (attested revenue, periods).
+
+### Expected behavior under stress
+
+- **Anomaly score**: Must be **0–100** inclusive; **101+** panics (deterministic failure mode for both `calculate_pricing` and `get_pricing_quote`).
+- **Risk and APR arithmetic**: `anomaly_score * risk_premium_bps_per_point` and `base_apr_bps + risk_premium_bps` use **saturating `u64` intermediates** capped at **`u32::MAX`** so adversarial admin parameters cannot cause silent `u32` wrap. The published `risk_premium_bps` in `PricingOutput` reflects that saturated product. Final **`apr_bps`** is still **clamped** to `[min_apr_bps, max_apr_bps]`.
+- **Tier selection**: Among tiers with `revenue >= min_revenue`, the contract selects the **maximum** `discount_bps`. If two tiers **tie** on discount, the **earlier** tier in the admin-configured order wins (implementation uses strict `>` on discount).
+- **Revenue range**: `revenue` is **`i128`**. Negative `min_revenue` thresholds are allowed at configuration time, so negative `revenue` can match a tier in unusual configurations; typical deployments use non-negative revenues and thresholds.
+- **Gas / performance**: `get_pricing_quote` scans all tiers (**O(tiers)**). `calculate_pricing` performs the same math plus **cross-contract** attestation reads. Very large tier vectors increase cost linearly.
+
+### Tests and verification
+
+Deterministic and failure-mode coverage (including saturated risk, `i128::MIN` / `i128::MAX`, many tiers, tied discounts, alignment of quote vs attested `calculate_pricing`) is in **`contracts/revenue-curve/src/test.rs`**. Run:
+
+```bash
+cargo test -p veritasor-revenue-curve
+```
+
 ## Limitations
 
 1. **Maximum stakeholders**: 50 (configurable limit for gas efficiency)
