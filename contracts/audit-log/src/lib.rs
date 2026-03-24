@@ -1,15 +1,19 @@
 //! # On-Chain Audit Log Contract
 //!
 //! Append-only audit log for key protocol actions. Records reference
-//! originating contracts and actors. Strong integrity: append-only.
+//! originating contracts and actors. Strong integrity: append-only
+//! and tamper-evident via hash chaining.
 //!
 //! ## Record schema
 //!
-//! Each entry stores: actor, source contract, action type, optional payload hash, ledger timestamp.
+//! Each entry stores: actor, source contract, action type, optional payload hash,
+//! ledger timestamp, previous entry hash, and current entry hash.
 //! Ordered by sequence number. Queries by actor or by contract supported via indexes.
 
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+
+use soroban_sdk::xdr::ToXdr;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
 use veritasor_common::replay_protection;
 
 #[cfg(test)]
@@ -24,6 +28,8 @@ pub enum DataKey {
     Admin,
     /// Next sequence number (monotonic).
     NextSeq,
+    /// Hash of the latest appended entry (chain head).
+    LastHash,
     /// Log entry by sequence number.
     Entry(u64),
     /// Index: actor -> list of seq numbers (append-only).
@@ -48,6 +54,51 @@ pub struct AuditRecord {
     pub payload: String,
     /// Ledger sequence at append time.
     pub ledger_seq: u32,
+    /// Hash of the previous entry in the chain.
+    pub prev_hash: BytesN<32>,
+    /// Hash of this entry.
+    pub entry_hash: BytesN<32>,
+}
+
+/// Deterministic material used to derive the tamper-evident entry hash.
+#[contracttype]
+#[derive(Clone, Debug)]
+struct AuditRecordHashInput {
+    pub seq: u64,
+    pub actor: Address,
+    pub source_contract: Address,
+    pub action: String,
+    pub payload: String,
+    pub ledger_seq: u32,
+    pub prev_hash: BytesN<32>,
+}
+
+fn zero_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0; 32])
+}
+
+fn compute_entry_hash(
+    env: &Env,
+    seq: u64,
+    actor: &Address,
+    source_contract: &Address,
+    action: &String,
+    payload: &String,
+    ledger_seq: u32,
+    prev_hash: &BytesN<32>,
+) -> BytesN<32> {
+    let hash_input = AuditRecordHashInput {
+        seq,
+        actor: actor.clone(),
+        source_contract: source_contract.clone(),
+        action: action.clone(),
+        payload: payload.clone(),
+        ledger_seq,
+        prev_hash: prev_hash.clone(),
+    };
+
+    let encoded = hash_input.to_xdr(env);
+    env.crypto().sha256(&encoded).into()
 }
 
 #[contract]
@@ -56,7 +107,6 @@ pub struct AuditLogContract;
 #[contractimpl]
 impl AuditLogContract {
     /// Initialize with admin. Only admin can authorize emitters.
-    /// Initialize the audit log with an admin address.
     ///
     /// # Replay Protection
     /// Uses admin address and `NONCE_CHANNEL_ADMIN` channel.
@@ -70,11 +120,19 @@ impl AuditLogContract {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextSeq, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHash, &zero_hash(&env));
     }
 
     /// Add an audit record. Callable by admin with replay protection.
+    ///
+    /// Each appended entry is chained to the previous one via `prev_hash`.
+    /// This makes any modification of historical entries detectable because
+    /// the chain head would no longer be reproducible.
     ///
     /// # Replay Protection
     /// Uses admin address and `NONCE_CHANNEL_ADMIN` channel.
@@ -102,8 +160,27 @@ impl AuditLogContract {
 
         // Verify and increment nonce for replay protection
         replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+
         let seq: u64 = env.storage().instance().get(&DataKey::NextSeq).unwrap_or(0);
         let ledger_seq = env.ledger().sequence();
+
+        let prev_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastHash)
+            .unwrap_or_else(|| zero_hash(&env));
+
+        let entry_hash = compute_entry_hash(
+            &env,
+            seq,
+            &actor,
+            &source_contract,
+            &action,
+            &payload,
+            ledger_seq,
+            &prev_hash,
+        );
+
         let record = AuditRecord {
             seq,
             actor: actor.clone(),
@@ -111,9 +188,13 @@ impl AuditLogContract {
             action,
             payload,
             ledger_seq,
+            prev_hash: prev_hash.clone(),
+            entry_hash: entry_hash.clone(),
         };
+
         env.storage().instance().set(&DataKey::Entry(seq), &record);
         env.storage().instance().set(&DataKey::NextSeq, &(seq + 1));
+        env.storage().instance().set(&DataKey::LastHash, &entry_hash);
 
         let mut actor_seqs: Vec<u64> = env
             .storage()
@@ -170,6 +251,14 @@ impl AuditLogContract {
             .instance()
             .get(&DataKey::Admin)
             .expect("not initialized")
+    }
+
+    /// Get the current chain head hash.
+    pub fn get_last_hash(env: Env) -> BytesN<32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastHash)
+            .unwrap_or_else(|| zero_hash(&env))
     }
 
     /// Get the current nonce for replay protection.
