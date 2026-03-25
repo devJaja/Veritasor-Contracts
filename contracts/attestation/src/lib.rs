@@ -19,11 +19,25 @@ use attestor_staking_import::AttestorStakingContractClient;
 
 const STATUS_KEY_TAG: u32 = 1;
 const ADMIN_KEY_TAG: (u32,) = (2,);
+const ANOMALY_KEY_TAG: u32 = 3;
+const AUTHORIZED_KEY_TAG: u32 = 4;
+const ESCALATION_KEY_TAG: u32 = 5;
 const QUERY_LIMIT_MAX: u32 = 30;
 
 pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
 pub const STATUS_FILTER_ALL: u32 = 2;
+
+pub const ANOMALY_SCORE_MAX: u32 = 100;
+
+pub const ESCALATION_LEVEL_NONE: u32 = 0;
+pub const ESCALATION_LEVEL_ELEVATED: u32 = 1;
+pub const ESCALATION_LEVEL_HIGH: u32 = 2;
+pub const ESCALATION_LEVEL_CRITICAL: u32 = 3;
+
+pub const ESCALATION_THRESHOLD_ELEVATED: u32 = 50;
+pub const ESCALATION_THRESHOLD_HIGH: u32 = 80;
+pub const ESCALATION_THRESHOLD_CRITICAL: u32 = 95;
 
 // Type aliases to reduce complexity - exported for other contracts
 pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<u64>);
@@ -940,6 +954,9 @@ impl AttestationContract {
             env.ledger().timestamp() >= expiry_ts
         } else {
             false
+        }
+    }
+
     pub fn get_attestation_for_period(
         env: Env,
         business: Address,
@@ -965,16 +982,10 @@ impl AttestationContract {
         target_period: u32,
         merkle_root: BytesN<32>,
     ) -> bool {
-        // Check if revoked first (most efficient check)
-        if Self::is_revoked(env.clone(), business.clone(), period.clone()) {
-            return false;
-        }
-
-        if let Some((stored_root, _ts, _ver, _fee, _proof_hash, _expiry)) =
-            Self::get_attestation(env.clone(), business, period)
-        {
-            stored_root == merkle_root
-        if let Some(range) = Self::get_attestation_for_period(env, business, target_period) {
+        if let Some(range) = Self::get_attestation_for_period(env.clone(), business.clone(), target_period) {
+            if range.revoked {
+                return false;
+            }
             range.merkle_root == merkle_root
         } else {
             false
@@ -1022,6 +1033,26 @@ impl AttestationContract {
         env.storage().instance().remove(&key);
     }
 
+    /// Compute a business-level anomaly escalation level from flags and score.
+    /// Returns 0..3 where 0 = none, 1 = elevated, 2 = high, 3 = critical.
+    fn calculate_escalation_level(flags: u32, score: u32) -> u32 {
+        if score >= ESCALATION_THRESHOLD_CRITICAL {
+            ESCALATION_LEVEL_CRITICAL
+        } else if score >= ESCALATION_THRESHOLD_HIGH {
+            ESCALATION_LEVEL_HIGH
+        } else if score >= ESCALATION_THRESHOLD_ELEVATED {
+            ESCALATION_LEVEL_ELEVATED
+        } else if flags & 0x8000_0000 != 0 {
+            // Highest bit in flags reserved for immediate critical escalation.
+            ESCALATION_LEVEL_CRITICAL
+        } else if flags & 0x3 == 0x3 {
+            // Combined core anomaly bits 0+1 indicate high suspicion even at low score.
+            ESCALATION_LEVEL_HIGH
+        } else {
+            ESCALATION_LEVEL_NONE
+        }
+    }
+
     /// Stores anomaly flags and risk score for an existing attestation. Only addresses in the
     /// authorized-analytics set (added by admin) may call this; updater must pass their address
     /// and authorize. flags: bitmask for anomaly conditions (semantics defined off-chain).
@@ -1039,21 +1070,49 @@ impl AttestationContract {
         if !env.storage().instance().has(&key_auth) {
             panic!("updater not authorized");
         }
-        let attest_key = (business.clone(), period.clone());
+        let attest_key = DataKey::Attestation(business.clone(), period.clone());
         if !env.storage().instance().has(&attest_key) {
             panic!("attestation does not exist for this business and period");
         }
         if score > ANOMALY_SCORE_MAX {
             panic!("score out of range");
         }
-        let anomaly_key = (ANOMALY_KEY_TAG, business, period);
+        let anomaly_key = (ANOMALY_KEY_TAG, business.clone(), period.clone());
         env.storage().instance().set(&anomaly_key, &(flags, score));
+
+        // Anomaly escalation can only increase over time to avoid downgrade path risks.
+        let new_level = Self::calculate_escalation_level(flags, score);
+        let escalation_key = (ESCALATION_KEY_TAG, business.clone());
+        let current_level: Option<u32> = env.storage().instance().get(&escalation_key);
+        let updated_level = match current_level {
+            Some(existing) => if existing > new_level { existing } else { new_level },
+            None => new_level,
+        };
+        if updated_level != ESCALATION_LEVEL_NONE {
+            env.storage().instance().set(&escalation_key, &updated_level);
+        } else {
+            // If no escalation, we clear the record to reduce storage footprint for clean state.
+            env.storage().instance().remove(&escalation_key);
+        }
     }
 
     /// Returns anomaly flags and risk score for (business, period) if set. For use by lenders.
     pub fn get_anomaly(env: Env, business: Address, period: String) -> Option<(u32, u32)> {
-        let key = (ANOMALY_KEY_TAG, business, period);
+        let key = (ANOMALY_KEY_TAG, business.clone(), period);
         env.storage().instance().get(&key)
+    }
+
+    /// Returns a business-level escalation level (0 - none, 1 - elevated, 2 - high, 3 - critical).
+    pub fn get_anomaly_escalation(env: Env, business: Address) -> Option<u32> {
+        let key = (ESCALATION_KEY_TAG, business);
+        env.storage().instance().get(&key)
+    }
+
+    /// Clear business-level escalation. Only ADMIN can call. Used to reset after manual review.
+    pub fn clear_anomaly_escalation(env: Env, caller: Address, business: Address) {
+        access_control::require_admin(&env, &caller);
+        let key = (ESCALATION_KEY_TAG, business);
+        env.storage().instance().remove(&key);
     }
 
     /// Get all attestations for a business with their revocation status.
