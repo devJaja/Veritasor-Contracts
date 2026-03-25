@@ -26,6 +26,8 @@ const NONCE_CHANNEL_BUSINESS: u32 = 1;
 
 pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
+pub const STATUS_FILTER_ALL: u32 = 2;
+const QUERY_LIMIT_MAX: u32 = 30;
 
 // Type aliases to reduce complexity
 pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>);
@@ -80,6 +82,23 @@ pub struct BatchAttestationItem {
 
 #[contract]
 pub struct AttestationContract;
+
+/// Lexicographic comparison of Soroban strings.
+fn compare_strings(a: &String, b: &String) -> Ordering {
+    let a_len = a.len();
+    let b_len = b.len();
+    let min_len = if a_len < b_len { a_len } else { b_len };
+
+    for i in 0..min_len {
+        let byte_a = a.as_bytes().get(i).unwrap();
+        let byte_b = b.as_bytes().get(i).unwrap();
+        match byte_a.cmp(&byte_b) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a_len.cmp(&b_len)
+}
 
 #[contractimpl]
 impl AttestationContract {
@@ -170,7 +189,8 @@ impl AttestationContract {
     }
 
     pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
-        false
+        let key = DataKey::Revoked(business, period);
+        env.storage().instance().has(&key)
     }
 
     pub fn revoke_attestation(
@@ -183,7 +203,10 @@ impl AttestationContract {
     ) {
         caller.require_auth();
         dynamic_fees::require_admin(&env);
-        // Minimal implementation for tests
+        let key = DataKey::Revoked(business.clone(), period.clone());
+        let timestamp = env.ledger().timestamp();
+        let revocation_data: RevocationData = (caller.clone(), timestamp, reason.clone());
+        env.storage().instance().set(&key, &revocation_data);
         events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
     }
 
@@ -307,4 +330,75 @@ impl AttestationContract {
     pub fn get_dispute(env: Env, id: u64) -> Option<Dispute> {
         dispute::get_dispute(&env, id)
     }
+
+    /// Paginated query for business attestations with stable cursor behavior.
+    ///
+    /// The cursor indexes into the `periods` list (not filtered results), ensuring
+    /// consistent pagination regardless of filtering. Returns (results, next_cursor).
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_attestations_page(
+        env: Env,
+        business: Address,
+        periods: Vec<String>,
+        period_start: Option<String>,
+        period_end: Option<String>,
+        status_filter: u32,
+        version_filter: Option<u32>,
+        limit: u32,
+        cursor: u32,
+    ) -> (Vec<(String, BytesN<32>, u64, u32, u32)>, u32) {
+        let effective_limit = if limit > QUERY_LIMIT_MAX { QUERY_LIMIT_MAX } else { limit };
+        let periods_len = periods.len();
+        let mut results: Vec<(String, BytesN<32>, u64, u32, u32)> = Vec::new(&env);
+        let mut idx = cursor;
+
+        while idx < periods_len && results.len() < effective_limit {
+            let period = periods.get(idx).unwrap();
+            idx += 1;
+
+            // Period range filter
+            if let Some(ref start) = period_start {
+                if compare_strings(&period, start) == Ordering::Less {
+                    continue;
+                }
+            }
+            if let Some(ref end) = period_end {
+                if compare_strings(&period, end) == Ordering::Greater {
+                    continue;
+                }
+            }
+
+            // Check if attestation exists
+            let att_key = DataKey::Attestation(business.clone(), period.clone());
+            let attestation: Option<AttestationData> = env.storage().instance().get(&att_key);
+            if attestation.is_none() {
+                continue;
+            }
+            let (merkle_root, timestamp, version, _, _, _) = attestation.unwrap();
+
+            // Determine revocation status
+            let rev_key = DataKey::Revoked(business.clone(), period.clone());
+            let is_revoked = env.storage().instance().has(&rev_key);
+            let status = if is_revoked { STATUS_REVOKED } else { STATUS_ACTIVE };
+
+            // Status filter
+            if status_filter != STATUS_FILTER_ALL && status_filter != status {
+                continue;
+            }
+
+            // Version filter
+            if let Some(v) = version_filter {
+                if version != v {
+                    continue;
+                }
+            }
+
+            results.push_back((period, merkle_root, timestamp, version, status));
+        }
+
+        (results, idx)
+    }
 }
+
+#[cfg(test)]
+mod query_pagination_test;
