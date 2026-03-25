@@ -1,21 +1,8 @@
 #![no_std]
-use core::cmp::Ordering;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
 
-/// Attestor staking client: WASM import for wasm32, crate client for host builds.
-#[cfg(target_arch = "wasm32")]
-mod attestor_staking_import {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32-unknown-unknown/release/veritasor_attestor_staking.wasm"
-    );
-    pub use Client as AttestorStakingContractClient;
-}
-
-#[cfg(not(target_arch = "wasm32"))]
+// Use the crate client directly for both wasm32 and host builds
 use veritasor_attestor_staking::AttestorStakingContractClient;
-
-#[cfg(target_arch = "wasm32")]
-use attestor_staking_import::AttestorStakingContractClient;
 
 const STATUS_KEY_TAG: u32 = 1;
 const ADMIN_KEY_TAG: (u32,) = (2,);
@@ -26,6 +13,13 @@ const NONCE_CHANNEL_BUSINESS: u32 = 1;
 
 pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
+
+// Storage key for attestor staking contract configuration
+#[contracttype]
+#[derive(Clone)]
+enum AttestorStakingKey {
+    StakingContract,
+}
 
 // Type aliases to reduce complexity
 pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>);
@@ -88,6 +82,8 @@ impl AttestationContract {
             panic!("already initialized");
         }
         admin.require_auth();
+        // Grant ADMIN role to the initial admin
+        access_control::grant_role(&env, &admin, ROLE_ADMIN);
         dynamic_fees::set_admin(&env, &admin);
     }
 
@@ -307,4 +303,140 @@ impl AttestationContract {
     pub fn get_dispute(env: Env, id: u64) -> Option<Dispute> {
         dispute::get_dispute(&env, id)
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  Attestor Staking Integration
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Set the attestor staking contract address (ADMIN only).
+    pub fn set_attestor_staking_contract(env: Env, caller: Address, staking_contract: Address) {
+        access_control::require_admin(&env, &caller);
+        env.storage().instance().set(&AttestorStakingKey::StakingContract, &staking_contract);
+    }
+
+    /// Get the configured attestor staking contract address.
+    pub fn get_attestor_staking_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&AttestorStakingKey::StakingContract)
+    }
+
+    /// Submit an attestation as an attestor (requires ROLE_ATTESTOR and staking eligibility).
+    pub fn submit_attestation_as_attestor(
+        env: Env,
+        attestor: Address,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+        timestamp: u64,
+        version: u32,
+        expiry_timestamp: Option<u64>,
+    ) {
+        // Require attestor role and authentication
+        access_control::require_attestor(&env, &attestor);
+
+        // Get staking contract address
+        let staking_contract: Address = env
+            .storage()
+            .instance()
+            .get(&AttestorStakingKey::StakingContract)
+            .expect("staking contract not configured");
+
+        // Check eligibility via staking contract
+        let staking_client = AttestorStakingContractClient::new(&env, &staking_contract);
+        if !staking_client.is_eligible(&attestor) {
+            panic!("attestor not eligible: insufficient stake");
+        }
+
+        // Check attestation doesn't exist
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        if env.storage().instance().has(&key) {
+            panic!("attestation exists");
+        }
+
+        // Collect fee from the attestor (payer)
+        let fee = dynamic_fees::collect_fee_from(&env, &attestor, &business);
+        dynamic_fees::increment_business_count(&env, &business);
+
+        // Store attestation
+        let data = (
+            merkle_root.clone(),
+            timestamp,
+            version,
+            fee,
+            None::<BytesN<32>>,
+            expiry_timestamp,
+        );
+        env.storage().instance().set(&key, &data);
+
+        events::emit_attestation_submitted(
+            &env,
+            &business,
+            &period,
+            &merkle_root,
+            timestamp,
+            version,
+            fee,
+            &None,
+            expiry_timestamp,
+        );
+    }
+
+    /// Submit multiple attestations as an attestor in a batch.
+    pub fn submit_batch_as_attestor(
+        env: Env,
+        attestor: Address,
+        items: Vec<BatchAttestationItem>,
+    ) {
+        // Require attestor role and authentication
+        access_control::require_attestor(&env, &attestor);
+
+        // Get staking contract address
+        let staking_contract: Address = env
+            .storage()
+            .instance()
+            .get(&AttestorStakingKey::StakingContract)
+            .expect("staking contract not configured");
+
+        // Check eligibility via staking contract
+        let staking_client = AttestorStakingContractClient::new(&env, &staking_contract);
+        if !staking_client.is_eligible(&attestor) {
+            panic!("attestor not eligible: insufficient stake");
+        }
+
+        // Process each item in the batch
+        for i in 0..items.len() {
+            let item = items.get(i).unwrap();
+            let key = DataKey::Attestation(item.business.clone(), item.period.clone());
+            if env.storage().instance().has(&key) {
+                panic!("attestation exists");
+            }
+
+            let fee = dynamic_fees::collect_fee_from(&env, &attestor, &item.business);
+            dynamic_fees::increment_business_count(&env, &item.business);
+
+            let data = (
+                item.merkle_root.clone(),
+                item.timestamp,
+                item.version,
+                fee,
+                None::<BytesN<32>>,
+                item.expiry_timestamp,
+            );
+            env.storage().instance().set(&key, &data);
+
+            events::emit_attestation_submitted(
+                &env,
+                &item.business,
+                &item.period,
+                &item.merkle_root,
+                item.timestamp,
+                item.version,
+                fee,
+                &None,
+                item.expiry_timestamp,
+            );
+        }
+    }
 }
+
+#[cfg(test)]
+mod attestor_staking_integration_test;

@@ -203,6 +203,42 @@ They verify:
 - Submissions fail if attestor is not eligible.
 - Submissions succeed when attestor stakes at least `min_stake`.
 
+### Test Categories
+
+The test suite includes **23 comprehensive tests** covering:
+
+**Correctness / Boundary Tests:**
+- `attestor_with_exact_min_stake_is_eligible` - Attestor with exactly minimum stake is eligible
+- `attestor_one_below_min_stake_is_ineligible` - Attestor one unit below minimum stake is ineligible
+- `multiple_attestors_independent_eligibility` - Multiple attestors have independent eligibility states
+- `get_staking_contract_returns_configured_address` - Returns correct address after configuration
+- `get_staking_contract_returns_none_when_not_configured` - Returns None when not configured
+
+**Security / Adversarial Tests:**
+- `non_admin_cannot_set_staking_contract` - Non-admin cannot call set_attestor_staking_contract
+- `non_attestor_cannot_submit_as_attestor` - Attestor without ROLE_ATTESTOR cannot submit
+- `non_dispute_contract_cannot_slash` - Only authorized dispute contract can slash
+- `slashing_below_min_stake_makes_ineligible` - Slashing below minimum makes ineligible
+- `slashing_above_min_stake_keeps_eligible` - Slashing above minimum keeps eligible
+
+**Regression Tests:**
+- `batch_submit_fails_when_ineligible` - Batch submission fails when attestor is ineligible
+- `min_stake_increase_makes_ineligible` - Min stake increase makes previously eligible attestor ineligible
+- `min_stake_decrease_makes_eligible` - Min stake decrease makes previously ineligible attestor eligible
+- `attestor_submit_requires_staking_contract_configured` - Submission requires staking contract configured
+
+**Edge Cases:**
+- `pending_unstake_counts_toward_eligibility` - Pending unstake still counts toward eligibility
+- `full_withdrawal_makes_ineligible` - Full withdrawal makes attestor ineligible
+- `duplicate_attestation_rejected` - Duplicate attestation for same business/period is rejected
+- `batch_with_duplicate_fails_entirely` - Batch with one duplicate entry fails entirely
+- `batch_submit_empty_list_handled` - Empty batch list is handled gracefully
+
+**Core Integration Tests:**
+- `attestor_submit_succeeds_when_eligible` - Attestor submission succeeds when eligible
+- `attestor_submit_fails_when_not_eligible` - Attestor submission fails when not eligible
+- `attestor_batch_submit_succeeds_when_eligible` - Batch submission succeeds when eligible
+
 ## Security notes / invariants
 
 - **Single pending unstake per attestor**: prevents multiple overlapping unlock schedules.
