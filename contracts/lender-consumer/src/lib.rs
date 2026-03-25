@@ -179,14 +179,7 @@ impl LenderConsumerContract {
     }
 
     /// Set a dispute status for a business and period.
-    ///
-    /// In a real system, this would be restricted to an admin or arbitrator.
-    pub fn set_dispute(env: Env, business: Address, period: String, is_disputed: bool) {
-        // ideally require auth from admin/arbitrator
-        // business.require_auth(); // or admin
-        env.storage()
-            .instance()
-            .set(&DataKey::DisputeStatus(business, period), &is_disputed);
+    /// Requires lender tier 2 access.
     pub fn set_dispute(env: Env, lender: Address, business: Address, period: String, is_disputed: bool) {
         Self::require_lender_tier(&env, &lender, 2);
         env.storage().instance().set(&DataKey::DisputeStatus(business, period), &is_disputed);

@@ -86,5 +86,17 @@ Sets the dispute status for a period.
 ## Security Considerations
 
 *   **Data Integrity**: Relies on the security of the Core Attestation Contract and the underlying Merkle proof verification.
-*   **Access Control**: `submit_revenue` is public but only accepts data that matches the authenticated commitment in Core. `set_dispute` should be restricted to authorized parties (currently open for demonstration).
-*   **Privacy**: Revenue data submitted to this contract becomes public on-chain. For private data sharing, a different architecture using Zero-Knowledge Proofs (ZKPs) would be required, where the contract only stores the *result* of the credit check, not the raw revenue.
+*   **Access Control**: `submit_revenue` requires documented authorization from a lender with `tier >= 1`. Administrative actions like `set_dispute` require `tier >= 2`.
+*   **Invalid Proof Rejection**: The contract strictly rejects any revenue data that does not hash to a value currently attested in the Core Contract. This prevents businesses from submitting "fake" data to lenders that doesn't match their historical commitments.
+*   **Privacy**: Revenue data submitted to this contract becomes public on-chain. For private data sharing, a different architecture using Zero-Knowledge Proofs (ZKPs) would be required.
+
+## Test Coverage
+
+Comprehensive tests in `lender-consumer/src/test.rs` cover:
+
+- **Valid Submission**: End-to-end flow from core attestation to revenue verification.
+- **Invalid Proof Rejection**: Panics if revenue does not match the core Merkle root or if no attestation exists.
+- **Cross-Business Isolation**: Ensures one business's attestation cannot be used to verify another business's revenue.
+- **Tiered Access Control**: Verifies rejection for unlisted lenders and enforcement of Tier 1 vs Tier 2 requirements.
+- **Adversarial Cases**: Correct handling of zero and negative revenue (anomalies).
+- **Trailing Revenue**: Correct aggregation over multiple periods.

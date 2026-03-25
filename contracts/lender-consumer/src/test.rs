@@ -301,3 +301,129 @@ fn test_lender_gains_and_loses_access_scenario() {
     }));
     assert!(denied2.is_err());
 }
+
+#[test]
+#[should_panic(expected = "Revenue data does not match the attested Merkle root in Core")]
+fn test_submit_revenue_no_attestation_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let core_id = env.register(AttestationContract, ());
+    let access_list_id = env.register(LenderAccessListContract, ());
+    let access_list_client = LenderAccessListContractClient::new(&env, &access_list_id);
+    access_list_client.initialize(&admin);
+    let lender = Address::generate(&env);
+    access_list_client.set_lender(&admin, &lender, &1u32, &lender_meta(&env, "Lender"));
+
+    let lender_id = env.register(LenderConsumerContract, ());
+    let lender_client = LenderConsumerContractClient::new(&env, &lender_id);
+    lender_client.initialize(&admin, &core_id, &access_list_id);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-03");
+
+    // Try to submit revenue when NO attestation exists in core for this (business, period)
+    lender_client.submit_revenue(&lender, &business, &period, &5000);
+}
+
+#[test]
+#[should_panic(expected = "Revenue data does not match the attested Merkle root in Core")]
+fn test_submit_revenue_wrong_business_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let core_id = env.register(AttestationContract, ());
+    let core_client = AttestationContractClient::new(&env, &core_id);
+    core_client.initialize(&admin);
+
+    let access_list_id = env.register(LenderAccessListContract, ());
+    let access_list_client = LenderAccessListContractClient::new(&env, &access_list_id);
+    access_list_client.initialize(&admin);
+    let lender = Address::generate(&env);
+    access_list_client.set_lender(&admin, &lender, &1u32, &lender_meta(&env, "Lender"));
+
+    let lender_id = env.register(LenderConsumerContract, ());
+    let lender_client = LenderConsumerContractClient::new(&env, &lender_id);
+    lender_client.initialize(&admin, &core_id, &access_list_id);
+
+    let business_a = Address::generate(&env);
+    let business_b = Address::generate(&env);
+    let period = String::from_str(&env, "2026-03");
+    let revenue: i128 = 5000;
+
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&revenue.to_be_bytes());
+    let payload = Bytes::from_slice(&env, &buf);
+    let root: BytesN<32> = env.crypto().sha256(&payload).into();
+
+    // Attest for Business A
+    core_client.submit_attestation(&business_a, &period, &root, &100, &1, &None);
+
+    // Try to submit the SAME revenue for Business B (which has no attestation)
+    lender_client.submit_revenue(&lender, &business_b, &period, &revenue);
+}
+
+#[test]
+fn test_adversarial_zero_revenue() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let core_id = env.register(AttestationContract, ());
+    let core_client = AttestationContractClient::new(&env, &core_id);
+    core_client.initialize(&admin);
+
+    let access_list_id = env.register(LenderAccessListContract, ());
+    let access_list_client = LenderAccessListContractClient::new(&env, &access_list_id);
+    access_list_client.initialize(&admin);
+    let lender = Address::generate(&env);
+    access_list_client.set_lender(&admin, &lender, &1u32, &lender_meta(&env, "Lender"));
+
+    let lender_id = env.register(LenderConsumerContract, ());
+    let lender_client = LenderConsumerContractClient::new(&env, &lender_id);
+    lender_client.initialize(&admin, &core_id, &access_list_id);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-03");
+    let revenue: i128 = 0;
+
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&revenue.to_be_bytes());
+    let payload = Bytes::from_slice(&env, &buf);
+    let root: BytesN<32> = env.crypto().sha256(&payload).into();
+
+    core_client.submit_attestation(&business, &period, &root, &100, &1, &None);
+
+    lender_client.submit_revenue(&lender, &business, &period, &revenue);
+    assert_eq!(lender_client.get_revenue(&business, &period), Some(0));
+    assert!(!lender_client.is_anomaly(&business, &period));
+}
+
+#[test]
+#[should_panic(expected = "lender not allowed")]
+fn test_set_dispute_unauthorized_tier_2() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let core_id = env.register(AttestationContract, ());
+
+    let access_list_id = env.register(LenderAccessListContract, ());
+    let access_list_client = LenderAccessListContractClient::new(&env, &access_list_id);
+    access_list_client.initialize(&admin);
+    
+    let lender_tier_1 = Address::generate(&env);
+    access_list_client.set_lender(&admin, &lender_tier_1, &1u32, &lender_meta(&env, "Tier1"));
+
+    let lender_id = env.register(LenderConsumerContract, ());
+    let lender_client = LenderConsumerContractClient::new(&env, &lender_id);
+    lender_client.initialize(&admin, &core_id, &access_list_id);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-03");
+
+    // Tier 1 lender trying to set dispute (requires Tier 2)
+    lender_client.set_dispute(&lender_tier_1, &business, &period, &true);
+}
