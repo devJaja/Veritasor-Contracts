@@ -12,6 +12,7 @@ members = [
     "contracts/protocol-dao",
     "contracts/protocol-simulation",
     "contracts/revenue-bonds",
+    "contracts/revenue-settlement",
     "contracts/revenue-stream",
 ]
 resolver = "2"
