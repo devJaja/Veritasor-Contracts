@@ -1195,7 +1195,7 @@ Initialize with admin.
 
 ### 6.2 Stream Operations
 
-#### `create_stream(admin: Address, attestation_contract: Address, business: Address, period: String, beneficiary: Address, token: Address, amount: i128) -> u64`
+#### `create_stream(admin: Address, attestation_contract: Address, business: Address, period: String, beneficiary: Address, token: Address, amount: i128, cliff_timestamp: Option<u64>) -> u64`
 
 Create a stream funded with tokens.
 
@@ -1209,6 +1209,7 @@ Create a stream funded with tokens.
 | `beneficiary` | `Address` | Beneficiary address |
 | `token` | `Address` | Token contract address |
 | `amount` | `i128` | Amount to stream (must be positive) |
+| `cliff_timestamp` | `Option<u64>` | Optional Unix timestamp after which release is allowed |
 
 **Authorization:** Admin must authorize
 
@@ -1221,7 +1222,7 @@ Create a stream funded with tokens.
 
 #### `release(stream_id: u64)`
 
-Release a stream if attestation exists and is not revoked.
+Release a stream if cliff timestamp has been reached (if set) and attestation exists and is not revoked.
 
 **Parameters:**
 | Name | Type | Description |
@@ -1231,6 +1232,7 @@ Release a stream if attestation exists and is not revoked.
 **Panics:**
 - `"stream not found"` if stream doesn't exist
 - `"stream already released"` if already released
+- `"cliff not reached"` if cliff timestamp is set and not yet reached
 - `"attestation not found"` if no attestation
 - `"attestation is revoked"` if attestation is revoked
 
