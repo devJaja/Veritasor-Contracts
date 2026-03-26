@@ -77,6 +77,7 @@ pub enum DataKey {
     /// Per-business submission timestamps within the current window.
     /// Stores a `Vec<u64>` of ledger timestamps.
     SubmissionTimestamps(Address),
+    IsPaused,
 }
 
 /// On-chain fee configuration.
@@ -132,6 +133,24 @@ pub fn get_fee_config(env: &Env) -> Option<FeeConfig> {
 
 pub fn set_fee_config(env: &Env, config: &FeeConfig) {
     env.storage().instance().set(&DataKey::FeeConfig, config);
+}
+
+pub fn set_fee_enabled(env: &Env, enabled: bool) {
+    if let Some(mut config) = get_fee_config(env) {
+        config.enabled = enabled;
+        set_fee_config(env, &config);
+    }
+}
+
+pub fn set_paused(env: &Env, paused: bool) {
+    env.storage().instance().set(&DataKey::IsPaused, &paused);
+}
+
+pub fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::IsPaused)
+        .unwrap_or(false)
 }
 
 pub fn set_dao(env: &Env, dao: &Address) {

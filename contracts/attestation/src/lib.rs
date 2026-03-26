@@ -30,7 +30,7 @@ pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
 
 // Type aliases to reduce complexity
-pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>);
+pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>, bool);
 pub type RevocationData = (Address, u64, String);
 pub type AttestationStatusResult = Vec<(String, Option<AttestationData>, Option<RevocationData>)>;
 
@@ -44,6 +44,10 @@ pub mod fees;
 pub mod multisig;
 pub mod rate_limit;
 pub mod registry;
+
+#[cfg(test)]
+mod property_test;
+
 
 pub use access_control::{ROLE_ADMIN, ROLE_ATTESTOR, ROLE_BUSINESS, ROLE_OPERATOR};
 pub use dispute::{
@@ -93,6 +97,7 @@ impl AttestationContract {
         }
         admin.require_auth();
         dynamic_fees::set_admin(&env, &admin);
+        access_control::grant_role(&env, &admin, ROLE_ADMIN);
     }
 
     pub fn configure_fees(
@@ -135,22 +140,26 @@ impl AttestationContract {
         proof_hash: Option<BytesN<32>>,
         expiry_timestamp: Option<u64>,
     ) {
+        if dynamic_fees::is_paused(&env) {
+            panic!("contract is paused");
+        }
         business.require_auth();
         let key = DataKey::Attestation(business.clone(), period.clone());
         if env.storage().instance().has(&key) {
-            panic!("attestation exists");
+            panic!("attestation already exists");
         }
 
         let fee = dynamic_fees::collect_fee(&env, &business);
         dynamic_fees::increment_business_count(&env, &business);
 
-        let data = (
+        let data: AttestationData = (
             merkle_root.clone(),
             timestamp,
             version,
             fee,
             proof_hash.clone(),
             expiry_timestamp,
+            false, // not revoked
         );
         env.storage().instance().set(&key, &data);
 
@@ -173,7 +182,7 @@ impl AttestationContract {
     }
 
     pub fn is_expired(env: Env, business: Address, period: String) -> bool {
-        if let Some((_, _, _, _, _, Some(expiry_ts))) =
+        if let Some((_, _, _, _, _, Some(expiry_ts), _)) =
             Self::get_attestation(env.clone(), business, period)
         {
             env.ledger().timestamp() >= expiry_ts
@@ -182,8 +191,29 @@ impl AttestationContract {
         }
     }
 
+    pub fn verify_attestation(
+        env: Env,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+    ) -> bool {
+        if let Some((stored_root, _, _, _, _, _, revoked)) =
+            Self::get_attestation(env.clone(), business, period)
+        {
+            !revoked && stored_root == merkle_root
+        } else {
+            false
+        }
+    }
+
     pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
-        false
+        if let Some((_, _, _, _, _, _, revoked)) =
+            Self::get_attestation(env.clone(), business, period)
+        {
+            revoked
+        } else {
+            false
+        }
     }
 
     pub fn revoke_attestation(
@@ -196,7 +226,12 @@ impl AttestationContract {
     ) {
         caller.require_auth();
         dynamic_fees::require_admin(&env);
-        // Minimal implementation for tests
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        let (root, ts, ver, fee, ph, exp, _): AttestationData =
+            env.storage().instance().get(&key).expect("not found");
+        let updated: AttestationData = (root, ts, ver, fee, ph, exp, true);
+        env.storage().instance().set(&key, &updated);
+
         events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
     }
 
@@ -210,20 +245,21 @@ impl AttestationContract {
     ) {
         access_control::require_admin(&env, &caller);
         let key = DataKey::Attestation(business.clone(), period.clone());
-        let (old_root, ts, old_ver, fee, proof_hash, expiry): AttestationData =
+        let (old_root, ts, old_ver, fee, proof_hash, expiry, revoked): AttestationData =
             env.storage().instance().get(&key).expect("not found");
 
         if new_version <= old_ver {
-            panic!("version too low");
+            panic!("new version must be greater than old version");
         }
 
-        let data = (
+        let data: AttestationData = (
             new_merkle_root.clone(),
             ts,
             new_version,
             fee,
             proof_hash,
             expiry,
+            revoked,
         );
         env.storage().instance().set(&key, &data);
     }
@@ -328,5 +364,56 @@ impl AttestationContract {
 
     pub fn get_dispute(env: Env, id: u64) -> Option<Dispute> {
         dispute::get_dispute(&env, id)
+    }
+
+    pub fn pause(env: Env, admin: Address) {
+        access_control::require_admin(&env, &admin);
+        dynamic_fees::set_paused(&env, true);
+    }
+
+    pub fn unpause(env: Env, admin: Address) {
+        access_control::require_admin(&env, &admin);
+        dynamic_fees::set_paused(&env, false);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        dynamic_fees::is_paused(&env)
+    }
+
+    pub fn set_fee_enabled(env: Env, admin: Address, enabled: bool) {
+        access_control::require_admin(&env, &admin);
+        dynamic_fees::set_fee_enabled(&env, enabled);
+    }
+
+    pub fn set_tier_discount(env: Env, admin: Address, tier: u32, discount_bps: u32) {
+        access_control::require_admin(&env, &admin);
+        dynamic_fees::set_tier_discount(&env, tier, discount_bps);
+    }
+
+    pub fn set_business_tier(env: Env, admin: Address, business: Address, tier: u32) {
+        access_control::require_admin(&env, &admin);
+        dynamic_fees::set_business_tier(&env, &business, tier);
+    }
+
+    pub fn set_volume_brackets(
+        env: Env,
+        admin: Address,
+        thresholds: Vec<u64>,
+        discounts: Vec<u32>,
+    ) {
+        access_control::require_admin(&env, &admin);
+        dynamic_fees::set_volume_brackets(&env, &thresholds, &discounts);
+    }
+
+    pub fn get_fee_quote(env: Env, business: Address) -> i128 {
+        dynamic_fees::calculate_fee(&env, &business)
+    }
+
+    pub fn get_business_count(env: Env, business: Address) -> u64 {
+        dynamic_fees::get_business_count(&env, &business)
+    }
+
+    pub fn get_business_tier(env: Env, business: Address) -> u32 {
+        dynamic_fees::get_business_tier(&env, &business)
     }
 }
