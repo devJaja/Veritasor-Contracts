@@ -571,3 +571,134 @@ This contract is part of the Veritasor protocol and follows the same license as 
 For questions, issues, or contributions:
 - GitHub: [Veritasor/Veritasor-Contracts](https://github.com/Veritasor/Veritasor-Contracts)
 - Documentation: [docs/](../docs/)
+
+---
+
+# Revenue Curve Pricing Contract — Parameter Constraints
+
+> **Contract:** `contracts/revenue-curve/src/lib.rs`
+> **Test suite:** `contracts/revenue-curve/src/test.rs`
+> **Feature branch:** `feature/implement-revenue-curve-parameter-constraints`
+
+## Overview
+
+The Revenue Curve Pricing Contract encodes APR-curve models based on attested revenue metrics to help lenders price risk. It consumes attestations from the `veritasor-attestation` contract and outputs `PricingOutput` structs containing the final APR in basis points and a full audit-ready breakdown.
+
+## Parameter Constraints
+
+All public state-mutating functions enforce strict input validation before persisting any state. Panicking on bad input (rather than silently clamping) makes invariant violations immediately visible to callers and on-chain indexers.
+
+### `set_pricing_policy` Constraints
+
+| Field | Rule | Panic message |
+|---|---|---|
+| `min_apr_bps` | Must be ≤ `max_apr_bps` | `"min_apr must be <= max_apr"` |
+| `base_apr_bps` | Must be in `[min_apr_bps, max_apr_bps]` | `"base_apr must be within [min_apr, max_apr]"` |
+| `max_apr_bps` | Must be ≤ 10 000 bps (100 %) | `"max_apr cannot exceed 10000 bps (100%)"` |
+| `risk_premium_bps_per_point` | Must be ≤ 1 000 bps | `"risk premium per point cannot exceed 1000 bps"` |
+
+**Rationale:**
+- Capping `max_apr_bps` at 10 000 prevents nonsensical rates above 100 %.
+- Capping `risk_premium_bps_per_point` at 1 000 bounds the maximum premium added by a worst-case anomaly score (100 × 1 000 = 100 000 bps before clamping to `max_apr`), ensuring the APR arithmetic cannot overflow a `u32` via `saturating_mul`.
+
+### `set_revenue_tiers` Constraints
+
+| Field / condition | Rule | Panic message |
+|---|---|---|
+| Vector length | ≤ 20 tiers | `"maximum of 20 tiers allowed"` |
+| `min_revenue` | Must be ≥ 0 | `"min_revenue cannot be negative"` |
+| `min_revenue` ordering | Strictly ascending across tiers | `"tiers must be sorted by min_revenue ascending"` |
+| `discount_bps` | ≤ 10 000 bps (100 %) | `"discount cannot exceed 100%"` |
+
+**Rationale:**
+- Negative revenue thresholds have no business meaning and would silently match all revenue values.
+- Unsorted tiers make the best-tier selection algorithm non-deterministic.
+- Limiting tiers to 20 bounds worst-case ledger iteration cost and storage footprint.
+
+### `calculate_pricing` / `get_pricing_quote` Constraints
+
+| Parameter | Rule | Panic message |
+|---|---|---|
+| `anomaly_score` | Must be in `[0, 100]` | `"anomaly_score must be <= 100"` |
+| Pricing policy | Must be configured | `"pricing policy not configured"` |
+| Pricing policy | Must be enabled | `"pricing policy is disabled"` |
+| Attestation (calculate_pricing only) | Must exist | `"attestation not found"` |
+| Attestation (calculate_pricing only) | Must not be revoked | `"attestation is revoked"` |
+
+## APR Calculation
+
+```
+risk_premium_bps = anomaly_score ×ₛₐₜ risk_premium_bps_per_point
+apr_bps          = (base_apr_bps +ₛₐₜ risk_premium_bps) -ₛᵤᵦ tier_discount_bps
+apr_bps          = clamp(apr_bps, min_apr_bps, max_apr_bps)
+```
+
+All arithmetic uses **saturating operations** (`saturating_mul`, `saturating_add`, `saturating_sub`) to prevent silent overflow.  
+The final `clamp` guarantees the output always lies within `[min_apr_bps, max_apr_bps]`.
+
+## Security Notes
+
+### Overflow Safety
+`u32` saturating arithmetic is used throughout the APR computation path. With the `risk_premium_bps_per_point ≤ 1 000` constraint and `anomaly_score ≤ 100`, the maximum unadjusted premium is `100 000` bps, well within `u32::MAX`. Saturation is retained as a belt-and-braces guard.
+
+### Access Control
+`require_admin` verifies both identity (storage equality) **and** authorisation (`admin.require_auth()`). Admin cannot be changed after initialisation.
+
+### Replay / Ordering
+Revenue tiers must be submitted in strictly ascending order of `min_revenue`. Duplicate thresholds are rejected at the policy level, preventing ambiguous tier matching.
+
+### Attestation Guard
+`calculate_pricing` consults the attestation contract for two checks before any APR computation:
+1. The attestation exists (`get_attestation` is `Some`).
+2. The attestation has not been revoked (`is_revoked` returns `false`).
+
+> **Note:** The attestation contract's `is_revoked()` is currently a stub (always returns `false`). The guard is structurally in place in the revenue-curve contract and will activate automatically once the attestation contract implements full revocation tracking. This is documented in `test_calculate_pricing_revoked_attestation_stub_behavior`.
+
+## Test Coverage
+
+The test suite (`contracts/revenue-curve/src/test.rs`) contains **25 tests** covering:
+
+### Positive / Happy-path Tests
+- `test_initialize` — contract initialises correctly
+- `test_set_pricing_policy` — policy stored and retrieved
+- `test_set_revenue_tiers` — tiers stored and retrieved
+- `test_calculate_pricing_basic` — zero-risk, no-tier pricing
+- `test_calculate_pricing_with_risk` — non-zero anomaly score
+- `test_calculate_pricing_with_tier_discount` — tier discount applied
+- `test_get_pricing_quote` — estimation path (no attestation required)
+- `test_multiple_pricing_scenarios` — 3 business profiles in one test
+
+### Boundary / Clamp Tests
+- `test_calculate_pricing_max_cap` — APR clamped to `max_apr`
+- `test_calculate_pricing_min_cap` — APR clamped to `min_apr`
+- `test_edge_case_zero_revenue` — zero revenue, no tier matched
+- `test_edge_case_extreme_revenue` — very large revenue, highest tier matched
+
+### Negative / Rejection Tests
+- `test_double_initialize_fails` — re-init panics
+- `test_invalid_policy_min_max` — min > max panics
+- `test_invalid_policy_base_out_of_range` — base outside [min, max] panics
+- `test_invalid_policy_max_apr_exceeds_limit` — max > 100 % panics *(new)*
+- `test_invalid_policy_risk_premium_exceeds_limit` — premium > 1 000 bps panics *(new)*
+- `test_unsorted_tiers_fail` — unsorted tiers panics
+- `test_excessive_discount_fails` — discount > 100 % panics
+- `test_excessive_revenue_tiers` — > 20 tiers panics *(new)*
+- `test_negative_min_revenue` — negative threshold panics *(new)*
+- `test_invalid_anomaly_score` — score > 100 panics
+- `test_pricing_with_disabled_policy` — disabled policy panics
+- `test_calculate_pricing_no_attestation` — missing attestation panics
+
+### Authorization / Attestation Tests
+- `test_calculate_pricing_revoked_attestation_stub_behavior` — documents upstream stub behaviour
+
+### Test Invocation
+
+```bash
+cargo test -p veritasor-revenue-curve
+```
+
+Expected output:
+```
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
