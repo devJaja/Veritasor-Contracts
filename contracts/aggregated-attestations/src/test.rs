@@ -15,6 +15,7 @@ fn setup(
     AttestationSnapshotContractClient<'static>,
     soroban_sdk::Address,
     soroban_sdk::Address,
+    soroban_sdk::Address,
 ) {
     env.mock_all_auths();
     let admin = Address::generate(env);
@@ -25,33 +26,70 @@ fn setup(
     let snap_id = env.register(AttestationSnapshotContract, ());
     let snap_client = AttestationSnapshotContractClient::new(env, &snap_id);
     snap_client.initialize(&admin, &None::<Address>);
-    (agg_client, snap_client, admin, snap_id)
+    (agg_client, snap_client, admin, agg_id, snap_id)
+}
+
+fn businesses(env: &Env, addrs: &[Address]) -> Vec<Address> {
+    let mut out = Vec::new(env);
+    for addr in addrs {
+        out.push_back(addr.clone());
+    }
+    out
 }
 
 #[test]
 fn test_initialize() {
     let env = Env::default();
-    let (client, _snap, admin, _snap_id) = setup(&env);
+    let (client, _snap, admin, _agg_id, _snap_id) = setup(&env);
     assert_eq!(client.get_admin(), admin);
 }
 
 #[test]
 fn test_register_portfolio() {
     let env = Env::default();
-    let (client, _snap, admin, _snap_id) = setup(&env);
+    let (client, _snap, admin, _agg_id, _snap_id) = setup(&env);
     let id = String::from_str(&env, "portfolio-1");
-    let mut businesses = Vec::new(&env);
-    businesses.push_back(Address::generate(&env));
-    businesses.push_back(Address::generate(&env));
+    let businesses = businesses(&env, &[Address::generate(&env), Address::generate(&env)]);
     client.register_portfolio(&admin, &id, &businesses);
     let stored = client.get_portfolio(&id).unwrap();
     assert_eq!(stored.len(), 2);
 }
 
 #[test]
+#[should_panic(expected = "duplicate business address in portfolio")]
+fn test_register_portfolio_duplicate_business_panics() {
+    let env = Env::default();
+    let (client, _snap, admin, _agg_id, _snap_id) = setup(&env);
+    let id = String::from_str(&env, "dup");
+    let business = Address::generate(&env);
+    let portfolio = businesses(&env, &[business.clone(), business]);
+
+    client.register_portfolio(&admin, &id, &portfolio);
+}
+
+#[test]
+fn test_failed_duplicate_registration_preserves_existing_portfolio() {
+    let env = Env::default();
+    let (client, _snap, admin, _agg_id, _snap_id) = setup(&env);
+    let id = String::from_str(&env, "stable");
+    let business_a = Address::generate(&env);
+    let business_b = Address::generate(&env);
+    let initial = businesses(&env, &[business_a.clone(), business_b]);
+    let duplicate = businesses(&env, &[business_a.clone(), business_a]);
+
+    client.register_portfolio(&admin, &id, &initial);
+    assert!(client
+        .try_register_portfolio(&admin, &id, &duplicate)
+        .is_err());
+
+    let stored = client.get_portfolio(&id).unwrap();
+    assert_eq!(stored, initial);
+}
+
+#[test]
 fn test_get_aggregated_metrics_empty_portfolio() {
     let env = Env::default();
-    let (agg_client, _snap_client, admin, snap_id) = setup(&env);
+    let (agg_client, _snap_client, admin, _agg_id, snap_id) = setup(&env);
     let id = String::from_str(&env, "empty");
     let businesses: Vec<Address> = Vec::new(&env);
     agg_client.register_portfolio(&admin, &id, &businesses);
@@ -66,7 +104,7 @@ fn test_get_aggregated_metrics_empty_portfolio() {
 #[test]
 fn test_get_aggregated_metrics_no_snapshots() {
     let env = Env::default();
-    let (agg_client, _snap_client, admin, snap_id) = setup(&env);
+    let (agg_client, _snap_client, admin, _agg_id, snap_id) = setup(&env);
     let id = String::from_str(&env, "no-snap");
     let mut businesses = Vec::new(&env);
     businesses.push_back(Address::generate(&env));
@@ -80,7 +118,7 @@ fn test_get_aggregated_metrics_no_snapshots() {
 #[test]
 fn test_get_aggregated_metrics_with_snapshots() {
     let env = Env::default();
-    let (agg_client, snap_client, admin, snap_id) = setup(&env);
+    let (agg_client, snap_client, admin, _agg_id, snap_id) = setup(&env);
     let b1 = Address::generate(&env);
     let b2 = Address::generate(&env);
     let period = String::from_str(&env, "2026-02");
@@ -100,9 +138,36 @@ fn test_get_aggregated_metrics_with_snapshots() {
 }
 
 #[test]
+fn test_duplicate_businesses_do_not_inflate_aggregated_metrics_for_legacy_portfolios() {
+    let env = Env::default();
+    let (agg_client, snap_client, admin, agg_id, snap_id) = setup(&env);
+    let b1 = Address::generate(&env);
+    let b2 = Address::generate(&env);
+    let period = String::from_str(&env, "2026-02");
+
+    snap_client.record_snapshot(&admin, &b1, &period, &100_000i128, &2u32, &1u64);
+    snap_client.record_snapshot(&admin, &b2, &period, &50_000i128, &1u32, &1u64);
+
+    let portfolio_id = String::from_str(&env, "legacy-dup");
+    let legacy_portfolio = businesses(&env, &[b1.clone(), b1, b2]);
+    env.as_contract(&agg_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Portfolio(portfolio_id.clone()), &legacy_portfolio);
+    });
+
+    let metrics = agg_client.get_aggregated_metrics(&snap_id, &portfolio_id);
+    assert_eq!(metrics.business_count, 2);
+    assert_eq!(metrics.businesses_with_snapshots, 2);
+    assert_eq!(metrics.total_trailing_revenue, 150_000i128);
+    assert_eq!(metrics.total_anomaly_count, 3u32);
+    assert_eq!(metrics.average_trailing_revenue, 75_000i128);
+}
+
+#[test]
 fn test_get_aggregated_metrics_unregistered_portfolio() {
     let env = Env::default();
-    let (agg_client, _snap_client, _admin, snap_id) = setup(&env);
+    let (agg_client, _snap_client, _admin, _agg_id, snap_id) = setup(&env);
     let id = String::from_str(&env, "nonexistent");
     let m = agg_client.get_aggregated_metrics(&snap_id, &id);
     assert_eq!(m.business_count, 0);
@@ -113,7 +178,7 @@ fn test_get_aggregated_metrics_unregistered_portfolio() {
 #[should_panic(expected = "caller is not admin")]
 fn test_register_portfolio_unauthorized() {
     let env = Env::default();
-    let (client, _snap, _admin, _snap_id) = setup(&env);
+    let (client, _snap, _admin, _agg_id, _snap_id) = setup(&env);
     let other = Address::generate(&env);
     let id = String::from_str(&env, "p1");
     let businesses = Vec::new(&env);
