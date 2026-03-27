@@ -2,572 +2,205 @@
 
 ## Overview
 
-The Revenue Share Distribution contract automatically distributes on-chain revenue to multiple stakeholders based on attested revenue data from the Veritasor attestation protocol. It provides a transparent, auditable mechanism for revenue sharing with configurable stakeholder allocations.
+The revenue-share contract distributes a caller-supplied revenue amount from a business wallet to a configured set of stakeholders using basis-point shares.
 
-## Key Features
+This contract currently does **not** read or validate attestations during `distribute_revenue`. The stored `attestation_contract` address is an integration hook and coordination reference for future use, not an active runtime dependency in the current implementation.
 
-- **Automated Distribution**: Distributes revenue to multiple stakeholders in a single transaction
-- **Flexible Configuration**: Supports 1-50 stakeholders with customizable share percentages
-- **Safe Rounding**: Handles rounding residuals by allocating to the first stakeholder
-- **Audit Trail**: Records all distributions with timestamps and individual amounts
-- **Access Control**: Admin-only configuration changes
-- **Integration Ready**: Designed to work with Veritasor attestation contracts
+## Current Interface
 
-## Distribution Model
+Contract location: `contracts/revenue-share/src/lib.rs`
 
-### Share Allocation
+Primary tests: `contracts/revenue-share/src/test.rs`
 
-Stakeholder shares are expressed in **basis points** (bps), where:
-- 1 bps = 0.01%
-- 100 bps = 1%
-- 10,000 bps = 100%
+### Admin and Replay-Protected Methods
 
-The total of all stakeholder shares must equal exactly 10,000 bps (100%).
+All admin write methods use nonce-based replay protection on `NONCE_CHANNEL_ADMIN`.
 
-### Distribution Algorithm
+- `initialize(admin, nonce, attestation_contract, token)`
+- `configure_stakeholders(nonce, stakeholders)`
+- `set_attestation_contract(nonce, attestation_contract)`
+- `set_token(nonce, token)`
+- `get_replay_nonce(actor, channel)`
 
-When revenue is distributed:
+Nonce rules:
 
-1. **Validation**: Ensures stakeholders are configured and no duplicate distribution exists
-2. **Calculation**: For each stakeholder, calculates: `amount = revenue × share_bps / 10,000`
-3. **Rounding**: Truncates fractional amounts (integer division)
-4. **Residual Allocation**: Allocates any rounding residual to the first stakeholder
-5. **Transfer**: Executes token transfers to all stakeholders
-6. **Recording**: Stores distribution record with timestamp and individual amounts
+- the first valid admin nonce is `0`
+- each successful admin call increments the stored nonce by `1`
+- replayed or skipped nonces are rejected
+- failed calls revert without consuming the nonce
 
-### Rounding Example
+### Distribution Methods
 
-For a revenue of 10,000 tokens distributed among 3 equal stakeholders (3,333 bps each, with first having 3,334 bps):
+- `distribute_revenue(business, period, revenue_amount)`
+- `get_distribution(business, period)`
+- `get_distribution_count(business)`
+- `get_stakeholders()`
+- `get_admin()`
+- `get_attestation_contract()`
+- `get_token()`
+- `calculate_share(revenue, share_bps)`
 
-```
-Stakeholder 1: 10,000 × 3,334 / 10,000 = 3,334
-Stakeholder 2: 10,000 × 3,333 / 10,000 = 3,333
-Stakeholder 3: 10,000 × 3,333 / 10,000 = 3,333
-Total calculated: 10,000
-Residual: 0 (in this case, perfectly divisible)
-```
+## Stakeholder Configuration
 
-For 10,001 tokens:
-```
-Stakeholder 1: 10,001 × 3,334 / 10,000 = 3,334 (truncated from 3,334.3334)
-Stakeholder 2: 10,001 × 3,333 / 10,000 = 3,333 (truncated from 3,333.3333)
-Stakeholder 3: 10,001 × 3,333 / 10,000 = 3,333 (truncated from 3,333.3333)
-Total calculated: 10,000
-Residual: 1
-Final Stakeholder 1 amount: 3,334 + 1 = 3,335
-```
+Stakeholder shares are expressed in basis points.
 
-This ensures that the total distributed always equals the input revenue amount exactly, with no tokens lost to rounding.
+- `1 bps = 0.01%`
+- `10,000 bps = 100%`
 
-## Contract Methods
+Validation rules:
 
-### Initialization
+- stakeholder list must contain `1..=50` entries
+- each stakeholder must have at least `1` bps
+- stakeholder addresses must be unique
+- total shares must equal exactly `10,000` bps
 
-#### `initialize(admin, attestation_contract, token)`
+Stakeholder order is part of contract behavior because residual rounding is always assigned to index `0`.
 
-One-time contract initialization.
+## Distribution Algorithm
 
-**Parameters:**
-- `admin` (Address): Administrator address with configuration privileges
-- `attestation_contract` (Address): Veritasor attestation contract address
-- `token` (Address): Token contract for revenue distributions
+For each stakeholder:
 
-**Authorization:** Requires `admin` signature
+`share_amount = revenue_amount * share_bps / 10_000`
 
-**Panics:**
-- If already initialized
+The division uses integer truncation. After all truncated shares are computed:
 
-**Example:**
-```rust
-client.initialize(
-    &admin_address,
-    &attestation_contract_address,
-    &usdc_token_address
-);
-```
+- `residual = revenue_amount - sum(truncated_shares)`
+- if `residual > 0`, the contract adds the full residual to the first stakeholder
 
-### Configuration (Admin Only)
+This makes the allocation deterministic and ensures no value is lost to rounding.
 
-#### `configure_stakeholders(stakeholders)`
+## Distribution Invariants
 
-Configure or update stakeholder allocations.
+The current test suite hardens the following invariants:
 
-**Parameters:**
-- `stakeholders` (Vec<Stakeholder>): Vector of stakeholder configurations
+- total distributed amount always equals `revenue_amount`
+- non-first stakeholders always receive their truncated base share exactly
+- only the first stakeholder receives the rounding residual
+- residual is deterministic for a given `(stakeholders, revenue_amount)` input
+- residual is bounded by `stakeholder_count - 1`
+- a `(business, period)` pair can only be distributed once
+- failed distributions do not leave partial transfers or partial storage updates
 
-**Stakeholder Structure:**
-```rust
-pub struct Stakeholder {
-    pub address: Address,    // Recipient address
-    pub share_bps: u32,      // Share in basis points (1-10,000)
-}
-```
+## Residual Allocation Examples
 
-**Validation Rules:**
-- Must have 1-50 stakeholders
-- Total shares must equal exactly 10,000 bps (100%)
-- Each stakeholder must have at least 1 bps (0.01%)
-- No duplicate addresses allowed
+### Example: Equal Three-Way Split
 
-**Authorization:** Requires admin signature
+Shares:
 
-**Panics:**
-- If validation fails
-- If caller is not admin
+- stakeholder 1: `3334`
+- stakeholder 2: `3333`
+- stakeholder 3: `3333`
 
-**Example:**
-```rust
-let mut stakeholders = Vec::new(&env);
+For `revenue_amount = 10,001`:
 
-// 60% to stakeholder 1
-stakeholders.push_back(Stakeholder {
-    address: stakeholder1_address,
-    share_bps: 6000,
-});
+- stakeholder 1 base share = `10,001 * 3334 / 10,000 = 3,334`
+- stakeholder 2 base share = `10,001 * 3333 / 10,000 = 3,333`
+- stakeholder 3 base share = `10,001 * 3333 / 10,000 = 3,333`
+- base total = `10,000`
+- residual = `1`
+- final amounts = `[3,335, 3,333, 3,333]`
 
-// 40% to stakeholder 2
-stakeholders.push_back(Stakeholder {
-    address: stakeholder2_address,
-    share_bps: 4000,
-});
+### Example: Tiny Revenue, Many Stakeholders
 
-client.configure_stakeholders(&stakeholders);
-```
+Shares:
 
-#### `set_attestation_contract(attestation_contract)`
+- `50` stakeholders at `200` bps each
 
-Update the attestation contract address.
+For `revenue_amount = 49`:
 
-**Parameters:**
-- `attestation_contract` (Address): New attestation contract address
+- every truncated base share is `0`
+- residual = `49`
+- final amounts = `[49, 0, 0, ..., 0]`
 
-**Authorization:** Requires admin signature
+This is expected behavior. Very small revenues can collapse entirely to the first stakeholder because the contract prioritizes exact conservation and deterministic residual handling over proportional dust distribution.
 
-#### `set_token(token)`
+## Failure Semantics
 
-Update the token contract address.
+`distribute_revenue` panics if:
 
-**Parameters:**
-- `token` (Address): New token contract address
+- stakeholders are not configured
+- `revenue_amount` is negative
+- the same `(business, period)` was already distributed
+- token transfers fail
 
-**Authorization:** Requires admin signature
+Important behavior:
 
-### Distribution Execution
+- distribution state is recorded only after token transfers succeed
+- if any transfer fails, the entire call reverts
+- failed distributions do not increment `get_distribution_count`
+- failed distributions do not persist `DistributionRecord`
 
-#### `distribute_revenue(business, period, revenue_amount)`
+## Security Assumptions
 
-Execute revenue distribution to configured stakeholders.
+### Authorization
 
-**Parameters:**
-- `business` (Address): Business address with revenue to distribute
-- `period` (String): Revenue period identifier (e.g., "2026-Q1", "2026-02")
-- `revenue_amount` (i128): Total revenue amount to distribute
+- admin configuration requires admin authorization plus the correct replay nonce
+- revenue distribution requires `business.require_auth()`
 
-**Process:**
-1. Validates no duplicate distribution for this (business, period)
-2. Retrieves configured stakeholders
-3. Calculates each stakeholder's share
-4. Allocates rounding residual to first stakeholder
-5. Transfers tokens from business to each stakeholder
-6. Records distribution with timestamp
+### Atomicity
 
-**Authorization:** Requires business signature
+The contract relies on Soroban transaction atomicity for failure safety. Tests cover the case where a later stakeholder transfer fails after an earlier transfer would otherwise have succeeded, and assert that no partial payout remains.
 
-**Panics:**
-- If stakeholders not configured
-- If distribution already executed for this (business, period)
-- If revenue amount is negative
-- If token transfers fail (insufficient balance, etc.)
+### Attestation Assumption
 
-**Example:**
-```rust
-// Business distributes Q1 2026 revenue
-client.distribute_revenue(
-    &business_address,
-    &String::from_str(&env, "2026-Q1"),
-    &1_000_000  // 1M tokens
-);
-```
+The contract stores an `attestation_contract` address but does not currently validate that `revenue_amount` is backed by an attestation. Integrators must treat `distribute_revenue` as operating on a trusted caller-supplied amount unless they add external orchestration or a future contract revision introduces direct attestation reads.
 
-### Read-Only Queries
+### Deterministic Ordering
 
-#### `get_stakeholders()`
-
-Returns the current stakeholder configuration.
-
-**Returns:** `Option<Vec<Stakeholder>>`
-- `Some(stakeholders)` if configured
-- `None` if not yet configured
-
-#### `get_distribution(business, period)`
-
-Returns distribution record for a specific business and period.
-
-**Parameters:**
-- `business` (Address): Business address
-- `period` (String): Period identifier
-
-**Returns:** `Option<DistributionRecord>`
-
-**DistributionRecord Structure:**
-```rust
-pub struct DistributionRecord {
-    pub total_amount: i128,      // Total revenue distributed
-    pub timestamp: u64,          // Distribution timestamp
-    pub amounts: Vec<i128>,      // Individual amounts per stakeholder
-}
-```
-
-#### `get_distribution_count(business)`
-
-Returns total number of distributions executed for a business.
-
-**Parameters:**
-- `business` (Address): Business address
-
-**Returns:** `u64` - Distribution count (0 if none)
-
-#### `calculate_share(revenue, share_bps)`
-
-Pure calculation function for share amounts.
-
-**Parameters:**
-- `revenue` (i128): Total revenue amount
-- `share_bps` (u32): Share in basis points
-
-**Returns:** `i128` - Calculated share amount
-
-**Formula:** `amount = revenue × share_bps / 10,000`
-
-**Example:**
-```rust
-let share = RevenueShareContract::calculate_share(100_000, 2500);
-// Returns: 25,000 (25% of 100,000)
-```
-
-#### `get_admin()`
-
-Returns the contract administrator address.
-
-**Returns:** `Address`
-
-**Panics:** If contract not initialized
-
-#### `get_attestation_contract()`
-
-Returns the attestation contract address.
-
-**Returns:** `Address`
-
-**Panics:** If not configured
-
-#### `get_token()`
-
-Returns the token contract address.
-
-**Returns:** `Address`
-
-**Panics:** If not configured
-
-## Usage Scenarios
-
-### Scenario 1: Simple Two-Party Split
-
-A business wants to split revenue 70/30 with a partner:
-
-```rust
-// 1. Initialize contract
-client.initialize(&admin, &attestation_contract, &usdc_token);
-
-// 2. Configure stakeholders
-let mut stakeholders = Vec::new(&env);
-stakeholders.push_back(Stakeholder {
-    address: business_address,
-    share_bps: 7000,  // 70%
-});
-stakeholders.push_back(Stakeholder {
-    address: partner_address,
-    share_bps: 3000,  // 30%
-});
-client.configure_stakeholders(&stakeholders);
-
-// 3. Distribute monthly revenue
-client.distribute_revenue(
-    &business_address,
-    &String::from_str(&env, "2026-02"),
-    &500_000  // $500k USDC
-);
-// Result: Business receives $350k, Partner receives $150k
-```
-
-### Scenario 2: Multi-Stakeholder Distribution
-
-A platform with multiple investors and team members:
-
-```rust
-let mut stakeholders = Vec::new(&env);
-
-// Founder: 40%
-stakeholders.push_back(Stakeholder {
-    address: founder_address,
-    share_bps: 4000,
-});
-
-// Investor A: 25%
-stakeholders.push_back(Stakeholder {
-    address: investor_a_address,
-    share_bps: 2500,
-});
-
-// Investor B: 20%
-stakeholders.push_back(Stakeholder {
-    address: investor_b_address,
-    share_bps: 2000,
-});
-
-// Team pool: 15%
-stakeholders.push_back(Stakeholder {
-    address: team_pool_address,
-    share_bps: 1500,
-});
-
-client.configure_stakeholders(&stakeholders);
-
-// Quarterly distribution
-client.distribute_revenue(
-    &platform_address,
-    &String::from_str(&env, "2026-Q1"),
-    &2_000_000
-);
-```
-
-### Scenario 3: Multiple Distribution Cycles
-
-Tracking distributions over time:
-
-```rust
-// Month 1
-client.distribute_revenue(
-    &business,
-    &String::from_str(&env, "2026-01"),
-    &100_000
-);
-
-// Month 2
-client.distribute_revenue(
-    &business,
-    &String::from_str(&env, "2026-02"),
-    &150_000
-);
-
-// Month 3
-client.distribute_revenue(
-    &business,
-    &String::from_str(&env, "2026-03"),
-    &120_000
-);
-
-// Query distribution history
-let count = client.get_distribution_count(&business);
-// Returns: 3
-
-let feb_record = client.get_distribution(
-    &business,
-    &String::from_str(&env, "2026-02")
-).unwrap();
-// Returns: DistributionRecord with total_amount = 150,000
-```
-
-## Security Considerations
-
-### Rounding Safety
-
-The contract uses integer division for share calculations, which truncates fractional amounts. The residual (difference between input and sum of calculated shares) is always allocated to the first stakeholder. This ensures:
-
-1. **No token loss**: Total distributed always equals input amount
-2. **Predictable behavior**: First stakeholder always receives residual
-3. **Minimal impact**: Residual is typically 0-49 tokens (for 50 stakeholders)
-
-**Maximum residual:** With 50 stakeholders, maximum residual is 49 tokens (less than 0.001% for typical amounts).
-
-### Access Control
-
-- **Admin-only configuration**: Only the admin can modify stakeholders, attestation contract, or token
-- **Business authorization**: Only the business can initiate distributions for their revenue
-- **Immutable distributions**: Once executed, distributions cannot be modified (audit trail)
-
-### Validation
-
-The contract enforces strict validation:
-
-- **Share totals**: Must equal exactly 10,000 bps (100%)
-- **Stakeholder limits**: 1-50 stakeholders
-- **Minimum shares**: Each stakeholder must have at least 1 bps
-- **No duplicates**: Stakeholder addresses must be unique
-- **No re-distribution**: Cannot distribute twice for the same (business, period)
-- **Non-negative amounts**: Revenue amounts must be >= 0
-
-### Token Transfer Safety
-
-- Uses Soroban SDK's `token::Client` for safe transfers
-- Requires business to have sufficient token balance
-- Transfers fail atomically if any individual transfer fails
-- Business must authorize the distribution transaction
-
-## Integration with Attestation Contract
-
-While the current implementation accepts revenue amounts directly, it's designed to integrate with the Veritasor attestation contract for verified revenue data:
-
-### Future Integration Pattern
-
-```rust
-// Pseudo-code for future attestation integration
-pub fn distribute_attested_revenue(
-    env: Env,
-    business: Address,
-    period: String,
-) {
-    // 1. Fetch attestation from attestation contract
-    let attestation_contract = Self::get_attestation_contract(&env);
-    let attestation_client = AttestationContractClient::new(&env, &attestation_contract);
-    
-    // 2. Verify attestation exists and is valid
-    let (merkle_root, timestamp, version, _fee) = attestation_client
-        .get_attestation(&business, &period)
-        .expect("attestation not found");
-    
-    // 3. Extract revenue amount from attestation metadata
-    // (Implementation depends on attestation data structure)
-    let revenue_amount = extract_revenue_from_attestation(...);
-    
-    // 4. Execute distribution
-    Self::distribute_revenue(env, business, period, revenue_amount);
-}
-```
-
-## Testing
-
-The contract includes comprehensive test coverage (>95%) covering:
-
-### Core Functionality
-- Initialization and configuration
-- Stakeholder management
-- Revenue distribution execution
-- Query operations
-
-### Edge Cases
-- Zero revenue distributions
-- Single stakeholder (100% allocation)
-- Maximum stakeholders (50)
-- Extreme allocations (99/1 splits)
-- Rounding with indivisible amounts
-
-### Error Conditions
-- Duplicate distributions
-- Invalid share totals
-- Duplicate stakeholder addresses
-- Negative revenue amounts
-- Unconfigured stakeholders
-
-### Scenario Tests
-- Multiple distribution cycles
-- Configuration updates
-- Multi-stakeholder distributions
-- Rounding residual allocation
-
-## Deployment
-
-### Prerequisites
-
-- Rust 1.75+
-- Soroban CLI
-- Stellar account with XLM for fees
-
-### Build
-
-```bash
-cd contracts/revenue-share
-cargo build --target wasm32-unknown-unknown --release
-```
-
-The compiled WASM will be at:
-```
-target/wasm32-unknown-unknown/release/veritasor_revenue_share.wasm
-```
-
-### Deploy
-
-```bash
-stellar contract deploy \
-  --network testnet \
-  --source <YOUR_SECRET_KEY> \
-  --wasm target/wasm32-unknown-unknown/release/veritasor_revenue_share.wasm
-```
-
-### Initialize
-
-```bash
-stellar contract invoke \
-  --network testnet \
-  --source <YOUR_SECRET_KEY> \
-  --id <CONTRACT_ID> \
-  -- initialize \
-  --admin <ADMIN_ADDRESS> \
-  --attestation_contract <ATTESTATION_CONTRACT_ID> \
-  --token <TOKEN_CONTRACT_ID>
-```
+Residual allocation depends on stakeholder ordering. Reordering stakeholders changes who receives rounding dust even if basis-point totals are unchanged.
 
 ## Performance Characteristics
 
-### Gas Costs
+The contract is `O(n)` in the number of stakeholders for each distribution.
 
-Distribution costs scale linearly with the number of stakeholders:
+Per distribution call:
 
-- **Fixed overhead**: Contract validation, storage reads
-- **Per-stakeholder cost**: Share calculation + token transfer
-- **Storage cost**: Distribution record storage
+- `n` stakeholder reads
+- `n` share calculations
+- up to `n` token transfers
+- one distribution record write
+- one distribution counter update
 
-**Estimated costs** (approximate):
-- 2 stakeholders: ~0.1 XLM
-- 10 stakeholders: ~0.3 XLM
-- 50 stakeholders: ~1.0 XLM
+Operational implications:
 
-### Storage
+- gas cost grows linearly with stakeholder count
+- the configured hard cap of `50` stakeholders keeps the worst-case loop bounded
+- the maximum residual is less than the stakeholder count, so at most `49` tokens for the current cap
 
-Per distribution record:
-- Total amount: 16 bytes (i128)
-- Timestamp: 8 bytes (u64)
-- Amounts vector: 16 bytes × stakeholder count
-- Keys and overhead: ~100 bytes
+## Test Coverage and Assurance
 
-**Example:** 50 stakeholders = ~900 bytes per distribution
+The current suite covers:
 
-## Limitations
+- nonce replay protection for admin methods
+- failed admin validation with nonce preservation
+- exact split distributions
+- zero-amount distributions
+- residual allocation for skewed and equalized share sets
+- tiny-revenue adversarial cases
+- duplicate-period rejection with state preservation
+- transfer-failure rollback behavior
+- stakeholder reconfiguration affecting only future periods
+- invariant matrix coverage across multiple share configurations and revenue values
 
-1. **Maximum stakeholders**: 50 (configurable limit for gas efficiency)
-2. **Rounding precision**: Integer division only (no fractional tokens)
-3. **Immutable distributions**: Cannot modify or cancel after execution
-4. **Single token**: One token contract per deployment
-5. **No time-based automation**: Requires manual distribution trigger
+Validation command:
 
-## Future Enhancements
+```bash
+cargo test -p veritasor-revenue-share
+```
 
-Potential improvements for future versions:
+## Example Usage
 
-1. **Attestation integration**: Direct integration with attestation contract for verified revenue
-2. **Scheduled distributions**: Time-based automatic distributions
-3. **Multi-token support**: Distribute multiple token types
-4. **Vesting schedules**: Time-locked stakeholder allocations
-5. **Dynamic shares**: Stakeholder shares that change over time
-6. **Distribution templates**: Pre-configured allocation patterns
-7. **Batch distributions**: Distribute to multiple businesses in one transaction
+```rust
+let nonce = client.get_replay_nonce(&admin, &NONCE_CHANNEL_ADMIN);
+client.configure_stakeholders(&nonce, &stakeholders);
 
-## License
+client.distribute_revenue(
+    &business,
+    &String::from_str(&env, "2026-02"),
+    &500_000,
+);
+```
 
-This contract is part of the Veritasor protocol and follows the same license as the parent repository.
+## Future Integration
 
-## Support
-
-For questions, issues, or contributions:
-- GitHub: [Veritasor/Veritasor-Contracts](https://github.com/Veritasor/Veritasor-Contracts)
-- Documentation: [docs/](../docs/)
+The stored `attestation_contract` field is intended to support a future flow where `distribute_revenue` or an adjacent orchestration layer derives `revenue_amount` from attested data instead of accepting it directly.

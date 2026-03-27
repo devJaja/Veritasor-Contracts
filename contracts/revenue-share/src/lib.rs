@@ -2,15 +2,15 @@
 
 //! # Revenue Share Distribution Contract
 //!
-//! Automatically distributes on-chain revenue to multiple stakeholders based on
-//! attested revenue data from the Veritasor attestation protocol.
+//! Automatically distributes caller-supplied revenue amounts to configured
+//! stakeholders using deterministic basis-point allocation rules.
 //!
 //! ## Distribution Model
 //!
 //! The contract maintains a list of stakeholders with their respective share percentages.
 //! When revenue is distributed:
 //!
-//! 1. Fetches attested revenue amount from the attestation contract
+//! 1. Accepts a caller-supplied revenue amount
 //! 2. Calculates each stakeholder's share: `amount = revenue × share_bps / 10_000`
 //! 3. Transfers tokens to each stakeholder
 //! 4. Handles rounding residuals by allocating to the first stakeholder
@@ -26,7 +26,7 @@
 //!
 //! - Admin-only configuration changes
 //! - Validates share totals on every update
-//! - Prevents distribution without valid attestation
+//! - Makes residual allocation deterministic and reviewable
 //! - Tracks distribution history for audit
 //! - Safe rounding with residual allocation
 
@@ -45,7 +45,7 @@ pub const NONCE_CHANNEL_ADMIN: u32 = 1;
 pub enum DataKey {
     /// Contract administrator
     Admin,
-    /// Attestation contract address
+    /// Attestation contract address reserved for integration and off-chain coordination
     AttestationContract,
     /// Token contract for distributions
     Token,
@@ -101,19 +101,20 @@ impl RevenueShareContract {
     /// # Panics
     /// - If already initialized
     /// - If nonce is invalid
-    pub fn initialize(env: Env, admin: Address, nonce: u64, attestation_contract: Address, token: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        nonce: u64,
+        attestation_contract: Address,
+        token: Address,
+    ) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         admin.require_auth();
-        
+
         // Verify and increment nonce for replay protection
-        replay_protection::verify_and_increment_nonce(
-            &env, 
-            &admin, 
-            NONCE_CHANNEL_ADMIN, 
-            nonce
-        );
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -213,7 +214,7 @@ impl RevenueShareContract {
 
     // ── Distribution Execution ──────────────────────────────────────
 
-    /// Distribute revenue based on attested data.
+    /// Distribute a caller-supplied revenue amount using the configured split.
     ///
     /// # Parameters
     /// - `business`: Business address with attested revenue
@@ -221,16 +222,15 @@ impl RevenueShareContract {
     /// - `revenue_amount`: Total revenue amount to distribute
     ///
     /// # Process
-    /// 1. Validates attestation exists and matches revenue amount
-    /// 2. Calculates each stakeholder's share
-    /// 3. Transfers tokens to stakeholders
-    /// 4. Allocates rounding residual to first stakeholder
+    /// 1. Validates this `(business, period)` has not already been distributed
+    /// 2. Calculates each stakeholder's truncated share
+    /// 3. Allocates any residual to the first stakeholder
+    /// 4. Transfers tokens to stakeholders
     /// 5. Records distribution for audit
     ///
     /// # Panics
     /// - If stakeholders not configured
     /// - If distribution already executed for this (business, period)
-    /// - If attestation validation fails
     /// - If token transfers fail
     pub fn distribute_revenue(env: Env, business: Address, period: String, revenue_amount: i128) {
         business.require_auth();
@@ -363,16 +363,6 @@ impl RevenueShareContract {
 
     // ── Internal Helpers ────────────────────────────────────────────
 
-    fn require_admin(env: &Env) -> Address {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("contract not initialized");
-        admin.require_auth();
-        admin
-    }
-    
     /// Helper function to require admin auth and verify replay protection nonce
     fn require_admin_with_nonce(env: &Env, nonce: u64) -> Address {
         let admin: Address = env
@@ -381,15 +371,10 @@ impl RevenueShareContract {
             .get(&DataKey::Admin)
             .expect("contract not initialized");
         admin.require_auth();
-        
+
         // Verify and increment nonce for replay protection
-        replay_protection::verify_and_increment_nonce(
-            env, 
-            &admin, 
-            NONCE_CHANNEL_ADMIN, 
-            nonce
-        );
-        
+        replay_protection::verify_and_increment_nonce(env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+
         admin
     }
 }
