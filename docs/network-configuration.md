@@ -595,6 +595,62 @@ cargo test -p veritasor-network-config rollback -- --nocapture
 4. Update default network if needed: `set_default_network()`
 5. After grace period, remove network: `remove_network(network_id)`
 
+## Business Config: Immutable Anchor Fields
+
+The Business Config contract supports **immutable anchor fields** — the ability to permanently lock individual configuration sections for a business so they can never be modified again.
+
+### AnchorConfig
+
+```rust
+struct AnchorConfig {
+    anomaly_policy_anchored: bool,
+    integrations_anchored: bool,
+    expiry_anchored: bool,
+    custom_fees_anchored: bool,
+    compliance_anchored: bool,
+}
+```
+
+### Behavior
+
+- **One-way lock**: Once a section is anchored (`true`), it cannot be un-anchored. Passing `false` for a previously anchored field is a no-op.
+- **Per-business**: Anchor configurations are independent per business address.
+- **Initial config allowed**: Anchoring fields before any config exists still permits the first `set_business_config` call. Immutability only applies to subsequent updates.
+- **Granular enforcement**: Anchoring one section (e.g., compliance) does not affect updates to other sections (e.g., expiry).
+- **Full and partial updates blocked**: Both `set_business_config` (full replace) and individual `update_*` methods respect anchor locks.
+
+### API
+
+```rust
+/// Lock config sections for a business (admin only, irreversible)
+fn set_anchor_config(env: Env, caller: Address, business: Address, anchor: AnchorConfig)
+
+/// Query current anchor state (returns all-false if unset)
+fn get_anchor_config(env: Env, business: Address) -> AnchorConfig
+```
+
+### Events
+
+| Event      | Topics           | Data         | Description             |
+|------------|------------------|--------------|-------------------------|
+| `anc_set`  | business         | AnchorConfig | Anchor config updated   |
+
+### Example
+
+```bash
+# Lock compliance config permanently for a regulated business
+stellar contract invoke --id <BUSINESS_CONFIG_CONTRACT> -- set_anchor_config \
+  --caller <ADMIN> \
+  --business <BUSINESS> \
+  --anchor '{
+    "anomaly_policy_anchored": false,
+    "integrations_anchored": false,
+    "expiry_anchored": false,
+    "custom_fees_anchored": false,
+    "compliance_anchored": true
+  }'
+```
+
 ## License
 
 Part of the Veritasor Contracts - see repository LICENSE file for details.
