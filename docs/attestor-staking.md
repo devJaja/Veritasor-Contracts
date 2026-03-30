@@ -132,6 +132,12 @@ Call `slash(attestor, amount, dispute_id)`:
   - `stake.locked <= stake.amount`
   - If pending unstake exists and exceeds `stake.locked`, it is reduced.
 - Transfers slashed tokens to the configured `treasury`.
+- Records slashing state (`is_dispute_processed(dispute_id) == true`).
+
+### Supporting read APIs
+
+- `get_dispute_contract()`: returns configured dispute contract address.
+- `is_dispute_processed(dispute_id)`: true if given dispute id has been used for slash.
 
 ## Eligibility
 

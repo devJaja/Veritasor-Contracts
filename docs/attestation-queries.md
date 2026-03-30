@@ -45,7 +45,37 @@ Constants: STATUS_ACTIVE = 0, STATUS_REVOKED = 1, STATUS_FILTER_ALL = 2.
 3. Apply period_start / period_end / status_filter / version_filter as needed. Filtering is done on-chain to reduce payload.
 4. For the next page, use the same period list with cursor = next_cursor until next_cursor >= periods.len().
 
+## Handling Sparse Periods
+
+Pagination remains stable under sparse conditions (gaps/missing attestations):
+
+- Missing periods skipped efficiently (storage miss fast).
+- next_cursor +=1 per period scanned (hits or misses).
+- Adversarial lists (unsorted/duplicates) handled without panic.
+- Cursor jumps to sparse regions bounded.
+- Filters + sparsity correct.
+- Roundtrips reproducible.
+
+See `query_pagination_test.rs` sparse suite.
+
 ## Performance considerations
 
 - One call does at most min(limit, QUERY_LIMIT_MAX) attestation lookups plus the same number of status lookups. Keep period list size and page size reasonable (e.g. 30–50 periods per request).
 - Round-trip correctness: fetching all pages with cursor 0, next_cursor, … until next_cursor >= len yields all matching attestations exactly once.
+
+## Cursor stability
+
+The pagination cursor is designed for stability across concurrent modifications:
+
+- **Position-based indexing:** The cursor indexes into the caller-provided `periods` list, not the contract's internal storage. This ensures deterministic iteration regardless of on-chain state changes.
+- **Stable across filters:** Applying different filters (status, version, period range) does not affect cursor positions. The cursor always advances through the periods list, skipping non-matching entries.
+- **Concurrent modification safety:** Since the periods list is provided by the caller, new attestations or revocations do not shift cursor positions or cause items to be skipped or duplicated during pagination.
+- **Lexicographic period comparison:** Period range filters use lexicographic string comparison, enabling natural ordering for YYYY-MM format periods.
+
+### Guarantees
+
+1. **No duplicates:** Each period in the list is visited exactly once during a complete pagination sequence.
+2. **No skips:** All matching attestations are returned when iterating from cursor 0 to periods.len().
+3. **Deterministic ordering:** Results are returned in the same order as the input periods list.
+4. **Idempotent queries:** Calling with the same parameters always returns the same results (assuming no state changes between calls).
+

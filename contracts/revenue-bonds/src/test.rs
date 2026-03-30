@@ -59,6 +59,7 @@ fn test_issue_bond_fixed_structure() {
 
     client.initialize(&admin);
 
+let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
         &issuer,
         &owner,
@@ -68,6 +69,7 @@ fn test_issue_bond_fixed_structure() {
         &500_000,
         &500_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -87,6 +89,7 @@ fn test_issue_bond_revenue_linked() {
 
     client.initialize(&admin);
 
+let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
         &issuer,
         &owner,
@@ -96,6 +99,7 @@ fn test_issue_bond_revenue_linked() {
         &100_000,
         &1_000_000,
         &24,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -113,6 +117,7 @@ fn test_issue_bond_hybrid() {
 
     client.initialize(&admin);
 
+let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
         &issuer,
         &owner,
@@ -122,6 +127,7 @@ fn test_issue_bond_hybrid() {
         &200_000,
         &800_000,
         &18,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -138,6 +144,7 @@ fn test_issue_bond_invalid_face_value() {
     let client = RevenueBondContractClient::new(&env, &contract_id);
 
     client.initialize(&admin);
+let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
         &issuer,
         &owner,
@@ -147,6 +154,7 @@ fn test_issue_bond_invalid_face_value() {
         &500_000,
         &500_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -160,6 +168,7 @@ fn test_issue_bond_invalid_revenue_share() {
     let client = RevenueBondContractClient::new(&env, &contract_id);
 
     client.initialize(&admin);
+let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
         &issuer,
         &owner,
@@ -169,6 +178,7 @@ fn test_issue_bond_invalid_revenue_share() {
         &100_000,
         &1_000_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -182,6 +192,7 @@ fn test_issue_bond_invalid_payment_range() {
     let client = RevenueBondContractClient::new(&env, &contract_id);
 
     client.initialize(&admin);
+let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
         &issuer,
         &owner,
@@ -191,6 +202,7 @@ fn test_issue_bond_invalid_payment_range() {
         &1_000_000,
         &500_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -395,6 +407,84 @@ fn test_multiple_period_redemptions() {
 
     assert_eq!(client.get_total_redeemed(&bond_id), 1_500_000);
     assert_eq!(client.get_remaining_value(&bond_id), 8_500_000);
+}
+
+/// Maturity is currently informational only. Redemptions continue if the bond
+/// is still active and has remaining face value, even when periods drift past
+/// the configured maturity window.
+#[test]
+fn test_redemption_continues_after_maturity_period_drift() {
+    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer,
+        &owner,
+        &2_000_000,
+        &BondStructure::Fixed,
+        &0,
+        &500_000,
+        &500_000,
+        &2,
+        &attestation_contract,
+        &token,
+    );
+
+    let period1 = String::from_str(&env, "2026-01");
+    let period2 = String::from_str(&env, "2026-02");
+    let period3 = String::from_str(&env, "2026-03");
+
+    client.redeem(&bond_id, &period1, &1_000_000);
+    client.redeem(&bond_id, &period2, &1_000_000);
+    client.redeem(&bond_id, &period3, &1_000_000);
+
+    let bond = client.get_bond(&bond_id).unwrap();
+    let redemption3 = client.get_redemption(&bond_id, &period3).unwrap();
+
+    assert_eq!(redemption3.redemption_amount, 500_000);
+    assert_eq!(client.get_total_redeemed(&bond_id), 1_500_000);
+    assert_eq!(client.get_remaining_value(&bond_id), 500_000);
+    assert_eq!(bond.status, BondStatus::Active);
+}
+
+/// Distinct period keys are the anti-double-spend boundary; ordering is not
+/// enforced so out-of-order period redemption remains valid.
+#[test]
+fn test_redemption_allows_out_of_order_period_drift() {
+    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer,
+        &owner,
+        &2_000_000,
+        &BondStructure::Fixed,
+        &0,
+        &500_000,
+        &500_000,
+        &12,
+        &attestation_contract,
+        &token,
+    );
+
+    let later_period = String::from_str(&env, "2026-03");
+    let earlier_period = String::from_str(&env, "2026-01");
+
+    client.redeem(&bond_id, &later_period, &1_000_000);
+    client.redeem(&bond_id, &earlier_period, &1_000_000);
+
+    let later_redemption = client.get_redemption(&bond_id, &later_period).unwrap();
+    let earlier_redemption = client.get_redemption(&bond_id, &earlier_period).unwrap();
+
+    assert_eq!(later_redemption.redemption_amount, 500_000);
+    assert_eq!(earlier_redemption.redemption_amount, 500_000);
+    assert_eq!(client.get_total_redeemed(&bond_id), 1_000_000);
 }
 
 #[test]

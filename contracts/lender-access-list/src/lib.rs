@@ -18,6 +18,8 @@ pub enum DataKey {
     Admin,
     /// Governance role flag for an address.
     GovernanceRole(Address),
+    /// Delegated admin flag for an address (lender management only).
+    DelegatedAdmin(Address),
     /// Lender record by address.
     Lender(Address),
     /// List of all lender addresses that have ever been added.
@@ -74,6 +76,9 @@ const TOPIC_LENDER_SET: Symbol = symbol_short!("lnd_set");
 const TOPIC_LENDER_REMOVED: Symbol = symbol_short!("lnd_rem");
 const TOPIC_GOV_GRANTED: Symbol = symbol_short!("gov_add");
 const TOPIC_GOV_REVOKED: Symbol = symbol_short!("gov_del");
+/// Delegated admin events.
+const TOPIC_DELEGATED_ADMIN_GRANTED: Symbol = symbol_short!("del_admin_add");
+const TOPIC_DELEGATED_ADMIN_REVOKED: Symbol = symbol_short!("del_admin_del");
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -87,6 +92,15 @@ pub struct LenderEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct GovernanceEvent {
+    pub account: Address,
+    pub enabled: bool,
+    pub changed_by: Address,
+}
+
+/// Delegated admin event.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DelegatedAdminEvent {
     pub account: Address,
     pub enabled: bool,
     pub changed_by: Address,
@@ -153,15 +167,49 @@ impl LenderAccessListContract {
         );
     }
 
+    /// Grant delegated admin role for lender management. Only admin.
+    pub fn grant_delegated_admin(env: Env, admin: Address, account: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegatedAdmin(account.clone()), &true);
+
+        env.events().publish(
+            (TOPIC_DELEGATED_ADMIN_GRANTED,),
+            DelegatedAdminEvent {
+                account,
+                enabled: true,
+                changed_by: admin,
+            },
+        );
+    }
+
+    /// Revoke delegated admin role. Only admin.
+    pub fn revoke_delegated_admin(env: Env, admin: Address, account: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegatedAdmin(account.clone()), &false);
+
+        env.events().publish(
+            (TOPIC_DELEGATED_ADMIN_REVOKED,),
+            DelegatedAdminEvent {
+                account,
+                enabled: false,
+                changed_by: admin,
+            },
+        );
+    }
+
     /// Add or update a lender.
     ///
     /// Access tiers:
     /// - tier 0: no access (treated as removed/disabled)
     /// - tier 1+: can rely on Veritasor attestations for lender-facing operations
     ///
-    /// Only governance can call.
+    /// Lender admin (governance or delegated admin) can call.
     pub fn set_lender(env: Env, caller: Address, lender: Address, tier: u32, metadata: LenderMetadata) {
-        Self::require_governance(&env, &caller);
+        Self::require_lender_admin(&env, &caller);
 
         let now = env.ledger().sequence();
         let key = DataKey::Lender(lender.clone());
@@ -200,9 +248,9 @@ impl LenderAccessListContract {
     }
 
     /// Remove a lender from the allowlist (sets status to Removed and tier to 0).
-    /// Only governance can call.
+    /// Lender admin (governance or delegated admin) can call.
     pub fn remove_lender(env: Env, caller: Address, lender: Address) {
-        Self::require_governance(&env, &caller);
+        Self::require_lender_admin(&env, &caller);
 
         let key = DataKey::Lender(lender.clone());
         let mut record: Lender = env
@@ -288,6 +336,14 @@ impl LenderAccessListContract {
             .unwrap_or(false)
     }
 
+    /// Check delegated admin role.
+    pub fn has_delegated_admin(env: Env, account: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::DelegatedAdmin(account))
+            .unwrap_or(false)
+    }
+
     fn append_lender_to_list(env: &Env, lender: &Address) {
         let mut list: Vec<Address> = env
             .storage()
@@ -317,6 +373,22 @@ impl LenderAccessListContract {
             .get(&DataKey::Admin)
             .expect("not initialized");
         assert!(*caller == admin, "caller is not admin");
+    }
+
+    /// Require caller has governance OR delegated admin role for lender management.
+    fn require_lender_admin(env: &Env, caller: &Address) {
+        caller.require_auth();
+        let has_gov: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceRole(caller.clone()))
+            .unwrap_or(false);
+        let has_del: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegatedAdmin(caller.clone()))
+            .unwrap_or(false);
+        assert!(has_gov || has_del, "caller lacks lender admin privileges");
     }
 
     fn require_governance(env: &Env, caller: &Address) {

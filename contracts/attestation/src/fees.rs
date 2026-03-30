@@ -1,5 +1,5 @@
 //! # Flat Fee Mechanism for Attestations
-//! 
+//!
 //! This module implements a simple flat fee mechanism for the Veritasor attestation protocol.
 //! Fees are collected in a specified token and sent to a treasury address.
 
@@ -26,10 +26,10 @@ pub enum FlatFeeDataKey {
 }
 
 /// Retrieve the current flat fee configuration from instance storage.
-/// 
+///
 /// # Arguments
 /// * `env` - The Soroban environment.
-/// 
+///
 /// # Returns
 /// * `Option<FlatFeeConfig>` - The stored configuration if it exists.
 pub fn get_flat_fee_config(env: &Env) -> Option<FlatFeeConfig> {
@@ -37,20 +37,22 @@ pub fn get_flat_fee_config(env: &Env) -> Option<FlatFeeConfig> {
 }
 
 /// Store a new flat fee configuration in instance storage.
-/// 
+///
 /// # Arguments
 /// * `env` - The Soroban environment.
 /// * `config` - The flat fee configuration to store.
 pub fn set_flat_fee_config(env: &Env, config: &FlatFeeConfig) {
-    env.storage().instance().set(&FlatFeeDataKey::FlatFeeConfig, config);
+    env.storage()
+        .instance()
+        .set(&FlatFeeDataKey::FlatFeeConfig, config);
 }
 
 /// Collect the flat fee by transferring tokens from the payer to the treasury.
-/// 
+///
 /// # Arguments
 /// * `env` - The Soroban environment.
 /// * `payer` - The address of the party paying the fee.
-/// 
+///
 /// # Returns
 /// * `i128` - The amount of fee collected (0 if disabled or amount is 0).
 pub fn collect_flat_fee(env: &Env, payer: &Address) -> i128 {
