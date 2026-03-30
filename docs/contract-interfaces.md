@@ -1493,6 +1493,8 @@ Emitted when a new attestation is submitted.
 | `timestamp` | `u64` | Timestamp |
 | `version` | `u32` | Schema version |
 | `fee_paid` | `i128` | Fee paid |
+| `proof_hash` | `Option<BytesN<32>>` | Optional off-chain proof hash |
+| `expiry_timestamp` | `Option<u64>` | Optional expiry timestamp |
 
 **Topic:** `att_sub`
 
@@ -1598,6 +1600,57 @@ Emitted when fee configuration changes.
 **Topic:** `fee_cfg`
 
 ---
+
+#### `RateLimitConfigChanged`
+
+Emitted when rate limit configuration changes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `max_submissions` | `u32` | Max submissions per window |
+| `window_seconds` | `u64` | Window duration in seconds |
+| `enabled` | `bool` | Enabled status |
+| `changed_by` | `Address` | Changer address |
+
+**Topic:** `rate_lm`
+
+---
+
+#### `KeyRotationProposed`
+
+Emitted when an admin rotation is proposed.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `old_admin` | `Address` | Current admin |
+| `new_admin` | `Address` | Proposed new admin |
+| `timelock_until` | `u32` | Timelock expiry |
+| `expires_at` | `u32` | Proposal expiry |
+
+**Topic:** `kr_prop`
+
+---
+
+#### `KeyRotationConfirmed`
+
+Emitted when an admin rotation is confirmed.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `old_admin` | `Address` | Previous admin |
+| `new_admin` | `Address` | New admin |
+| `is_emergency` | `bool` | Whether rotation was emergency |
+
+**Topic:** `kr_conf`
+
+### 8.1.11 Gas and Performance Considerations
+
+Event emission in Soroban consumes CPU instructions and adds to the transaction's entry size.
+
+- **Topic Efficiency:** Veritasor uses `symbol_short!` (up to 9 characters) for event topics to minimize storage and processing costs.
+- **Data Serialization:** Event data is serialized as Soroban `Val` types. Large collections or strings in event data can significantly increase gas costs.
+- **Indexing Overhead:** While on-chain costs are relatively low, frequent event emission can increase the load on off-chain indexers.
+- **Typical Cost:** Standard `AttestationSubmitted` event cost: ~1,500 - 3,000 instructions (depending on metadata size).
 
 ### 8.2 IntegrationRegistryContract Events
 

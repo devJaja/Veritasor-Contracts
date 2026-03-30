@@ -223,6 +223,22 @@ pub struct KeyRotationCancelledEvent {
 ///
 /// This event is emitted whenever a new attestation is successfully stored.
 /// Indexers can use this to track all attestations submitted to the contract.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `business` - Business address that submitted the attestation
+/// * `period` - Period identifier (e.g., "2026-02")
+/// * `merkle_root` - Merkle root hash of the attestation data
+/// * `timestamp` - Timestamp of the attestation
+/// * `version` - Version of the attestation schema
+/// * `fee_paid` - Fee paid for this attestation
+/// * `proof_hash` - Optional SHA-256 hash pointing to the off-chain proof bundle
+/// * `expiry_timestamp` - Optional expiry timestamp for the attestation
+///
+/// # Events
+///
+/// * AttestationSubmitted - Emitted on successful publication
 #[allow(clippy::too_many_arguments)]
 pub fn emit_attestation_submitted(
     env: &Env,
@@ -253,6 +269,18 @@ pub fn emit_attestation_submitted(
 ///
 /// This event is emitted when an attestation is revoked. The event includes
 /// the reason for revocation to provide context for auditing.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `business` - Business address whose attestation was revoked
+/// * `period` - Period identifier of the revoked attestation
+/// * `revoked_by` - Address that performed the revocation
+/// * `reason` - Reason for revocation (optional context)
+///
+/// # Events
+///
+/// * AttestationRevoked - Emitted on successful publication
 pub fn emit_attestation_revoked(
     env: &Env,
     business: &Address,
@@ -274,6 +302,21 @@ pub fn emit_attestation_revoked(
 ///
 /// This event is emitted when an attestation is migrated to a new version.
 /// The event includes both old and new values for audit trail purposes.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `business` - Business address whose attestation was migrated
+/// * `period` - Period identifier of the migrated attestation
+/// * `old_merkle_root` - Old merkle root before migration
+/// * `new_merkle_root` - New merkle root after migration
+/// * `old_version` - Old version before migration
+/// * `new_version` - New version after migration
+/// * `migrated_by` - Address that performed the migration
+///
+/// # Events
+///
+/// * AttestationMigrated - Emitted on successful publication
 #[allow(clippy::too_many_arguments)]
 pub fn emit_attestation_migrated(
     env: &Env,
@@ -337,6 +380,15 @@ pub fn emit_paused(env: &Env, changed_by: &Address) {
 /// Emit a contract unpaused event.
 ///
 /// This event is emitted when the contract is unpaused.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `changed_by` - Address that changed the pause state
+///
+/// # Events
+///
+/// * ContractUnpaused - Emitted on successful publication
 pub fn emit_unpaused(env: &Env, changed_by: &Address) {
     let event = PauseChangedEvent {
         changed_by: changed_by.clone(),
@@ -398,6 +450,18 @@ pub fn emit_business_reactivated(env: &Env, business: &Address, reactivated_by: 
 ///
 /// This event is emitted when the rate limit configuration is created or
 /// updated by the admin.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `max_submissions` - Maximum submissions per business in one window
+/// * `window_seconds` - Sliding-window duration in seconds
+/// * `enabled` - Whether rate limiting is enabled
+/// * `changed_by` - Address that made the change
+///
+/// # Events
+///
+/// * RateLimitConfigChanged - Emitted on successful publication
 pub fn emit_rate_limit_config_changed(
     env: &Env,
     max_submissions: u32,
@@ -417,6 +481,18 @@ pub fn emit_rate_limit_config_changed(
 /// Emit a key rotation proposed event.
 ///
 /// This event is emitted when an admin proposes a key rotation.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `old_admin` - Address of the current admin proposing the rotation
+/// * `new_admin` - Address of the proposed new admin
+/// * `timelock_until` - Ledger sequence after which the rotation can be confirmed
+/// * `expires_at` - Ledger sequence after which the rotation expires
+///
+/// # Events
+///
+/// * KeyRotationProposed - Emitted on successful publication
 pub fn emit_key_rotation_proposed(
     env: &Env,
     old_admin: &Address,
@@ -436,6 +512,17 @@ pub fn emit_key_rotation_proposed(
 /// Emit a key rotation confirmed event.
 ///
 /// This event is emitted when a rotation is successfully confirmed.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `old_admin` - Address of the previous admin
+/// * `new_admin` - Address of the new admin
+/// * `is_emergency` - Whether this was an emergency rotation
+///
+/// # Events
+///
+/// * KeyRotationConfirmed - Emitted on successful publication
 pub fn emit_key_rotation_confirmed(
     env: &Env,
     old_admin: &Address,
@@ -453,6 +540,16 @@ pub fn emit_key_rotation_confirmed(
 /// Emit a key rotation cancelled event.
 ///
 /// This event is emitted when a pending rotation is cancelled.
+///
+/// # Arguments
+///
+/// * `env` - Env instance
+/// * `cancelled_by` - Address of the admin who cancelled the rotation
+/// * `proposed_new_admin` - Address that was proposed as the new admin
+///
+/// # Events
+///
+/// * KeyRotationCancelled - Emitted on successful publication
 pub fn emit_key_rotation_cancelled(
     env: &Env,
     cancelled_by: &Address,
