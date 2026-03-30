@@ -161,6 +161,7 @@ veritasor-contracts/
 
 With [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) and a configured network:
 
+
 ```bash
 stellar contract deploy \
   --network testnet \

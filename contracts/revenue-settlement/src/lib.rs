@@ -6,7 +6,7 @@
 
 #![allow(clippy::too_many_arguments)]
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Vec};
 
 /// Attestation client: WASM import for wasm32, crate for tests.
 #[cfg(target_arch = "wasm32")]
@@ -32,6 +32,7 @@ pub enum DataKey {
     Agreement(u64),
     Committed(u64, String),
     Settlement(u64, String),
+    BusinessPeriodToken(Address, String),
 }
 
 #[contracttype]
@@ -141,9 +142,27 @@ impl RevenueSettlementContract {
         id
     }
 
-    /// Settle revenue for a period: verify attestation, calculate repayment,
-    /// prevent double-spending via commitment tracking, transfer funds.
+    /// Settle revenue for a single period.
     pub fn settle(env: Env, agreement_id: u64, period: String, attested_revenue: i128) {
+        let periods = Vec::from_array(&env, [period]);
+        let revenues = Vec::from_array(&env, [attested_revenue]);
+        Self::settle_multi(env, agreement_id, periods, revenues);
+    }
+
+    /// Settle revenue for multiple periods with netting.
+    ///
+    /// Aggregates revenue across all provided periods, calculates a single netted 
+    /// repayment based on summed thresholds and caps, and distributes settlement 
+    /// records.
+    pub fn settle_multi(
+        env: Env,
+        agreement_id: u64,
+        periods: Vec<String>,
+        revenues: Vec<i128>,
+    ) {
+        assert!(periods.len() > 0, "periods cannot be empty");
+        assert_eq!(periods.len(), revenues.len(), "mismatched periods and revenues");
+
         let agreement: Agreement = env
             .storage()
             .instance()
@@ -151,28 +170,27 @@ impl RevenueSettlementContract {
             .expect("agreement not found");
 
         assert_eq!(agreement.status, 0, "agreement not active");
-        assert!(attested_revenue >= 0, "attested_revenue must be non-negative");
 
-        // Prevent double-settling for the same period
-        let existing: Option<SettlementRecord> = env
+        let attestation_client =
+            attestation_import::AttestationContractClient::new(&env, &agreement.attestation_contract);
+
+        // Prevent cross-token settlement for the same business and attestation period.
+        let business_period_token_key =
+            DataKey::BusinessPeriodToken(agreement.business.clone(), period.clone());
+        let business_period_token: Option<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::Settlement(agreement_id, period.clone()));
-        assert!(existing.is_none(), "already settled for period");
-
-        // Verify attestation exists and is not revoked
-        let client =
-            attestation_import::AttestationContractClient::new(&env, &agreement.attestation_contract);
-        assert!(
-            client
-                .get_attestation(&agreement.business, &period)
-                .is_some(),
-            "attestation not found"
-        );
-        assert!(
-            !client.is_revoked(&agreement.business, &period),
-            "attestation is revoked"
-        );
+            .get(&business_period_token_key);
+        if let Some(existing_token) = business_period_token {
+            assert_eq!(
+                existing_token, agreement.token,
+                "multi-currency settlement not allowed for period"
+            );
+        } else {
+            env.storage()
+                .instance()
+                .set(&business_period_token_key, &agreement.token);
+        }
 
         // Check commitment not already made for this period
         let committed_key = DataKey::Committed(agreement_id, period.clone());
@@ -186,41 +204,54 @@ impl RevenueSettlementContract {
             "commitment already made for period"
         );
 
-        // Calculate repayment
-        let repayment_amount = if attested_revenue >= agreement.min_revenue_threshold {
-            let share = (attested_revenue as u128)
+        let total_repayment_amount = if total_revenue >= agg_threshold && total_revenue > 0 {
+            let share = (total_revenue as u128)
                 .saturating_mul(agreement.revenue_share_bps as u128)
                 .saturating_div(10000) as i128;
-            share.min(agreement.max_repayment_amount)
+            share.min(agg_cap)
         } else {
             0
         };
 
-        // Mark as committed to prevent double-spending
-        env.storage()
-            .instance()
-            .set(&committed_key, &repayment_amount);
-
-        // Transfer tokens from business to lender
-        if repayment_amount > 0 {
+        // Transfer tokens
+        if total_repayment_amount > 0 {
             let token_client = token::Client::new(&env, &agreement.token);
-            token_client.transfer(&agreement.business, &agreement.lender, &repayment_amount);
+            token_client.transfer(&agreement.business, &agreement.lender, &total_repayment_amount);
         }
 
-        // Record settlement
-        let settlement = SettlementRecord {
-            agreement_id,
-            period: period.clone(),
-            attested_revenue,
-            repayment_amount,
-            amount_transferred: repayment_amount,
-            settled_at: env.ledger().timestamp(),
-        };
+        // Phase 3: Recording Settlements and Commitments
+        let settled_at = env.ledger().timestamp();
+        let dist_repayment = total_repayment_amount / num_periods;
+        let remainder = total_repayment_amount % num_periods;
 
-        env.storage().instance().set(
-            &DataKey::Settlement(agreement_id, period),
-            &settlement,
-        );
+        for i in 0..periods.len() {
+            let period = periods.get(i).unwrap();
+            let revenue = revenues.get(i).unwrap();
+            
+            let amount_for_record = if i == periods.len() - 1 {
+                dist_repayment + remainder
+            } else {
+                dist_repayment
+            };
+
+            let settlement = SettlementRecord {
+                agreement_id,
+                period: period.clone(),
+                attested_revenue: revenue,
+                repayment_amount: amount_for_record,
+                amount_transferred: amount_for_record,
+                settled_at,
+            };
+
+            env.storage().instance().set(
+                &DataKey::Settlement(agreement_id, period.clone()),
+                &settlement,
+            );
+            env.storage().instance().set(
+                &DataKey::Committed(agreement_id, period),
+                &amount_for_record,
+            );
+        }
     }
 
     /// Get agreement by id.

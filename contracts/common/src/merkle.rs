@@ -215,8 +215,8 @@ pub fn verify_proof(
     root: &BytesN<32>,
     proof: &MerkleProof,
 ) -> Result<bool, MerkleError> {
-    if proof.proof.len() > MAX_TREE_DEPTH {
-        return Err(MerkleError::MaxDepthExceeded);
+    if proof.proof.len() != proof.path.len() {
+        return Err(MerkleError::MalformedInput);
     }
 
     let mut current_hash = proof.leaf.clone();

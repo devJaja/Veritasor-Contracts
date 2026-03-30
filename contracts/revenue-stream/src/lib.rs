@@ -54,7 +54,6 @@ impl<'a> AttestationContractClient<'a> {
         &self,
         business: &Address,
         period: &String,
-    ) -> Option<(BytesN<32>, u64, u32, i128, Option<u64>)> {
     ) -> Option<(BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>)> {
         let mut args = soroban_sdk::Vec::new(self.env);
         args.push_back(business.into_val(self.env));
@@ -102,6 +101,7 @@ pub struct Stream {
     pub beneficiary: Address,
     pub token: Address,
     pub amount: i128,
+    pub cliff_timestamp: Option<u64>,
     pub released: bool,
 }
 
@@ -130,7 +130,8 @@ impl RevenueStreamContract {
     }
 
     /// Create a stream: fund it with `amount` of `token` (transferred from caller).
-    /// Release is allowed once attestation (business, period) exists and is not revoked.
+    /// Release is allowed once attestation (business, period) exists and is not revoked,
+    /// and if cliff_timestamp is set, after the current time reaches the cliff.
     ///
     /// # Replay Protection
     /// Uses admin address and `NONCE_CHANNEL_ADMIN` channel.
@@ -145,6 +146,7 @@ impl RevenueStreamContract {
         beneficiary: Address,
         token: Address,
         amount: i128,
+        cliff_timestamp: Option<u64>,
     ) -> u64 {
         let stored_admin: Address = env
             .storage()
@@ -170,6 +172,7 @@ impl RevenueStreamContract {
             beneficiary: beneficiary.clone(),
             token: token.clone(),
             amount,
+            cliff_timestamp,
             released: false,
         };
         env.storage().instance().set(&DataKey::Stream(id), &stream);
@@ -182,7 +185,8 @@ impl RevenueStreamContract {
         id
     }
 
-    /// Release a stream if the referenced attestation exists and is not revoked.
+    /// Release a stream if the referenced attestation exists and is not revoked,
+    /// and the cliff timestamp has been reached (if set).
     /// Transfers the stream amount to the beneficiary and marks it released.
     pub fn release(env: Env, stream_id: u64) {
         let mut stream: Stream = env
@@ -191,6 +195,9 @@ impl RevenueStreamContract {
             .get(&DataKey::Stream(stream_id))
             .expect("stream not found");
         assert!(!stream.released, "stream already released");
+        if let Some(cliff) = stream.cliff_timestamp {
+            assert!(env.ledger().timestamp() >= cliff, "cliff not reached");
+        }
         let client = AttestationContractClient::new(&env, &stream.attestation_contract);
         let exists = client
             .get_attestation(&stream.business, &stream.period)

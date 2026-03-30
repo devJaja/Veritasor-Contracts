@@ -12,7 +12,7 @@ fn setup() -> (Env, AttestationContractClient<'static>) {
     env.mock_all_auths();
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
-    client.initialize(&Address::generate(&env));
+    client.initialize(&Address::generate(&env), &0u64);
     (env, client)
 }
 
@@ -23,7 +23,7 @@ fn setup_with_admin() -> (Env, AttestationContractClient<'static>, Address) {
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &0u64);
     (env, client, admin)
 }
 
@@ -280,4 +280,89 @@ fn verify_attestation_with_proof_hash() {
 
     let wrong_root = BytesN::from_array(&env, &[11u8; 32]);
     assert!(!client.verify_attestation(&business, &period, &wrong_root));
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Collision Resistance and Adversarial Validation
+// ════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_collision_resistance_minimal_change() {
+    let (env, client) = setup();
+
+    let business1 = Address::generate(&env);
+    let business2 = Address::generate(&env);
+    let period = String::from_str(&env, "2026-09");
+    let root = BytesN::from_array(&env, &[12u8; 32]);
+
+    // Two hashes that differ by only one bit.
+    let mut hash1_bytes = [0xAAu8; 32];
+    let mut hash2_bytes = [0xAAu8; 32];
+    hash2_bytes[31] ^= 1; // Flip the last bit
+
+    let hash1 = BytesN::from_array(&env, &hash1_bytes);
+    let hash2 = BytesN::from_array(&env, &hash2_bytes);
+
+    client.submit_attestation(&business1, &period, &root, &1_700_000_000u64, &1u32, &Some(hash1.clone()), &None);
+    client.submit_attestation(&business2, &period, &root, &1_700_000_000u64, &1u32, &Some(hash2.clone()), &None);
+
+    // Verify they are stored as distinct values.
+    assert_eq!(client.get_proof_hash(&business1, &period), Some(hash1));
+    assert_eq!(client.get_proof_hash(&business2, &period), Some(hash2));
+    assert_ne!(hash1, hash2);
+}
+
+#[test]
+fn test_adversarial_edge_hashes() {
+    let (env, client) = setup();
+
+    let business_zero = Address::generate(&env);
+    let business_max = Address::generate(&env);
+    let period = String::from_str(&env, "2026-10");
+    let root = BytesN::from_array(&env, &[13u8; 32]);
+
+    let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let max_hash = BytesN::from_array(&env, &[0xFFu8; 32]);
+
+    client.submit_attestation(&business_zero, &period, &root, &1_700_000_000u64, &1u32, &Some(zero_hash.clone()), &None);
+    client.submit_attestation(&business_max, &period, &root, &1_700_000_000u64, &1u32, &Some(max_hash.clone()), &None);
+
+    assert_eq!(client.get_proof_hash(&business_zero, &period), Some(zero_hash));
+    assert_eq!(client.get_proof_hash(&business_max, &period), Some(max_hash));
+}
+
+#[test]
+fn test_hash_uniqueness_across_records() {
+    let (env, client) = setup();
+
+    let business1 = Address::generate(&env);
+    let business2 = Address::generate(&env);
+    let period1 = String::from_str(&env, "2026-Q1");
+    let period2 = String::from_str(&env, "2026-Q2");
+    let root = BytesN::from_array(&env, &[14u8; 32]);
+    let shared_hash = BytesN::from_array(&env, &[0x55u8; 32]);
+
+    // Same hash for different business/period pairs should be allowed and isolated.
+    client.submit_attestation(&business1, &period1, &root, &1_700_000_000u64, &1u32, &Some(shared_hash.clone()), &None);
+    client.submit_attestation(&business2, &period2, &root, &1_700_000_000u64, &1u32, &Some(shared_hash.clone()), &None);
+
+    assert_eq!(client.get_proof_hash(&business1, &period1), Some(shared_hash.clone()));
+    assert_eq!(client.get_proof_hash(&business2, &period2), Some(shared_hash));
+}
+
+#[test]
+#[should_panic(expected = "attestation exists")]
+fn test_prevent_proof_hash_overwrite() {
+    let (env, client) = setup();
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-11");
+    let root = BytesN::from_array(&env, &[15u8; 32]);
+    let hash1 = BytesN::from_array(&env, &[0x11u8; 32]);
+    let hash2 = BytesN::from_array(&env, &[0x22u8; 32]);
+
+    client.submit_attestation(&business, &period, &root, &1_700_000_000u64, &1u32, &Some(hash1), &None);
+    
+    // Attempting to overwrite with a different hash should panic.
+    client.submit_attestation(&business, &period, &root, &1_700_000_001u64, &1u32, &Some(hash2), &None);
 }

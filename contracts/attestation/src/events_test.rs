@@ -413,3 +413,245 @@ fn test_multiple_migrations() {
     assert_eq!(stored_root, root_v3);
     assert_eq!(version, 3);
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  Event Schema Snapshot Tests
+// ════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::events::*;
+    use soroban_sdk::{vec, IntoVal, TryFromVal};
+
+    #[test]
+    fn test_attestation_submitted_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let business = Address::generate(&env);
+        let period = String::from_str(&env, "2026-02");
+        let root = BytesN::from_array(&env, &[1u8; 32]);
+        let timestamp = 1_700_000_000u64;
+        let version = 1u32;
+        let fee = 100i128;
+        let proof_hash = Some(BytesN::from_array(&env, &[2u8; 32]));
+        let expiry = Some(2_000_000_000u64);
+
+        emit_attestation_submitted(
+            &env,
+            &business,
+            &period,
+            &root,
+            timestamp,
+            version,
+            fee,
+            &proof_hash,
+            expiry,
+        );
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_ATTESTATION_SUBMITTED.into_val(&env));
+        assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = AttestationSubmittedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.business, business);
+        assert_eq!(event_data.period, period);
+        assert_eq!(event_data.merkle_root, root);
+        assert_eq!(event_data.timestamp, timestamp);
+        assert_eq!(event_data.version, version);
+        assert_eq!(event_data.fee_paid, fee);
+        assert_eq!(event_data.proof_hash, proof_hash);
+        assert_eq!(event_data.expiry_timestamp, expiry);
+    }
+
+    #[test]
+    fn test_attestation_revoked_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let business = Address::generate(&env);
+        let period = String::from_str(&env, "2026-02");
+        let revoked_by = Address::generate(&env);
+        let reason = String::from_str(&env, "test reason");
+
+        emit_attestation_revoked(&env, &business, &period, &revoked_by, &reason);
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_ATTESTATION_REVOKED.into_val(&env));
+        assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = AttestationRevokedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.business, business);
+        assert_eq!(event_data.period, period);
+        assert_eq!(event_data.revoked_by, revoked_by);
+        assert_eq!(event_data.reason, reason);
+    }
+
+    #[test]
+    fn test_role_granted_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let account = Address::generate(&env);
+        let changed_by = Address::generate(&env);
+        let role = 1u32;
+
+        emit_role_granted(&env, &account, role, &changed_by);
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_ROLE_GRANTED.into_val(&env));
+        assert_eq!(topics.get(1).unwrap(), account.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = RoleChangedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.account, account);
+        assert_eq!(event_data.role, role);
+        assert_eq!(event_data.changed_by, changed_by);
+    }
+
+    #[test]
+    fn test_fee_config_changed_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let token = Address::generate(&env);
+        let collector = Address::generate(&env);
+        let changed_by = Address::generate(&env);
+        let base_fee = 1000i128;
+        let enabled = true;
+
+        emit_fee_config_changed(&env, &token, &collector, base_fee, enabled, &changed_by);
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_FEE_CONFIG.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = FeeConfigChangedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.token, token);
+        assert_eq!(event_data.collector, collector);
+        assert_eq!(event_data.base_fee, base_fee);
+        assert_eq!(event_data.enabled, enabled);
+        assert_eq!(event_data.changed_by, changed_by);
+    }
+
+    #[test]
+    fn test_pause_changed_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let changed_by = Address::generate(&env);
+
+        emit_paused(&env, &changed_by);
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_PAUSED.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = PauseChangedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.changed_by, changed_by);
+    }
+
+    #[test]
+    fn test_attestation_migrated_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let business = Address::generate(&env);
+        let period = String::from_str(&env, "2026-02");
+        let old_root = BytesN::from_array(&env, &[1u8; 32]);
+        let new_root = BytesN::from_array(&env, &[2u8; 32]);
+        let old_version = 1u32;
+        let new_version = 2u32;
+        let migrated_by = Address::generate(&env);
+
+        emit_attestation_migrated(
+            &env,
+            &business,
+            &period,
+            &old_root,
+            &new_root,
+            old_version,
+            new_version,
+            &migrated_by,
+        );
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_ATTESTATION_MIGRATED.into_val(&env));
+        assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = AttestationMigratedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.business, business);
+        assert_eq!(event_data.period, period);
+        assert_eq!(event_data.old_merkle_root, old_root);
+        assert_eq!(event_data.new_merkle_root, new_root);
+        assert_eq!(event_data.old_version, old_version);
+        assert_eq!(event_data.new_version, new_version);
+        assert_eq!(event_data.migrated_by, migrated_by);
+    }
+
+    #[test]
+    fn test_rate_limit_config_changed_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let changed_by = Address::generate(&env);
+        let max_submissions = 100u32;
+        let window_seconds = 3600u64;
+        let enabled = true;
+
+        emit_rate_limit_config_changed(&env, max_submissions, window_seconds, enabled, &changed_by);
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_RATE_LIMIT.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = RateLimitConfigChangedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.max_submissions, max_submissions);
+        assert_eq!(event_data.window_seconds, window_seconds);
+        assert_eq!(event_data.enabled, enabled);
+        assert_eq!(event_data.changed_by, changed_by);
+    }
+
+    #[test]
+    fn test_key_rotation_proposed_schema_snapshot() {
+        let (env, _client, _admin) = setup();
+        let old_admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let timelock = 1000u32;
+        let expiry = 2000u32;
+
+        emit_key_rotation_proposed(&env, &old_admin, &new_admin, timelock, expiry);
+
+        let last_event = env.events().all().last().unwrap();
+        let (_contract_id, topics, data) = last_event;
+
+        // Verify Topics
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics.get(0).unwrap(), TOPIC_KEY_ROTATION_PROPOSED.into_val(&env));
+
+        // Verify Data Schema
+        let event_data = KeyRotationProposedEvent::try_from_val(&env, &data).unwrap();
+        assert_eq!(event_data.old_admin, old_admin);
+        assert_eq!(event_data.new_admin, new_admin);
+        assert_eq!(event_data.timelock_until, timelock);
+        assert_eq!(event_data.expires_at, expiry);
+    }
+}
