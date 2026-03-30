@@ -74,8 +74,34 @@ fn submit_revenue_attestation(
 }
 
 fn mint(env: &Env, token_addr: &Address, to: &Address, amount: i128) {
-    let stellar = StellarAssetClient::new(env, token_addr);
-    stellar.mint(to, &amount);
+    StellarAssetClient::new(env, token_addr).mint(to, &amount);
+}
+
+fn admin_nonce(client: &RevenueShareContractClient<'_>, admin: &Address) -> u64 {
+    client.get_replay_nonce(admin, &NONCE_CHANNEL_ADMIN)
+}
+
+fn configure_stakeholders_as_admin(
+    client: &RevenueShareContractClient<'_>,
+    admin: &Address,
+    stakeholders: &Vec<Stakeholder>,
+) {
+    let nonce = admin_nonce(client, admin);
+    client.configure_stakeholders(&nonce, stakeholders);
+}
+
+fn set_attestation_contract_as_admin(
+    client: &RevenueShareContractClient<'_>,
+    admin: &Address,
+    attestation_contract: &Address,
+) {
+    let nonce = admin_nonce(client, admin);
+    client.set_attestation_contract(&nonce, attestation_contract);
+}
+
+fn set_token_as_admin(client: &RevenueShareContractClient<'_>, admin: &Address, token: &Address) {
+    let nonce = admin_nonce(client, admin);
+    client.set_token(&nonce, token);
 }
 
 fn admin_nonce(client: &RevenueShareContractClient<'_>, admin: &Address) -> u64 {
@@ -138,6 +164,82 @@ fn create_stakeholders(env: &Env, count: u32, equal_shares: bool) -> soroban_sdk
     stakeholders
 }
 
+fn sum_amounts(amounts: &Vec<i128>) -> i128 {
+    let mut total = 0i128;
+    for i in 0..amounts.len() {
+        total += amounts.get(i).unwrap();
+    }
+    total
+}
+
+fn expected_distribution_amounts(
+    env: &Env,
+    stakeholders: &Vec<Stakeholder>,
+    revenue_amount: i128,
+) -> Vec<i128> {
+    let mut amounts = Vec::new(env);
+    let mut total_distributed = 0i128;
+
+    for i in 0..stakeholders.len() {
+        let stakeholder = stakeholders.get(i).unwrap();
+        let amount = RevenueShareContract::calculate_share(revenue_amount, stakeholder.share_bps);
+        amounts.push_back(amount);
+        total_distributed += amount;
+    }
+
+    let residual = revenue_amount - total_distributed;
+    if residual > 0 {
+        let first_amount = amounts.get(0).unwrap();
+        amounts.set(0, first_amount + residual);
+    }
+
+    amounts
+}
+
+fn assert_distribution_invariants(
+    env: &Env,
+    client: &RevenueShareContractClient<'_>,
+    token: &Address,
+    business: &Address,
+    period: &String,
+    stakeholders: &Vec<Stakeholder>,
+    revenue_amount: i128,
+) {
+    let token_client = TokenClient::new(env, token);
+    let record = client.get_distribution(business, period).unwrap();
+    let expected_amounts = expected_distribution_amounts(env, stakeholders, revenue_amount);
+
+    assert_eq!(record.total_amount, revenue_amount);
+    assert_eq!(record.amounts.len(), stakeholders.len());
+    assert_eq!(sum_amounts(&record.amounts), revenue_amount);
+    assert_eq!(sum_amounts(&expected_amounts), revenue_amount);
+
+    let mut residual = revenue_amount;
+    for i in 0..stakeholders.len() {
+        let stakeholder = stakeholders.get(i).unwrap();
+        let base_amount =
+            RevenueShareContract::calculate_share(revenue_amount, stakeholder.share_bps);
+        residual -= base_amount;
+
+        let expected = expected_amounts.get(i).unwrap();
+        let actual = record.amounts.get(i).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(token_client.balance(&stakeholder.address), expected);
+
+        if i > 0 {
+            assert_eq!(actual, base_amount);
+        }
+    }
+
+    assert!(residual >= 0);
+    assert!(residual < stakeholders.len() as i128);
+    assert_eq!(
+        record.amounts.get(0).unwrap(),
+        expected_amounts.get(0).unwrap()
+    );
+    assert_eq!(token_client.balance(business), 0);
+}
+
 // ════════════════════════════════════════════════════════════════════
 //  Initialization & Constants
 // ════════════════════════════════════════════════════════════════════
@@ -173,10 +275,11 @@ fn test_configure_stakeholders_two_equal() {
     let n = admin_nonce(&client, &admin);
     client.configure_stakeholders(&n, &stakeholders);
 
-    let stored = client.get_stakeholders().unwrap();
-    assert_eq!(stored.len(), 2);
-    assert_eq!(stored.get(0).unwrap().share_bps, 5000);
-    assert_eq!(stored.get(1).unwrap().share_bps, 5000);
+    assert!(client
+        .try_configure_stakeholders(&nonce, &stakeholders)
+        .is_err());
+    assert_eq!(admin_nonce(&client, &admin), nonce + 1);
+    assert_eq!(client.get_stakeholders().unwrap(), stakeholders);
 }
 
 #[test]
@@ -187,10 +290,9 @@ fn test_configure_stakeholders_custom_split() {
     let n = admin_nonce(&client, &admin);
     client.configure_stakeholders(&n, &stakeholders);
 
-    let stored = client.get_stakeholders().unwrap();
-    assert_eq!(stored.len(), 2);
-    assert_eq!(stored.get(0).unwrap().share_bps, 6000);
-    assert_eq!(stored.get(1).unwrap().share_bps, 4000);
+    client.configure_stakeholders(&nonce, &valid);
+    assert_eq!(admin_nonce(&client, &admin), nonce + 1);
+    assert_eq!(client.get_stakeholders().unwrap(), valid);
 }
 
 #[test]
@@ -201,12 +303,14 @@ fn test_configure_stakeholders_three_way() {
     let n = admin_nonce(&client, &admin);
     client.configure_stakeholders(&n, &stakeholders);
 
-    let stored = client.get_stakeholders().unwrap();
-    assert_eq!(stored.len(), 3);
-    assert_eq!(stored.get(0).unwrap().share_bps, 5000);
-    assert_eq!(stored.get(1).unwrap().share_bps, 3000);
-    assert_eq!(stored.get(2).unwrap().share_bps, 2000);
+    set_token_as_admin(&client, &admin, &new_token);
+    assert_eq!(client.get_token(), new_token);
+    assert_eq!(admin_nonce(&client, &admin), nonce_before + 2);
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  Stakeholder Configuration Tests
+// ════════════════════════════════════════════════════════════════════
 
 #[test]
 fn test_configure_stakeholders_many() {
@@ -216,8 +320,9 @@ fn test_configure_stakeholders_many() {
     let n = admin_nonce(&client, &admin);
     client.configure_stakeholders(&n, &stakeholders);
 
-    let stored = client.get_stakeholders().unwrap();
-    assert_eq!(stored.len(), 10);
+    let updated = stakeholders_with_shares(&env, &[5000, 3000, 2000]);
+    configure_stakeholders_as_admin(&client, &admin, &updated);
+    assert_eq!(client.get_stakeholders().unwrap(), updated);
 }
 
 #[test]
@@ -239,7 +344,7 @@ fn test_configure_stakeholders_too_many_panics() {
 }
 
 #[test]
-#[should_panic(expected = "total shares must equal 10,000 bps")]
+#[should_panic(expected = "total shares must equal 10,000 bps (100%)")]
 fn test_configure_stakeholders_invalid_total_panics() {
     let (env, client, _att, admin, _token, _att_id) = setup();
 
@@ -284,11 +389,11 @@ fn test_configure_stakeholders_duplicate_address_panics() {
     let addr = Address::generate(&env);
     let mut stakeholders = soroban_sdk::Vec::new(&env);
     stakeholders.push_back(Stakeholder {
-        address: addr.clone(),
+        address: duplicated.clone(),
         share_bps: 5000,
     });
     stakeholders.push_back(Stakeholder {
-        address: addr,
+        address: duplicated,
         share_bps: 5000,
     });
 
@@ -329,15 +434,34 @@ fn test_distribute_revenue_two_stakeholders() {
     let stakeholder1 = stakeholders.get(0).unwrap();
     let stakeholder2 = stakeholders.get(1).unwrap();
 
-    assert_eq!(token_client.balance(&stakeholder1.address), 6_000);
-    assert_eq!(token_client.balance(&stakeholder2.address), 4_000);
+    let record = client.get_distribution(&business, &period).unwrap();
+    assert_eq!(record.timestamp, 1_717_171_717);
+    assert_eq!(client.get_distribution_count(&business), 1);
     assert_eq!(token_client.balance(&business), 0);
+}
+
+#[test]
+fn test_zero_amount_distribution_records_zero_amounts_without_transfers() {
+    let (env, client, admin, _attestation, token) = setup();
+    let stakeholders = equal_stakeholders(&env, 2);
+    configure_stakeholders_as_admin(&client, &admin, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-02");
+    client.distribute_revenue(&business, &period, &0);
 
     let record = client.get_distribution(&business, &period).unwrap();
-    assert_eq!(record.total_amount, 10_000);
+    assert_eq!(record.total_amount, 0);
     assert_eq!(record.amounts.len(), 2);
-    assert_eq!(record.amounts.get(0).unwrap(), 6_000);
-    assert_eq!(record.amounts.get(1).unwrap(), 4_000);
+    assert_eq!(record.amounts.get(0).unwrap(), 0);
+    assert_eq!(record.amounts.get(1).unwrap(), 0);
+    assert_eq!(client.get_distribution_count(&business), 1);
+
+    let token_client = TokenClient::new(&env, &token);
+    for i in 0..stakeholders.len() {
+        let stakeholder = stakeholders.get(i).unwrap();
+        assert_eq!(token_client.balance(&stakeholder.address), 0);
+    }
 }
 
 #[test]
@@ -362,9 +486,12 @@ fn test_distribute_revenue_three_stakeholders() {
     let stakeholder2 = stakeholders.get(1).unwrap();
     let stakeholder3 = stakeholders.get(2).unwrap();
 
-    assert_eq!(token_client.balance(&stakeholder1.address), 50_000);
-    assert_eq!(token_client.balance(&stakeholder2.address), 30_000);
-    assert_eq!(token_client.balance(&stakeholder3.address), 20_000);
+    let record = client.get_distribution(&business, &period).unwrap();
+    assert_eq!(record.amounts.get(0).unwrap(), 49);
+    for i in 1..record.amounts.len() {
+        assert_eq!(record.amounts.get(i).unwrap(), 0);
+    }
+    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, 49);
 }
 
 #[test]
@@ -423,7 +550,7 @@ fn test_distribute_revenue_zero_amount() {
     submit_revenue_attestation(&env, &att, &business, &period, 0, None);
 
     let token_client = TokenClient::new(&env, &token);
-    mint(&env, &token, &business, 0);
+    mint(&env, &token, &business, 9_999);
 
     let dn = distribute_nonce(&client, &business);
     client.distribute_revenue(&business, &period, &0, &dn);
@@ -446,8 +573,7 @@ fn test_distribute_revenue_multiple_periods_increments_nonces() {
     client.configure_stakeholders(&n, &stakeholders);
 
     let business = Address::generate(&env);
-    let token_client = TokenClient::new(&env, &token);
-    mint(&env, &token, &business, 30_000);
+    mint(&env, &token, &business, 20_000);
 
     let p1 = String::from_str(&env, "2026-01");
     submit_revenue_attestation(&env, &att, &business, &p1, 10_000, None);
@@ -678,7 +804,7 @@ fn test_calculate_share_edge_cases() {
     );
     assert_eq!(RevenueShareContract::calculate_share(10_000, 1), 1);
     assert_eq!(
-        RevenueShareContract::calculate_share(1_000_000_000, 5000),
+        RevenueShareContract::calculate_share(1_000_000_000, 5_000),
         500_000_000
     );
 }

@@ -2,8 +2,8 @@
 
 //! # Revenue Share Distribution Contract
 //!
-//! Automatically distributes on-chain revenue to multiple stakeholders based on
-//! attested revenue data from the Veritasor attestation protocol.
+//! Automatically distributes caller-supplied revenue amounts to configured
+//! stakeholders using deterministic basis-point allocation rules.
 //!
 //! ## Distribution model
 //!
@@ -78,7 +78,7 @@ use attestation_import::AttestationContractClient;
 pub enum DataKey {
     /// Contract administrator
     Admin,
-    /// Attestation contract address
+    /// Attestation contract address reserved for integration and off-chain coordination
     AttestationContract,
     /// Token contract for distributions
     Token,
