@@ -271,3 +271,74 @@ fn test_frivolous_slashing_blocked() {
         client.slash(&attestor, &2000, &99);
     });
 }
+
+#[test]
+fn test_slash_with_pending_unstake_adjusts_locked_and_pending() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attestor = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let dispute_contract = env.register(DummyDisputeContract, ());
+
+    let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
+    token_admin.mint(&attestor, &10000);
+
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.stake(&attestor, &10000);
+    client.request_unstake(&attestor, &6000);
+
+    // Slash amount that forces stake.amount < previously locked value (6000 -> 4000 remains)
+    env.as_contract(&dispute_contract, || {
+        let outcome = client.slash(&attestor, &8000, &123);
+        assert_eq!(outcome, SlashOutcome::Slashed);
+    });
+
+    let stake = client.get_stake(&attestor).unwrap();
+    assert_eq!(stake.amount, 2000);
+    assert_eq!(stake.locked, 2000);
+
+    let pending = client.get_pending_unstake(&attestor).unwrap();
+    assert_eq!(pending.amount, 2000);
+
+    assert!(client.is_dispute_processed(&123));
+}
+
+#[test]
+fn test_set_dispute_contract_updates_authorized_slasher() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attestor = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let original_dispute_contract = env.register(DummyDisputeContract, ());
+    let new_dispute_contract = env.register(DummyDisputeContract, ());
+
+    let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
+    token_admin.mint(&attestor, &10000);
+
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &token_id, &treasury, &1000, &original_dispute_contract, &0u64);
+    client.stake(&attestor, &5000);
+
+    // old dispute contract cannot slash now after reconfiguration
+    client.set_dispute_contract(&admin, &new_dispute_contract);
+
+    env.as_contract(&original_dispute_contract, || {
+        let result = client.try_slash(&attestor, &1000, &200);
+        assert!(result.is_err());
+    });
+
+    // new dispute contract should be effective
+    env.as_contract(&new_dispute_contract, || {
+        let outcome = client.slash(&attestor, &1000, &200);
+        assert_eq!(outcome, SlashOutcome::Slashed);
+    });
+}

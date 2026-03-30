@@ -4,6 +4,14 @@
 //! Veritasor contracts across multiple Stellar networks (e.g., testnet, mainnet).
 //! It allows for centralized network configuration management with governance
 //! controls and supports adding new networks without contract redeployment.
+//!
+//! ## Migration and rollback (operational model)
+//!
+//! There is no single on-chain `rollback` entrypoint. **Rollback** means governance
+//! re-applies a previously known-good [`NetworkConfig`] (and related fee/registry
+//! updates) via `set_network_config` / `update_fee_policy` / `update_contract_registry`.
+//! Per-network [`get_network_version`] and [`get_global_version`] **only increase**
+//! on successful mutations; restoring prior parameter values does not rewind counters.
 
 #![no_std]
 
@@ -39,6 +47,10 @@ pub enum DataKey {
     RoleHolders,
     NetworkVersion(NetworkId),
     GlobalVersion,
+    /// Per-asset row: `AssetKey` → `AssetConfig`
+    NetworkAssetConfig(AssetKey),
+    /// Ordered asset addresses registered for a network (separate from [`DataKey::NetworkVersion`]).
+    NetworkAssetAddresses(NetworkId),
 }
 
 /// Key for asset storage
@@ -395,9 +407,11 @@ mod storage {
             network_id,
             asset_address: asset_config.asset_address.clone(),
         };
-        env.storage().instance().set(&DataKey::NetworkConfig(asset_key.network_id), asset_config);
-        
-        let list_key = DataKey::NetworkVersion(asset_key.network_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::NetworkAssetConfig(asset_key.clone()), asset_config);
+
+        let list_key = DataKey::NetworkAssetAddresses(network_id);
         let mut assets: Vec<Address> = env.storage().instance().get(&list_key).unwrap_or(Vec::new(env));
         if !assets.contains(&asset_config.asset_address) {
             assets.push_back(asset_config.asset_address.clone());
@@ -410,9 +424,9 @@ mod storage {
             network_id,
             asset_address: asset_address.clone(),
         };
-        env.storage().instance().remove(&DataKey::NetworkConfig(asset_key.network_id));
-        
-        let list_key = DataKey::NetworkVersion(network_id);
+        env.storage().instance().remove(&DataKey::NetworkAssetConfig(asset_key));
+
+        let list_key = DataKey::NetworkAssetAddresses(network_id);
         let mut assets: Vec<Address> = env.storage().instance().get(&list_key).unwrap_or(Vec::new(env));
         if let Some(pos) = assets.iter().position(|a| a == *asset_address) {
             assets.remove(pos as u32);
@@ -425,11 +439,14 @@ mod storage {
             network_id,
             asset_address: asset_address.clone(),
         };
-        env.storage().instance().get(&DataKey::NetworkConfig(asset_key.network_id))
+        env.storage().instance().get(&DataKey::NetworkAssetConfig(asset_key))
     }
 
     pub fn get_network_assets(env: &Env, network_id: NetworkId) -> Vec<Address> {
-        env.storage().instance().get(&DataKey::NetworkVersion(network_id)).unwrap_or(Vec::new(env))
+        env.storage()
+            .instance()
+            .get(&DataKey::NetworkAssetAddresses(network_id))
+            .unwrap_or(Vec::new(env))
     }
 }
 
@@ -820,6 +837,13 @@ impl NetworkConfigContract {
             networks.remove(pos as u32);
             env.storage().instance().set(&networks_key, &networks);
         }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::NetworkAssetAddresses(network_id));
+        env.storage()
+            .instance()
+            .remove(&DataKey::NetworkVersion(network_id));
         
         storage::increment_global_version(&env);
     }
