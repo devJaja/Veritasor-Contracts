@@ -14,11 +14,15 @@ fn setup(env: &Env) -> SetupData {
 
     let attestation_id = env.register(AttestationContract, ());
     let attestation_client = AttestationContractClient::new(env, &attestation_id);
-    attestation_client.initialize(&admin);
+    attestation_client.initialize(&admin, &0u64);
 
     let token_admin = Address::generate(env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin);
     let token = token_contract.address().clone();
+
+    let alt_token_admin = Address::generate(env);
+    let alt_token_contract = env.register_stellar_asset_contract_v2(alt_token_admin);
+    let alt_token = alt_token_contract.address().clone();
 
     let lender = Address::generate(env);
     let business = Address::generate(env);
@@ -29,6 +33,7 @@ fn setup(env: &Env) -> SetupData {
         attestation_id,
         attestation_client,
         token,
+        alt_token,
         lender,
         business,
     }
@@ -40,6 +45,7 @@ struct SetupData {
     attestation_id: Address,
     attestation_client: AttestationContractClient<'static>,
     token: Address,
+    alt_token: Address,
     lender: Address,
     business: Address,
 }
@@ -159,7 +165,7 @@ fn test_settle_basic_repayment() {
 
     setup
         .attestation_client
-        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
     let attested_revenue = 1_000_000i128;
     let business_tokens = 1_500_000i128;
@@ -241,7 +247,7 @@ fn test_settle_double_spending_prevention() {
 
     setup
         .attestation_client
-        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
     let attested_revenue = 1_000_000i128;
     let business_tokens = 2_000_000i128;
@@ -255,6 +261,138 @@ fn test_settle_double_spending_prevention() {
     setup
         .settlement_client
         .settle(&agreement_id, &period, &attested_revenue);
+}
+
+#[test]
+fn test_settle_rejects_multi_currency_for_same_business_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.mock_all_auths_allowing_non_root_auth();
+    let setup = setup(&env);
+
+    let principal = 10_000_000i128;
+    let revenue_share_bps = 1000u32;
+    let min_revenue = 100_000i128;
+    let max_repayment = 500_000i128;
+
+    let primary_agreement_id = setup.settlement_client.create_agreement(
+        &setup.lender,
+        &setup.business,
+        &principal,
+        &revenue_share_bps,
+        &min_revenue,
+        &max_repayment,
+        &setup.attestation_id,
+        &setup.token,
+    );
+
+    let second_lender = Address::generate(&env);
+    let alternate_agreement_id = setup.settlement_client.create_agreement(
+        &second_lender,
+        &setup.business,
+        &principal,
+        &revenue_share_bps,
+        &min_revenue,
+        &max_repayment,
+        &setup.attestation_id,
+        &setup.alt_token,
+    );
+
+    let period = String::from_str(&env, "2026-02");
+    let root = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    setup
+        .attestation_client
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
+
+    let attested_revenue = 1_000_000i128;
+    StellarAssetClient::new(&env, &setup.token).mint(&setup.business, &1_500_000i128);
+    StellarAssetClient::new(&env, &setup.alt_token).mint(&setup.business, &1_500_000i128);
+
+    setup
+        .settlement_client
+        .settle(&primary_agreement_id, &period, &attested_revenue);
+
+    let rejected = setup
+        .settlement_client
+        .try_settle(&alternate_agreement_id, &period, &attested_revenue);
+    assert!(rejected.is_err());
+    assert!(setup
+        .settlement_client
+        .get_settlement(&alternate_agreement_id, &period)
+        .is_none());
+    assert_eq!(
+        setup
+            .settlement_client
+            .get_committed(&alternate_agreement_id, &period),
+        0
+    );
+
+    let primary = setup
+        .settlement_client
+        .get_settlement(&primary_agreement_id, &period)
+        .unwrap();
+    assert_eq!(primary.amount_transferred, 100_000i128);
+}
+
+#[test]
+fn test_settle_allows_same_currency_across_multiple_agreements() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.mock_all_auths_allowing_non_root_auth();
+    let setup = setup(&env);
+
+    let principal = 10_000_000i128;
+    let revenue_share_bps = 1000u32;
+    let min_revenue = 100_000i128;
+    let max_repayment = 500_000i128;
+
+    let first_agreement_id = setup.settlement_client.create_agreement(
+        &setup.lender,
+        &setup.business,
+        &principal,
+        &revenue_share_bps,
+        &min_revenue,
+        &max_repayment,
+        &setup.attestation_id,
+        &setup.token,
+    );
+
+    let second_lender = Address::generate(&env);
+    let second_agreement_id = setup.settlement_client.create_agreement(
+        &second_lender,
+        &setup.business,
+        &principal,
+        &revenue_share_bps,
+        &min_revenue,
+        &max_repayment,
+        &setup.attestation_id,
+        &setup.token,
+    );
+
+    let period = String::from_str(&env, "2026-02");
+    let root = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+    setup
+        .attestation_client
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
+
+    let attested_revenue = 1_000_000i128;
+    StellarAssetClient::new(&env, &setup.token).mint(&setup.business, &3_000_000i128);
+
+    setup
+        .settlement_client
+        .settle(&first_agreement_id, &period, &attested_revenue);
+    setup
+        .settlement_client
+        .settle(&second_agreement_id, &period, &attested_revenue);
+
+    assert!(setup
+        .settlement_client
+        .get_settlement(&first_agreement_id, &period)
+        .is_some());
+    assert!(setup
+        .settlement_client
+        .get_settlement(&second_agreement_id, &period)
+        .is_some());
 }
 
 #[test]
@@ -285,7 +423,7 @@ fn test_settle_below_minimum_revenue() {
 
     setup
         .attestation_client
-        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
     let attested_revenue = 100_000i128;
 
@@ -330,7 +468,7 @@ fn test_settle_capped_at_max_repayment() {
 
     setup
         .attestation_client
-        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
     let attested_revenue = 10_000_000i128;
     let business_tokens = 1_000_000i128;
@@ -378,12 +516,12 @@ fn test_settle_revoked_attestation() {
 
     setup
         .attestation_client
-        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
     let reason = String::from_str(&env, "test revocation");
     setup
         .attestation_client
-        .revoke_attestation(&setup.admin, &setup.business, &period, &reason);
+        .revoke_attestation(&setup.admin, &setup.business, &period, &reason, &0u64);
 
     let attested_revenue = 1_000_000i128;
 
@@ -429,7 +567,7 @@ fn test_multiple_periods_settlement() {
 
         setup
             .attestation_client
-            .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+            .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
         let attested_revenue = 1_000_000i128;
         setup
@@ -546,7 +684,7 @@ fn test_settle_inactive_agreement() {
 
     setup
         .attestation_client
-        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
     let attested_revenue = 1_000_000i128;
     setup
@@ -585,7 +723,7 @@ fn test_get_committed() {
     let root = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
     setup
         .attestation_client
-        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32);
+        .submit_attestation(&setup.business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
 
     let attested_revenue = 1_000_000i128;
     let business_tokens = 1_500_000i128;

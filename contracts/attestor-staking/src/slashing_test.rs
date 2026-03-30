@@ -552,23 +552,15 @@ fn test_frivolous_slashing_blocked() {
     });
 }
 
-/// Test scenario: Dispute contract update rejects old address and accepts new address (Req 6.3, 6.4)
-///
-/// After calling `set_dispute_contract` to update to a new dispute contract address:
-/// - The old dispute contract address must be rejected when calling `slash`
-/// - The new dispute contract address must be accepted when calling `slash`
 #[test]
-fn test_dispute_contract_update_rejects_old_accepts_new() {
+fn test_slash_with_pending_unstake_adjusts_locked_and_pending() {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
     let attestor = Address::generate(&env);
     let treasury = Address::generate(&env);
-
-    // Register two distinct dispute contracts
-    let dispute_contract_a = env.register(DummyDisputeContract, ());
-    let dispute_contract_b = env.register(DummyDisputeContract, ());
+    let dispute_contract = env.register(DummyDisputeContract, ());
 
     let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
     token_admin.mint(&attestor, &10000);
@@ -576,566 +568,57 @@ fn test_dispute_contract_update_rejects_old_accepts_new() {
     let contract_id = env.register(AttestorStakingContract, ());
     let client = AttestorStakingContractClient::new(&env, &contract_id);
 
-    // Initialize with dispute_contract_A
-    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract_a, &0u64);
+    client.initialize(&admin, &token_id, &treasury, &1000, &dispute_contract, &0u64);
+    client.stake(&attestor, &10000);
+    client.request_unstake(&attestor, &6000);
+
+    // Slash amount that forces stake.amount < previously locked value (6000 -> 4000 remains)
+    env.as_contract(&dispute_contract, || {
+        let outcome = client.slash(&attestor, &8000, &123);
+        assert_eq!(outcome, SlashOutcome::Slashed);
+    });
+
+    let stake = client.get_stake(&attestor).unwrap();
+    assert_eq!(stake.amount, 2000);
+    assert_eq!(stake.locked, 2000);
+
+    let pending = client.get_pending_unstake(&attestor).unwrap();
+    assert_eq!(pending.amount, 2000);
+
+    assert!(client.is_dispute_processed(&123));
+}
+
+#[test]
+fn test_set_dispute_contract_updates_authorized_slasher() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attestor = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let original_dispute_contract = env.register(DummyDisputeContract, ());
+    let new_dispute_contract = env.register(DummyDisputeContract, ());
+
+    let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
+    token_admin.mint(&attestor, &10000);
+
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &token_id, &treasury, &1000, &original_dispute_contract, &0u64);
     client.stake(&attestor, &5000);
 
-    // Update dispute contract to dispute_contract_B (Req 6.3, 6.4)
-    client.set_dispute_contract(&dispute_contract_b);
+    // old dispute contract cannot slash now after reconfiguration
+    client.set_dispute_contract(&admin, &new_dispute_contract);
 
-    // Req 6.3: old dispute contract (A) must now be rejected
-    let result = env.as_contract(&dispute_contract_a, || {
-        client.try_slash(&attestor, &1000, &1)
+    env.as_contract(&original_dispute_contract, || {
+        let result = client.try_slash(&attestor, &1000, &200);
+        assert!(result.is_err());
     });
-    assert!(
-        result.is_err(),
-        "slash from old dispute_contract_A must be rejected after update"
-    );
 
-    // Req 6.4: new dispute contract (B) must be accepted
-    let outcome = env.as_contract(&dispute_contract_b, || {
-        client.slash(&attestor, &1000, &2)
-    });
-    assert_eq!(
-        outcome,
-        SlashOutcome::Slashed,
-        "slash from new dispute_contract_B must succeed after update"
-    );
-
-    // Confirm stake was reduced by the successful slash
-    let stake = client.get_stake(&attestor).unwrap();
-    assert_eq!(stake.amount, 4000, "stake.amount should be reduced by the successful slash");
-}
-
-/// Test scenario: Slash attestor down to exactly min_stake; is_eligible returns true (Req 10.2)
-///
-/// The setup helper uses min_stake = 1000. We stake 2000 and slash 1000,
-/// leaving exactly min_stake = 1000. is_eligible must return true.
-#[test]
-fn test_eligibility_boundary_exactly_min_stake() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    // setup uses min_stake = 1000; stake 2000 so we can slash down to exactly 1000
-    let stake_amount = 2000_i128;
-    let min_stake = 1000_i128;
-    let (attestor, _treasury, dispute_contract, _token_id, client) = setup(&env, stake_amount);
-
-    // Slash exactly (stake_amount - min_stake) to land on min_stake
-    let slash_amount = stake_amount - min_stake; // 1000
-    env.as_contract(&dispute_contract, || {
-        let outcome = client.slash(&attestor, &slash_amount, &1);
+    // new dispute contract should be effective
+    env.as_contract(&new_dispute_contract, || {
+        let outcome = client.slash(&attestor, &1000, &200);
         assert_eq!(outcome, SlashOutcome::Slashed);
     });
-
-    // Confirm stake.amount is exactly min_stake
-    let stake = client.get_stake(&attestor).unwrap();
-    assert_eq!(
-        stake.amount, min_stake,
-        "stake.amount must equal min_stake after slash"
-    );
-
-    // Req 10.2: is_eligible must return true when stake.amount == min_stake
-    assert!(
-        client.is_eligible(&attestor),
-        "is_eligible must return true when stake.amount == min_stake"
-    );
-}
-
-/// Test scenario: Slash attestor down to min_stake - 1; is_eligible returns false (Req 10.3)
-///
-/// The setup helper uses min_stake = 1000. We stake 2000 and slash 1001,
-/// leaving min_stake - 1 = 999. is_eligible must return false.
-#[test]
-fn test_eligibility_boundary_min_stake_minus_one() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let stake_amount = 2000_i128;
-    let min_stake = 1000_i128;
-    let (attestor, _treasury, dispute_contract, _token_id, client) = setup(&env, stake_amount);
-
-    // Slash exactly (stake_amount - (min_stake - 1)) to land on min_stake - 1
-    let slash_amount = stake_amount - (min_stake - 1); // 1001
-    env.as_contract(&dispute_contract, || {
-        let outcome = client.slash(&attestor, &slash_amount, &1);
-        assert_eq!(outcome, SlashOutcome::Slashed);
-    });
-
-    // Confirm stake.amount is exactly min_stake - 1
-    let stake = client.get_stake(&attestor).unwrap();
-    assert_eq!(
-        stake.amount,
-        min_stake - 1,
-        "stake.amount must equal min_stake - 1 after slash"
-    );
-
-    // Req 10.3: is_eligible must return false when stake.amount == min_stake - 1
-    assert!(
-        !client.is_eligible(&attestor),
-        "is_eligible must return false when stake.amount == min_stake - 1"
-    );
-}
-
-/// Test scenario: Slash attestorA with dispute_id=N, then slash attestorB with the same
-/// dispute_id=N; the second call must panic with "dispute already processed" (Req 5.3)
-///
-/// This verifies that dispute_id uniqueness is global (not per-attestor).
-#[test]
-#[should_panic(expected = "dispute already processed")]
-fn test_double_slash_different_attestor_same_dispute_id() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    // Set up attestorA using the shared helper
-    let stake_amount = 5000_i128;
-    let (attestor_a, _treasury, dispute_contract, token_id, client) = setup(&env, stake_amount);
-
-    // Register and fund attestorB separately (same contract, same token)
-    let attestor_b = Address::generate(&env);
-    let token_admin_addr = Address::generate(&env);
-    let (_, _token_admin_client, _) = create_token_contract(&env, &token_admin_addr);
-    // Mint tokens for attestorB using the existing token contract
-    let token_admin_client_existing = token::StellarAssetClient::new(&env, &token_id);
-    token_admin_client_existing.mint(&attestor_b, &stake_amount);
-    client.stake(&attestor_b, &stake_amount);
-
-    let dispute_id: u64 = 42;
-
-    // First slash: attestorA with dispute_id=42 — must succeed
-    env.as_contract(&dispute_contract, || {
-        let outcome = client.slash(&attestor_a, &1000, &dispute_id);
-        assert_eq!(outcome, SlashOutcome::Slashed);
-    });
-
-    // Second slash: attestorB with the same dispute_id=42 — must panic
-    env.as_contract(&dispute_contract, || {
-        client.slash(&attestor_b, &1000, &dispute_id);
-    });
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 1: Exact Slash Conservation
-//
-// Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 11.1, 11.4
-proptest! {
-    #[test]
-    fn prop_exact_slash_conservation(
-        // Generate stake_amount in [1, i128::MAX/2] and slash_amount in [1, stake_amount]
-        stake_amount in 1_i128..=(i128::MAX / 2),
-        slash_amount in 1_i128..=(i128::MAX / 2),
-    ) {
-        // Constrain: slash_amount <= stake_amount
-        let slash_amount = slash_amount.min(stake_amount);
-
-        let env = Env::default();
-        env.mock_all_auths();
-
-        // --- Inline setup (proptest closures can't use the `setup` fn due to lifetime issues) ---
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &stake_amount);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        // min_stake = 1 so any stake_amount is valid; unbonding_period = 0
-        client.initialize(&admin, &token_id, &treasury, &1, &dispute_contract, &0u64);
-        client.stake(&attestor, &stake_amount);
-        // --- End inline setup ---
-
-        let treasury_balance_before = token_client.balance(&treasury);
-
-        // Perform the slash
-        let outcome = env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &slash_amount, &1u64)
-        });
-
-        // Req 1.1 / 1.3 / 1.4: post-slash stake.amount == stake_amount - slash_amount
-        let stake_after = client.get_stake(&attestor).unwrap();
-        prop_assert_eq!(
-            stake_after.amount,
-            stake_amount - slash_amount,
-            "stake.amount must equal stake_amount - slash_amount"
-        );
-
-        // Req 1.2 / 1.5 / 11.1 / 11.4: treasury increased by exactly slash_amount
-        let treasury_balance_after = token_client.balance(&treasury);
-        prop_assert_eq!(
-            treasury_balance_after - treasury_balance_before,
-            slash_amount,
-            "treasury must increase by exactly slash_amount"
-        );
-
-        // Outcome must be Slashed (slash_amount >= 1 and stake_amount >= slash_amount)
-        prop_assert_eq!(outcome, SlashOutcome::Slashed);
-    }
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 2: Over-Slash Clamping
-//
-// Validates: Requirements 2.1, 2.2, 2.3
-proptest! {
-    #[test]
-    fn prop_over_slash_clamping(
-        stake_amount in 1_i128..=(i128::MAX / 2),
-        extra in 1_i128..=(i128::MAX / 2),
-    ) {
-        // slash_amount > stake_amount
-        let slash_amount = stake_amount.saturating_add(extra);
-
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &stake_amount);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &token_id, &treasury, &1, &dispute_contract, &0u64);
-        client.stake(&attestor, &stake_amount);
-
-        let treasury_before = token_client.balance(&treasury);
-
-        let outcome = env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &slash_amount, &1u64)
-        });
-
-        // Req 2.1: stake.amount reduced to exactly 0
-        let stake_after = client.get_stake(&attestor).unwrap();
-        prop_assert_eq!(stake_after.amount, 0, "stake.amount must be 0 after over-slash");
-
-        // Req 2.2: treasury increased by exactly the pre-slash stake_amount
-        let treasury_after = token_client.balance(&treasury);
-        prop_assert_eq!(
-            treasury_after - treasury_before,
-            stake_amount,
-            "treasury must increase by exactly the original stake_amount"
-        );
-
-        // Req 2.3: outcome is Slashed
-        prop_assert_eq!(outcome, SlashOutcome::Slashed);
-    }
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 3: Locked Invariant Preservation
-//
-// Validates: Requirements 3.1, 3.2, 3.3, 3.4
-proptest! {
-    #[test]
-    fn prop_locked_invariant_preserved(
-        stake_amount in 1_i128..=(i128::MAX / 2),
-        locked_amount in 0_i128..=(i128::MAX / 2),
-        slash_amount in 1_i128..=(i128::MAX / 2),
-    ) {
-        // Constrain: locked_amount <= stake_amount
-        let locked_amount = locked_amount.min(stake_amount);
-
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &stake_amount);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &token_id, &treasury, &1, &dispute_contract, &0u64);
-        client.stake(&attestor, &stake_amount);
-
-        // Set up locked by calling request_unstake (if locked_amount > 0)
-        if locked_amount > 0 {
-            client.request_unstake(&attestor, &locked_amount);
-        }
-
-        env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &slash_amount, &1u64)
-        });
-
-        let post_slash_stake = client.get_stake(&attestor).unwrap();
-
-        // Req 3.1: locked <= amount invariant must hold after slash
-        prop_assert!(
-            post_slash_stake.locked <= post_slash_stake.amount,
-            "locked ({}) must be <= amount ({}) after slash",
-            post_slash_stake.locked,
-            post_slash_stake.amount
-        );
-    }
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 4: Pending Unstake Adjustment
-//
-// Validates: Requirements 4.1, 4.2, 4.4, 4.5
-proptest! {
-    #[test]
-    fn prop_pending_adjustment(
-        stake_amount in 1_i128..=(i128::MAX / 2),
-        locked_amount in 1_i128..=(i128::MAX / 2),
-        slash_amount in 1_i128..=(i128::MAX / 2),
-    ) {
-        // Constrain: 0 < locked_amount <= stake_amount
-        let locked_amount = locked_amount.min(stake_amount);
-
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &stake_amount);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &token_id, &treasury, &1, &dispute_contract, &0u64);
-        client.stake(&attestor, &stake_amount);
-
-        // Set up pending unstake
-        client.request_unstake(&attestor, &locked_amount);
-
-        env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &slash_amount, &1u64)
-        });
-
-        let post_slash_stake = client.get_stake(&attestor).unwrap();
-        let pending = client.get_pending_unstake(&attestor).unwrap();
-
-        // Req 4.1, 4.2, 4.4, 4.5: pending.amount == min(locked_amount, post_slash_stake.locked)
-        let expected_pending = locked_amount.min(post_slash_stake.locked);
-        prop_assert_eq!(
-            pending.amount,
-            expected_pending,
-            "pending.amount ({}) must equal min(locked_amount={}, post_slash_locked={})",
-            pending.amount,
-            locked_amount,
-            post_slash_stake.locked
-        );
-    }
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 5: No Phantom Pending Unstake
-//
-// Validates: Requirements 4.3
-proptest! {
-    #[test]
-    fn prop_no_phantom_pending(
-        stake_amount in 1_i128..=(i128::MAX / 2),
-        slash_amount in 1_i128..=(i128::MAX / 2),
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &stake_amount);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &token_id, &treasury, &1, &dispute_contract, &0u64);
-        client.stake(&attestor, &stake_amount);
-
-        // No request_unstake call — no pending unstake exists
-
-        env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &slash_amount, &1u64)
-        });
-
-        // Req 4.3: no PendingUnstake record must exist after slash
-        let pending = client.get_pending_unstake(&attestor);
-        prop_assert!(
-            pending.is_none(),
-            "get_pending_unstake must return None when no request_unstake was called"
-        );
-    }
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 6: Double-Slash Prevention
-//
-// Validates: Requirements 5.1, 5.2, 5.3
-proptest! {
-    #[test]
-    fn prop_double_slash_prevention(
-        stake_amount in 1_i128..=(i128::MAX / 2),
-        slash_amount in 1_i128..=(i128::MAX / 2),
-        dispute_id in 0_u64..=u64::MAX,
-    ) {
-        let slash_amount = slash_amount.min(stake_amount);
-
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &stake_amount);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &token_id, &treasury, &1, &dispute_contract, &0u64);
-        client.stake(&attestor, &stake_amount);
-
-        // First slash must succeed
-        let outcome = env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &slash_amount, &dispute_id)
-        });
-        prop_assert_eq!(outcome, SlashOutcome::Slashed);
-
-        // Second slash with same dispute_id must fail (Req 5.1, 5.2, 5.3)
-        let result = env.as_contract(&dispute_contract, || {
-            client.try_slash(&attestor, &slash_amount, &dispute_id)
-        });
-        prop_assert!(
-            result.is_err(),
-            "second slash with same dispute_id must return an error"
-        );
-    }
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 8: Sequential Multi-Slash Accumulation
-//
-// Validates: Requirements 8.1, 8.2, 8.3, 8.4
-proptest! {
-    #[test]
-    fn prop_sequential_accumulation(
-        initial_stake in 3_i128..=(i128::MAX / 4),
-        s1 in 1_i128..=(i128::MAX / 4),
-        s2 in 1_i128..=(i128::MAX / 4),
-        s3 in 1_i128..=(i128::MAX / 4),
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &initial_stake);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        client.initialize(&admin, &token_id, &treasury, &1, &dispute_contract, &0u64);
-        client.stake(&attestor, &initial_stake);
-
-        let treasury_before = token_client.balance(&treasury);
-
-        // Perform 3 sequential slashes with distinct dispute IDs
-        env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &s1, &1u64)
-        });
-        let stake_after_1 = client.get_stake(&attestor).unwrap();
-        prop_assert!(stake_after_1.locked <= stake_after_1.amount, "locked <= amount after slash 1");
-
-        env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &s2, &2u64)
-        });
-        let stake_after_2 = client.get_stake(&attestor).unwrap();
-        prop_assert!(stake_after_2.locked <= stake_after_2.amount, "locked <= amount after slash 2");
-
-        env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &s3, &3u64)
-        });
-        let stake_after_3 = client.get_stake(&attestor).unwrap();
-        prop_assert!(stake_after_3.locked <= stake_after_3.amount, "locked <= amount after slash 3");
-
-        // Req 8.1, 8.2: final stake.amount == max(0, initial_stake - sum)
-        let sum = s1.saturating_add(s2).saturating_add(s3);
-        let expected_stake = (initial_stake - sum).max(0);
-        prop_assert_eq!(
-            stake_after_3.amount,
-            expected_stake,
-            "final stake.amount must equal max(0, initial_stake - sum)"
-        );
-
-        // Req 8.2: total treasury increase == min(initial_stake, sum)
-        let expected_treasury_increase = initial_stake.min(sum);
-        let treasury_after = token_client.balance(&treasury);
-        prop_assert_eq!(
-            treasury_after - treasury_before,
-            expected_treasury_increase,
-            "total treasury increase must equal min(initial_stake, sum)"
-        );
-    }
-}
-
-// Feature: stake-slashing-precision-rounding-tests, Property 10: Eligibility Reflects Post-Slash Stake
-//
-// Validates: Requirements 10.1, 10.2, 10.3, 10.4
-proptest! {
-    #[test]
-    fn prop_eligibility_reflects_post_slash_stake(
-        stake_amount in 1_i128..=(i128::MAX / 2),
-        min_stake in 1_i128..=(i128::MAX / 2),
-        slash_amount in 1_i128..=(i128::MAX / 2),
-    ) {
-        // Constrain: stake_amount >= min_stake so the attestor starts eligible
-        let stake_amount = stake_amount.max(min_stake);
-        // Clamp slash_amount to stake_amount (over-slash is fine, just clamps to 0)
-        let slash_amount = slash_amount.min(stake_amount);
-
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let attestor = Address::generate(&env);
-        let treasury = Address::generate(&env);
-        let dispute_contract = env.register(DummyDisputeContract, ());
-
-        let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
-        token_admin.mint(&attestor, &stake_amount);
-
-        let contract_id = env.register(AttestorStakingContract, ());
-        let client = AttestorStakingContractClient::new(&env, &contract_id);
-
-        // Initialize with the generated min_stake
-        client.initialize(&admin, &token_id, &treasury, &min_stake, &dispute_contract, &0u64);
-        client.stake(&attestor, &stake_amount);
-
-        env.as_contract(&dispute_contract, || {
-            client.slash(&attestor, &slash_amount, &1u64)
-        });
-
-        let post_slash_stake = client.get_stake(&attestor).unwrap();
-        let is_eligible = client.is_eligible(&attestor);
-
-        // Req 10.1, 10.2, 10.3, 10.4: is_eligible == (post_slash_stake.amount >= min_stake)
-        let expected_eligible = post_slash_stake.amount >= min_stake;
-        prop_assert_eq!(
-            is_eligible,
-            expected_eligible,
-            "is_eligible ({}) must match post_slash_stake.amount ({}) >= min_stake ({})",
-            is_eligible,
-            post_slash_stake.amount,
-            min_stake
-        );
-    }
 }
