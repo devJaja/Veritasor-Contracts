@@ -132,6 +132,68 @@ Call `slash(attestor, amount, dispute_id)`:
   - `stake.locked <= stake.amount`
   - If pending unstake exists and exceeds `stake.locked`, it is reduced.
 - Transfers slashed tokens to the configured `treasury`.
+- Records slashing state (`is_dispute_processed(dispute_id) == true`).
+
+### Supporting read APIs
+
+- `get_dispute_contract()`: returns configured dispute contract address.
+- `is_dispute_processed(dispute_id)`: true if given dispute id has been used for slash.
+
+## Slashing Precision and Behavior
+
+### Integer arithmetic
+
+The actual deduction applied during a slash is computed as:
+
+```
+Slash_Amount = min(requested_amount, stake.amount)
+```
+
+All arithmetic uses **integer (floor/truncation) semantics** — there are no fractional tokens. The contract never rounds up; any remainder is simply not transferred.
+
+### The `stake.locked <= stake.amount` invariant
+
+The staking contract maintains the invariant `stake.locked <= stake.amount` at all times. After a slash reduces `stake.amount`, the contract enforces this by clamping `locked`:
+
+```
+stake.locked = min(stake.locked, new_stake_amount)
+```
+
+- If the slash does not reduce `stake.amount` below `stake.locked`, `locked` is left unchanged.
+- If the slash reduces `stake.amount` below the current `stake.locked`, `locked` is reduced to equal the new `stake.amount`.
+- If `stake.locked` is already `0`, it remains `0` regardless of the slash amount.
+
+### `PendingUnstake.amount` adjustment
+
+When a `PendingUnstake` record exists and a slash reduces `stake.locked`, the pending amount is clamped to the new `stake.locked`:
+
+```
+pending.amount = min(pending.amount, post_slash_stake.locked)
+```
+
+- If `pending.amount <= post_slash_stake.locked`, the pending amount is left unchanged.
+- If `pending.amount > post_slash_stake.locked`, it is reduced to `stake.locked`.
+- If the slash reduces `stake.amount` to `0`, `pending.amount` is reduced to `0`.
+- The `PendingUnstake` record is **preserved** even when `pending.amount` reaches `0`, so that `withdraw_unstaked` can still be called to clean up state.
+- If no `PendingUnstake` exists before the slash, none is created.
+
+### Double-slash prevention
+
+Each `dispute_id` is recorded globally (not per-attestor) once a slash is processed:
+
+- A second call to `slash` with the same `dispute_id` — regardless of which attestor is targeted — will panic with `"dispute already processed"`.
+- `dispute_id` uniqueness is **global**: slashing attestor A with `dispute_id = N` prevents slashing attestor B with the same `dispute_id = N`.
+- A call that panics due to an invalid `amount` (e.g. `amount = 0`) does **not** consume the `dispute_id`. The same `dispute_id` can be reused in a subsequent valid call.
+
+### Known precision edge cases
+
+| Scenario                                   | Behavior                                                                        |
+| ------------------------------------------ | ------------------------------------------------------------------------------- |
+| `slash_amount = 1` (minimum)               | Deducts exactly `1` token; no rounding occurs                                   |
+| `slash_amount = stake.amount` (full slash) | `stake.amount` becomes `0`; all tokens transferred to treasury                  |
+| `slash_amount > stake.amount` (over-slash) | Clamped to `stake.amount`; outcome is `Slashed`, not `NoSlash`                  |
+| `stake.amount = 0` before slash            | No tokens transferred; outcome is `NoSlash`; `dispute_id` is still consumed     |
+| `slash_amount = 0`                         | Panics with `"slash amount must be positive"`; `dispute_id` is **not** consumed |
 
 ## Eligibility
 

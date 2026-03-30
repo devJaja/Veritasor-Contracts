@@ -105,6 +105,8 @@ No new `DataKey` variants are required.
 2. **Immutability** — Once stored, the proof hash cannot be changed except through an admin-gated `migrate_attestation` call, which preserves the existing hash. There is no standalone "update proof hash" method.
 3. **Submitter responsibility** — The contract does not validate that the hash corresponds to a real off-chain dataset. It is the submitter's responsibility to ensure correctness.
 4. **No oracle dependency** — The hash is provided at submission time; no external oracle or off-chain service is consulted during the transaction.
+5. **Collision Resistance** — The contract assumes SHA-256 for proof hashing. While the contract does not verify the hash contents, it ensures that distinct hashes are stored uniquely and cannot be overwritten once associated with a (business, period) pair, preventing hash collision or replacement attacks on-chain.
+6. **Adversarial Resiliency** — The contract accepts any 32-byte value. Submitters must ensure that malicious or "garbage" hashes (e.g., all zeros) do not break off-chain indexing logic or reveal unintended data through rainbow tables.
 
 ## Off-Chain Storage Expectations
 
@@ -164,6 +166,10 @@ echo "$STORED_HASH  bundle.tar.gz" | sha256sum --check
 - **Migration preservation** — proof hash survives `migrate_attestation` (both Some and None cases)
 - **Simulated off-chain retrieval** — end-to-end flow using a realistic SHA-256 hash
 - **Verification unaffected** — `verify_attestation` still works correctly with proof hash present
+- **Collision Resistance** — verifies that distinct hashes are stored correctly as separate values, even with minimal differences (regression-tested)
+- **Adversarial edge cases** — verifies correct handling of extreme hash values (all zeros, all ones)
+- **Uniqueness across records** — ensures the same hash can be used by different businesses without side effects
+- **Overwrite prevention** — ensures proof hashes (and attestations) cannot be tampered with or replaced without re-authorization
 
 Run tests:
 ```bash

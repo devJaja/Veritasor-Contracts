@@ -39,6 +39,7 @@ fn set_test_config(env: &Env) {
         timelock_ledgers: 10,
         confirmation_window_ledgers: 20,
         cooldown_ledgers: 5,
+        grace_period_ledgers: 10,
     };
     set_rotation_config(env, &config);
 }
@@ -69,6 +70,7 @@ fn test_custom_config() {
             timelock_ledgers: 100,
             confirmation_window_ledgers: 200,
             cooldown_ledgers: 50,
+            grace_period_ledgers: 100,
         };
         set_rotation_config(&env, &custom);
 
@@ -88,6 +90,7 @@ fn test_zero_timelock_rejected() {
             timelock_ledgers: 0,
             confirmation_window_ledgers: 20,
             cooldown_ledgers: 5,
+            grace_period_ledgers: 10,
         };
         set_rotation_config(&env, &config);
     });
@@ -102,6 +105,7 @@ fn test_zero_confirmation_window_rejected() {
             timelock_ledgers: 10,
             confirmation_window_ledgers: 0,
             cooldown_ledgers: 5,
+            grace_period_ledgers: 10,
         };
         set_rotation_config(&env, &config);
     });
@@ -494,6 +498,7 @@ fn test_rotation_history_accumulates() {
             timelock_ledgers: 1,
             confirmation_window_ledgers: 100,
             cooldown_ledgers: 0,
+            grace_period_ledgers: 10,
         };
         set_rotation_config(&env, &config);
 
@@ -517,6 +522,7 @@ fn test_rotation_history_trimmed_at_max() {
             timelock_ledgers: 1,
             confirmation_window_ledgers: 100,
             cooldown_ledgers: 0,
+            grace_period_ledgers: 10,
         };
         set_rotation_config(&env, &config);
 
@@ -668,7 +674,8 @@ fn test_emergency_rotate_bypasses_cooldown() {
 
         // First rotation (planned)
         propose_rotation(&env, &admin1, &admin2);
-        env.ledger().set_sequence_number(env.ledger().sequence() + 11);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + 11);
         confirm_rotation(&env, &admin2);
 
         // Cooldown is 5. Try emergency rotation immediately.
@@ -933,6 +940,7 @@ fn test_multiple_rotations_sequential() {
             timelock_ledgers: 2,
             confirmation_window_ledgers: 50,
             cooldown_ledgers: 3,
+            grace_period_ledgers: 5,
         };
         set_rotation_config(&env, &config);
 
