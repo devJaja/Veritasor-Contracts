@@ -18,7 +18,8 @@ const ADMIN_KEY_TAG: (u32,) = (2,);
 const ANOMALY_KEY_TAG: (u32,) = (3,);
 const AUTHORIZED_KEY_TAG: (u32,) = (4,);
 const ANOMALY_SCORE_MAX: u32 = 100;
-const NONCE_CHANNEL_BUSINESS: u32 = 1;
+pub const NONCE_CHANNEL_ADMIN: u32 = 0;
+pub const NONCE_CHANNEL_BUSINESS: u32 = 1;
 
 pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
@@ -39,6 +40,9 @@ pub mod rate_limit;
 pub mod registry;
 pub mod dispute;
 pub mod extended_metadata;
+
+#[cfg(test)]
+mod rate_limit_test;
 
 pub use access_control::{ROLE_ADMIN, ROLE_ATTESTOR, ROLE_BUSINESS, ROLE_OPERATOR};
 pub use dynamic_fees::{DataKey, FeeConfig};
@@ -80,11 +84,12 @@ pub struct AttestationContract;
 
 #[contractimpl]
 impl AttestationContract {
-    pub fn initialize(env: Env, admin: Address, _nonce: u64) {
+    pub fn initialize(env: Env, admin: Address, nonce: u64) {
         if dynamic_fees::is_initialized(&env) {
             panic!("already initialized");
         }
         admin.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
         dynamic_fees::set_admin(&env, &admin);
         access_control::grant_role(&env, &admin, ROLE_ADMIN);
     }
@@ -117,8 +122,13 @@ impl AttestationContract {
         version: u32,
         proof_hash: Option<BytesN<32>>,
         expiry_timestamp: Option<u64>,
+        nonce: u64,
     ) {
+        access_control::require_not_paused(&env);
         business.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &business, NONCE_CHANNEL_BUSINESS, nonce);
+        rate_limit::check_rate_limit(&env, &business);
+
         let key = DataKey::Attestation(business.clone(), period.clone());
         if env.storage().instance().has(&key) {
             panic!("attestation exists");
@@ -148,6 +158,8 @@ impl AttestationContract {
             &proof_hash,
             expiry_timestamp,
         );
+
+        rate_limit::record_submission(&env, &business);
     }
 
     pub fn get_attestation(
@@ -405,6 +417,63 @@ impl AttestationContract {
 
     pub fn get_dispute(env: Env, id: u64) -> Option<Dispute> {
         dispute::get_dispute(&env, id)
+    }
+
+    /// Configure the sliding-window and burst-window rate limit controls.
+    pub fn configure_rate_limit(
+        env: Env,
+        max_submissions: u32,
+        window_seconds: u64,
+        burst_max_submissions: u32,
+        burst_window_seconds: u64,
+        enabled: bool,
+        nonce: u64,
+    ) {
+        let admin = dynamic_fees::require_admin(&env);
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+
+        let config = RateLimitConfig {
+            max_submissions,
+            window_seconds,
+            burst_max_submissions,
+            burst_window_seconds,
+            enabled,
+        };
+        rate_limit::set_rate_limit_config(&env, &config);
+        events::emit_rate_limit_config_changed(
+            &env,
+            max_submissions,
+            window_seconds,
+            burst_max_submissions,
+            burst_window_seconds,
+            enabled,
+            &admin,
+        );
+    }
+
+    /// Return the currently configured rate limit, if any.
+    pub fn get_rate_limit_config(env: Env) -> Option<RateLimitConfig> {
+        rate_limit::get_rate_limit_config(&env)
+    }
+
+    /// Return the active submission count for the business in the full window.
+    pub fn get_submission_window_count(env: Env, business: Address) -> u32 {
+        rate_limit::get_submission_count(&env, &business)
+    }
+
+    /// Return the active submission count for the business in the burst window.
+    pub fn get_submission_burst_count(env: Env, business: Address) -> u32 {
+        rate_limit::get_burst_submission_count(&env, &business)
+    }
+
+    /// Return the cumulative business submission count used by fee logic.
+    pub fn get_business_count(env: Env, business: Address) -> u64 {
+        dynamic_fees::get_business_count(&env, &business)
+    }
+
+    /// Return the next nonce required for the given actor/channel pair.
+    pub fn get_replay_nonce(env: Env, actor: Address, channel: u32) -> u64 {
+        replay_protection::get_nonce(&env, &actor, channel)
     }
 }
 

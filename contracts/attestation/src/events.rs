@@ -173,6 +173,10 @@ pub struct RateLimitConfigChangedEvent {
     pub max_submissions: u32,
     /// Sliding-window duration in seconds
     pub window_seconds: u64,
+    /// Maximum submissions allowed in the shorter burst window
+    pub burst_max_submissions: u32,
+    /// Burst-window duration in seconds
+    pub burst_window_seconds: u64,
     /// Whether rate limiting is enabled
     pub enabled: bool,
     /// Address that made the change
@@ -466,12 +470,16 @@ pub fn emit_rate_limit_config_changed(
     env: &Env,
     max_submissions: u32,
     window_seconds: u64,
+    burst_max_submissions: u32,
+    burst_window_seconds: u64,
     enabled: bool,
     changed_by: &Address,
 ) {
     let event = RateLimitConfigChangedEvent {
         max_submissions,
         window_seconds,
+        burst_max_submissions,
+        burst_window_seconds,
         enabled,
         changed_by: changed_by.clone(),
     };
