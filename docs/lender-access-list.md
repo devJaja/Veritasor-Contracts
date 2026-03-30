@@ -24,10 +24,33 @@ Contracts that integrate with this access list should choose a minimum tier per 
 
 ## Governance model
 
-- The contract has an `admin` address set at initialization.
-- Governance role is represented by a boolean flag `GovernanceRole(Address)`.
-- The `admin` can grant/revoke governance role.
-- Any address with governance role can add/update/remove lenders.
+**Hardened with Delegated Admin Controls:**
+
+- **Admin**: Single address set at initialization. Controls role grants/revokes.
+- **GovernanceRole(Address)** (bool): Full privileges (manage lenders + future).
+  - Admin grants/revokes.
+- **DelegatedAdmin(Address)** (bool): Lender management only (set_lender/remove_lender).
+  - Admin grants/revokes.
+  - `set_lender`/`remove_lender`: Allow GovernanceRole **OR** DelegatedAdmin (principle of least privilege).
+
+Events emitted for all role changes.
+
+## Security assumptions and privilege boundaries
+
+- Governance authority and lender allowlist membership are separate capabilities.
+- A lender with active tier access is still non-governance unless explicitly granted governance by admin.
+- Governance addresses cannot grant or revoke governance for other accounts; this is admin-only.
+- Revoked governance takes effect immediately for all mutating methods.
+- Access checks are tier-based and status-aware (`Active` and `tier >= min_tier`).
+
+Expected behavior for privilege-escalation resistance:
+
+- Non-admin callers must fail when attempting `grant_governance` or `revoke_governance`.
+- Non-governance callers must fail when attempting `set_lender` or `remove_lender`.
+- A lender account must fail if it attempts to self-upgrade its own tier through `set_lender`.
+- A previously authorized governance account must fail to mutate lender state after revocation.
+
+These invariants are covered by adversarial regression tests in `contracts/lender-access-list/src/test.rs`.
 
 ## Interface summary
 
@@ -35,13 +58,21 @@ Contracts that integrate with this access list should choose a minimum tier per 
 
 - `initialize(admin)`
 
-### Governance
+### Governance & Admin Controls
 
+**Full Governance (admin only):**
 - `grant_governance(admin, account)`
 - `revoke_governance(admin, account)`
+- `has_governance(account) -> bool`
+
+**Delegated Admin (admin only):**
+- `grant_delegated_admin(admin, account)`
+- `revoke_delegated_admin(admin, account)`
+- `has_delegated_admin(account) -> bool`
 
 ### Lender management
 
+**Lender Admin (GovernanceRole **OR** DelegatedAdmin):**
 - `set_lender(caller, lender, tier, metadata)`
 - `remove_lender(caller, lender)`
 

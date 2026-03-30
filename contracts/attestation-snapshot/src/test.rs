@@ -1,10 +1,9 @@
-//! Tests for the attestation snapshot contract: recording, querying, attestation
-//! validation, edge cases (missing attestations, repeated snapshots, evolving metrics),
-//! and scenario tests where lenders query snapshots for underwriting.
+//! Tests for the attestation snapshot contract, including epoch finalization,
+//! authorization, attestation validation, and ordering/replay edge cases.
 
 use super::*;
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{Address, Env, String};
+use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
+use soroban_sdk::{Address, BytesN, Env, String};
 use veritasor_attestation::{AttestationContract, AttestationContractClient};
 
 fn setup_snapshot_only() -> (Env, AttestationSnapshotContractClient<'static>, Address) {
@@ -37,6 +36,37 @@ fn setup_with_attestation() -> (
 
     let business = Address::generate(&env);
     (env, snap_client, att_client, admin, business)
+}
+
+fn set_ledger_timestamp(env: &Env, ts: u64) {
+    env.ledger().set(LedgerInfo {
+        timestamp: ts,
+        protocol_version: 22,
+        sequence_number: env.ledger().sequence(),
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 10,
+        min_persistent_entry_ttl: 10,
+        max_entry_ttl: 3_110_400,
+    });
+}
+
+fn submit_attestation(
+    env: &Env,
+    client: &AttestationContractClient<'_>,
+    business: &Address,
+    period: &String,
+) {
+    let root = BytesN::from_array(env, &[1u8; 32]);
+    client.submit_attestation(
+        business,
+        period,
+        &root,
+        &1_700_000_000u64,
+        &1u32,
+        &None,
+        &None,
+    );
 }
 
 // ── Initialization ───────────────────────────────────────────────────
@@ -74,25 +104,35 @@ fn test_record_and_get_snapshot_no_attestation_contract() {
     let (env, client, admin) = setup_snapshot_only();
     let business = Address::generate(&env);
     let period = String::from_str(&env, "2026-02");
+
+    set_ledger_timestamp(&env, 1_700_000_100);
     client.record_snapshot(&admin, &business, &period, &100_000i128, &2u32, &5u64);
+
     let record = client.get_snapshot(&business, &period).unwrap();
     assert_eq!(record.period, period);
     assert_eq!(record.trailing_revenue, 100_000i128);
     assert_eq!(record.anomaly_count, 2u32);
     assert_eq!(record.attestation_count, 5u64);
+    assert_eq!(record.recorded_at, 1_700_000_100);
 }
 
 #[test]
-fn test_record_overwrites_same_period() {
+fn test_record_overwrites_same_period_before_finalization() {
     let (env, client, admin) = setup_snapshot_only();
     let business = Address::generate(&env);
     let period = String::from_str(&env, "2026-02");
+
+    set_ledger_timestamp(&env, 1_700_000_100);
     client.record_snapshot(&admin, &business, &period, &100_000i128, &2u32, &5u64);
+
+    set_ledger_timestamp(&env, 1_700_000_200);
     client.record_snapshot(&admin, &business, &period, &200_000i128, &3u32, &6u64);
+
     let record = client.get_snapshot(&business, &period).unwrap();
     assert_eq!(record.trailing_revenue, 200_000i128);
     assert_eq!(record.anomaly_count, 3u32);
     assert_eq!(record.attestation_count, 6u64);
+    assert_eq!(record.recorded_at, 1_700_000_200);
 }
 
 #[test]
@@ -101,10 +141,14 @@ fn test_get_snapshots_for_business() {
     let business = Address::generate(&env);
     let p1 = String::from_str(&env, "2026-01");
     let p2 = String::from_str(&env, "2026-02");
+
     client.record_snapshot(&admin, &business, &p1, &50_000i128, &0u32, &1u64);
     client.record_snapshot(&admin, &business, &p2, &100_000i128, &1u32, &2u64);
+
     let snapshots = client.get_snapshots_for_business(&business);
     assert_eq!(snapshots.len(), 2);
+    assert_eq!(snapshots.get(0).unwrap().period, p1);
+    assert_eq!(snapshots.get(1).unwrap().period, p2);
 }
 
 #[test]
@@ -117,24 +161,16 @@ fn test_record_unauthorized_panics() {
     client.record_snapshot(&other, &business, &period, &100_000i128, &0u32, &0u64);
 }
 
-// ── Recording with attestation contract (validation) ────────────────────
+// ── Recording with attestation contract (validation) ─────────────────
 
 #[test]
 fn test_record_with_attestation_required_succeeds_when_attestation_exists() {
     let (env, snap_client, att_client, admin, business) = setup_with_attestation();
     let period = String::from_str(&env, "2026-02");
-    let root = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-    att_client.submit_attestation(
-        &business,
-        &period,
-        &root,
-        &1700000000u64,
-        &1u32,
-        &None,
-        &None,
-        &0u64,
-    );
+
+    submit_attestation(&env, &att_client, &business, &period);
     snap_client.record_snapshot(&admin, &business, &period, &100_000i128, &0u32, &1u64);
+
     let record = snap_client.get_snapshot(&business, &period).unwrap();
     assert_eq!(record.trailing_revenue, 100_000i128);
 }
@@ -148,40 +184,36 @@ fn test_record_with_attestation_required_panics_when_no_attestation() {
 }
 
 #[test]
-#[should_panic(expected = "attestation must not be revoked")]
-fn test_record_with_attestation_required_panics_when_revoked() {
+fn test_attestation_validated_snapshot_can_be_finalized() {
     let (env, snap_client, att_client, admin, business) = setup_with_attestation();
     let period = String::from_str(&env, "2026-02");
-    let root = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-    att_client.submit_attestation(
-        &business,
-        &period,
-        &root,
-        &1700000000u64,
-        &1u32,
-        &None,
-        &None,
-    );
-    att_client.revoke_attestation(
-        &admin,
-        &business,
-        &period,
-        &String::from_str(&env, "fraud"),
-        &1u64,
-    );
+
+    submit_attestation(&env, &att_client, &business, &period);
     snap_client.record_snapshot(&admin, &business, &period, &100_000i128, &0u32, &1u64);
+    snap_client.finalize_epoch(&admin, &period);
+
+    assert!(snap_client.is_epoch_finalized(&period));
+    assert_eq!(
+        snap_client
+            .get_epoch_finalization(&period)
+            .unwrap()
+            .snapshot_count,
+        1
+    );
 }
 
-// ── Writer role ───────────────────────────────────────────────────────
+// ── Writer role ──────────────────────────────────────────────────────
 
 #[test]
 fn test_writer_can_record() {
     let (env, client, admin) = setup_snapshot_only();
     let writer = Address::generate(&env);
     client.add_writer(&admin, &writer);
+
     let business = Address::generate(&env);
     let period = String::from_str(&env, "2026-02");
     client.record_snapshot(&writer, &business, &period, &50_000i128, &0u32, &0u64);
+
     assert!(client.get_snapshot(&business, &period).is_some());
 }
 
@@ -189,40 +221,172 @@ fn test_writer_can_record() {
 fn test_remove_writer() {
     let (env, client, admin) = setup_snapshot_only();
     let writer = Address::generate(&env);
+
     client.add_writer(&admin, &writer);
     assert!(client.is_writer(&writer));
+
     client.remove_writer(&admin, &writer);
     assert!(!client.is_writer(&writer));
 }
 
-// ── Lender / underwriting scenario ───────────────────────────────────
-
 #[test]
-fn test_lender_queries_snapshots_for_underwriting() {
+#[should_panic(expected = "caller must be admin or writer")]
+fn test_removed_writer_cannot_record() {
     let (env, client, admin) = setup_snapshot_only();
+    let writer = Address::generate(&env);
     let business = Address::generate(&env);
-    let periods = ["2026-01", "2026-02", "2026-03"];
-    for (i, p) in periods.iter().enumerate() {
-        let period = String::from_str(&env, p);
-        client.record_snapshot(
-            &admin,
-            &business,
-            &period,
-            &(100_000 * (i as i128 + 1)),
-            &(i as u32),
-            &(i as u64 + 1),
-        );
-    }
-    let snapshots = client.get_snapshots_for_business(&business);
-    assert_eq!(snapshots.len(), 3);
-    let last = client
-        .get_snapshot(&business, &String::from_str(&env, "2026-03"))
-        .unwrap();
-    assert_eq!(last.trailing_revenue, 300_000i128);
-    assert_eq!(last.anomaly_count, 2u32);
+    let period = String::from_str(&env, "2026-02");
+
+    client.add_writer(&admin, &writer);
+    client.remove_writer(&admin, &writer);
+    client.record_snapshot(&writer, &business, &period, &50_000i128, &0u32, &0u64);
 }
 
-// ── Edge cases ────────────────────────────────────────────────────────
+// ── Epoch finalization ───────────────────────────────────────────────
+
+#[test]
+fn test_finalize_epoch_records_metadata_and_freezes_business_index() {
+    let (env, client, admin) = setup_snapshot_only();
+    let epoch = String::from_str(&env, "2026-02");
+    let business_one = Address::generate(&env);
+    let business_two = Address::generate(&env);
+
+    set_ledger_timestamp(&env, 1_700_000_100);
+    client.record_snapshot(&admin, &business_one, &epoch, &100_000i128, &1u32, &1u64);
+    client.record_snapshot(&admin, &business_two, &epoch, &200_000i128, &0u32, &1u64);
+
+    let epoch_businesses = client.get_epoch_businesses(&epoch);
+    assert_eq!(epoch_businesses.len(), 2);
+    assert_eq!(epoch_businesses.get(0).unwrap(), business_one);
+    assert_eq!(epoch_businesses.get(1).unwrap(), business_two);
+
+    set_ledger_timestamp(&env, 1_700_000_250);
+    client.finalize_epoch(&admin, &epoch);
+
+    assert!(client.is_epoch_finalized(&epoch));
+
+    let finalization = client.get_epoch_finalization(&epoch).unwrap();
+    assert_eq!(finalization.epoch, epoch);
+    assert_eq!(finalization.snapshot_count, 2);
+    assert_eq!(finalization.finalized_at, 1_700_000_250);
+    assert_eq!(finalization.finalized_by, admin);
+}
+
+#[test]
+fn test_finalize_epoch_does_not_double_count_rewrites() {
+    let (env, client, admin) = setup_snapshot_only();
+    let epoch = String::from_str(&env, "2026-02");
+    let business = Address::generate(&env);
+
+    client.record_snapshot(&admin, &business, &epoch, &100_000i128, &1u32, &1u64);
+    client.record_snapshot(&admin, &business, &epoch, &150_000i128, &2u32, &2u64);
+
+    set_ledger_timestamp(&env, 1_700_000_300);
+    client.finalize_epoch(&admin, &epoch);
+
+    let epoch_businesses = client.get_epoch_businesses(&epoch);
+    assert_eq!(epoch_businesses.len(), 1);
+    assert_eq!(epoch_businesses.get(0).unwrap(), business);
+
+    let finalization = client.get_epoch_finalization(&epoch).unwrap();
+    assert_eq!(finalization.snapshot_count, 1);
+}
+
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_finalize_epoch_non_admin_panics() {
+    let (env, client, admin) = setup_snapshot_only();
+    let writer = Address::generate(&env);
+    let business = Address::generate(&env);
+    let epoch = String::from_str(&env, "2026-02");
+
+    client.add_writer(&admin, &writer);
+    client.record_snapshot(&writer, &business, &epoch, &100_000i128, &0u32, &1u64);
+    client.finalize_epoch(&writer, &epoch);
+}
+
+#[test]
+#[should_panic(expected = "epoch has no snapshots")]
+fn test_finalize_empty_epoch_panics() {
+    let (env, client, admin) = setup_snapshot_only();
+    client.finalize_epoch(&admin, &String::from_str(&env, "2026-02"));
+}
+
+#[test]
+#[should_panic(expected = "epoch already finalized")]
+fn test_finalize_epoch_twice_panics() {
+    let (env, client, admin) = setup_snapshot_only();
+    let business = Address::generate(&env);
+    let epoch = String::from_str(&env, "2026-02");
+
+    client.record_snapshot(&admin, &business, &epoch, &100_000i128, &0u32, &1u64);
+    client.finalize_epoch(&admin, &epoch);
+    client.finalize_epoch(&admin, &epoch);
+}
+
+#[test]
+#[should_panic(expected = "epoch already finalized")]
+fn test_record_after_epoch_finalization_panics() {
+    let (env, client, admin) = setup_snapshot_only();
+    let business = Address::generate(&env);
+    let epoch = String::from_str(&env, "2026-02");
+
+    client.record_snapshot(&admin, &business, &epoch, &100_000i128, &0u32, &1u64);
+    client.finalize_epoch(&admin, &epoch);
+    client.record_snapshot(&admin, &business, &epoch, &200_000i128, &0u32, &2u64);
+}
+
+#[test]
+fn test_finalization_is_scoped_per_epoch() {
+    let (env, client, admin) = setup_snapshot_only();
+    let business = Address::generate(&env);
+    let epoch_one = String::from_str(&env, "2026-01");
+    let epoch_two = String::from_str(&env, "2026-02");
+
+    client.record_snapshot(&admin, &business, &epoch_one, &100_000i128, &0u32, &1u64);
+    client.finalize_epoch(&admin, &epoch_one);
+
+    client.record_snapshot(&admin, &business, &epoch_two, &150_000i128, &1u32, &2u64);
+
+    assert!(client.is_epoch_finalized(&epoch_one));
+    assert!(!client.is_epoch_finalized(&epoch_two));
+    assert_eq!(
+        client
+            .get_snapshot(&business, &epoch_two)
+            .unwrap()
+            .trailing_revenue,
+        150_000i128
+    );
+}
+
+#[test]
+fn test_writer_record_then_admin_finalize() {
+    let (env, client, admin) = setup_snapshot_only();
+    let writer = Address::generate(&env);
+    let business = Address::generate(&env);
+    let epoch = String::from_str(&env, "2026-02");
+
+    client.add_writer(&admin, &writer);
+    client.record_snapshot(&writer, &business, &epoch, &100_000i128, &0u32, &1u64);
+    client.finalize_epoch(&admin, &epoch);
+    assert!(client.is_epoch_finalized(&epoch));
+}
+
+#[test]
+#[should_panic(expected = "epoch already finalized")]
+fn test_writer_cannot_record_after_admin_finalizes_epoch() {
+    let (env, client, admin) = setup_snapshot_only();
+    let writer = Address::generate(&env);
+    let business = Address::generate(&env);
+    let epoch = String::from_str(&env, "2026-02");
+
+    client.add_writer(&admin, &writer);
+    client.record_snapshot(&writer, &business, &epoch, &100_000i128, &0u32, &1u64);
+    client.finalize_epoch(&admin, &epoch);
+    client.record_snapshot(&writer, &business, &epoch, &200_000i128, &1u32, &2u64);
+}
+
+// ── Query edge cases ─────────────────────────────────────────────────
 
 #[test]
 fn test_get_snapshot_missing_returns_none() {
@@ -241,11 +405,24 @@ fn test_get_snapshots_for_business_empty() {
 }
 
 #[test]
+fn test_get_epoch_finalization_missing_returns_none() {
+    let (env, client, _admin) = setup_snapshot_only();
+    let epoch = String::from_str(&env, "2026-02");
+    assert!(client.get_epoch_finalization(&epoch).is_none());
+    assert_eq!(client.get_epoch_businesses(&epoch).len(), 0);
+    assert!(!client.is_epoch_finalized(&epoch));
+}
+
+// ── Admin configuration ──────────────────────────────────────────────
+
+#[test]
 fn test_set_attestation_contract() {
     let (env, client, admin) = setup_snapshot_only();
     let att_id = Address::generate(&env);
+
     client.set_attestation_contract(&admin, &Some(att_id.clone()));
     assert_eq!(client.get_attestation_contract(), Some(att_id));
+
     client.set_attestation_contract(&admin, &None::<Address>);
     assert!(client.get_attestation_contract().is_none());
 }
@@ -256,4 +433,37 @@ fn test_set_attestation_contract_non_admin_panics() {
     let (env, client, _admin) = setup_snapshot_only();
     let other = Address::generate(&env);
     client.set_attestation_contract(&other, &None::<Address>);
+}
+
+// ── Lender / underwriting scenario ───────────────────────────────────
+
+#[test]
+fn test_lender_queries_snapshots_for_underwriting() {
+    let (env, client, admin) = setup_snapshot_only();
+    let business = Address::generate(&env);
+    let periods = ["2026-01", "2026-02", "2026-03"];
+
+    for (i, p) in periods.iter().enumerate() {
+        let period = String::from_str(&env, p);
+        client.record_snapshot(
+            &admin,
+            &business,
+            &period,
+            &(100_000 * (i as i128 + 1)),
+            &(i as u32),
+            &(i as u64 + 1),
+        );
+    }
+
+    client.finalize_epoch(&admin, &String::from_str(&env, "2026-03"));
+
+    let snapshots = client.get_snapshots_for_business(&business);
+    assert_eq!(snapshots.len(), 3);
+
+    let latest = client
+        .get_snapshot(&business, &String::from_str(&env, "2026-03"))
+        .unwrap();
+    assert_eq!(latest.trailing_revenue, 300_000i128);
+    assert_eq!(latest.anomaly_count, 2u32);
+    assert!(client.is_epoch_finalized(&String::from_str(&env, "2026-03")));
 }

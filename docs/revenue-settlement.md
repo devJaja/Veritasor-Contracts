@@ -191,6 +191,25 @@ fn get_admin(env: Env) -> Address
 
 Fail if either check fails.
 
+### 2.5. Single Settlement Token Per Business-Period
+
+**Invariant**: A business and attestation period cannot be settled across multiple token contracts.
+
+**Mechanism**: The first successful settlement for `(business, period)` records the agreement token. Later settlements for the same business-period must use that same token address or they fail.
+
+**Rationale**: Revenue attestations do not include FX conversion logic in this contract. Rejecting cross-token settlement prevents the same attested revenue from being repaid in multiple currencies.
+
+### 2.5. Multi-Currency Rejection
+
+**Invariant**: Once a business-period has been settled in one token, another agreement cannot reuse that same attestation period with a different token.
+
+**Mechanism**: Settlement stores the first token seen for `(business, period)` and rejects any later settlement attempt with a different token.
+
+**Expected Behavior**:
+- Same-token agreements may settle independently.
+- Different-token agreements for the same business-period are rejected.
+- Failed cross-token attempts do not create settlement records or commitment entries for the rejected agreement.
+
 ### 3. Authorization
 
 **Invariant**: Only authorized parties can initiate state changes.
@@ -229,6 +248,8 @@ The contract includes comprehensive tests:
 ### Security Invariants
 - `test_settle_double_spending_prevention`: Verify commitment prevents re-settlement
 - `test_settle_inactive_agreement`: Verify cannot settle completed/defaulted agreements
+- `test_settle_rejects_multi_currency_for_same_business_period`: Verify cross-token reuse of the same business-period is rejected without partial state
+- `test_settle_allows_same_currency_across_multiple_agreements`: Verify same-token agreements remain supported for the same business-period
 
 ### Repayment Logic
 - `test_settle_below_minimum_revenue`: Verify minimum revenue threshold
@@ -345,6 +366,7 @@ After deployment, call `initialize` with admin address before any other operatio
 - Attestation contract is secure and non-malicious
 - Token contract follows Soroban token standard
 - Admin wallet is secure
+- No FX conversion is performed inside settlement; token address is the only on-chain currency discriminator enforced here
 
 ### External Dependencies
 - [Soroban SDK](https://github.com/stellar/rs-soroban-sdk)

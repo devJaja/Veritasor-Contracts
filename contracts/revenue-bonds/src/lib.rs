@@ -104,7 +104,8 @@ pub enum BondStructure {
 pub enum BondStatus {
     Active = 0,
     FullyRedeemed = 1,
-    Defaulted = 2,
+Defaulted = 2,
+    Matured = 3,
 }
 
 /// Bond issuance and terms
@@ -127,8 +128,9 @@ pub struct Bond {
     pub maturity_periods: u32,
     pub attestation_contract: Address,
     pub token: Address,
-    pub status: BondStatus,
+pub status: BondStatus,
     pub issued_at: u64,
+    pub issue_period: String,
 }
 
 /// Redemption record for a specific period
@@ -139,7 +141,33 @@ pub struct RedemptionRecord {
     pub period: String,
     pub attested_revenue: i128,
     pub redemption_amount: i128,
-    pub redeemed_at: u64,
+pub redeemed_at: u64,
+}
+
+fn parse_period(env: &Env, period: String) -> u64 {
+    let bytes = period.to_bytes();
+    assert!(bytes.len() == 7, "invalid period length");
+    assert!(bytes[4] == b'-', "invalid period separator");
+    let mut year = 0u64;
+    for i in 0..4 {
+        let d = bytes[i] as u64 - b'0' as u64;
+        assert!(d <= 9, "invalid year digit");
+        year = year * 10 + d;
+    }
+    let mut month = 0u64;
+    for i in 0..2 {
+        let d = bytes[5 + i] as u64 - b'0' as u64;
+        assert!(d <= 9, "invalid month digit");
+        month = month * 10 + d;
+    }
+    assert!(month >= 1 && month <= 12, "invalid month");
+    year * 12 + month - 1
+}
+
+fn is_period_within_maturity(env: &Env, bond: &Bond, period: String) -> bool {
+    let issue_months = parse_period(env, bond.issue_period.clone());
+    let period_months = parse_period(env, period);
+    period_months >= issue_months && period_months < issue_months + (bond.maturity_periods as u64)
 }
 
 #[contract]
@@ -191,28 +219,18 @@ impl RevenueBondContract {
         min_payment_per_period: i128,
         max_payment_per_period: i128,
         maturity_periods: u32,
+        issue_period: String,
         attestation_contract: Address,
         token: Address,
     ) -> u64 {
         issuer.require_auth();
 
         assert!(face_value > 0, "face_value must be positive");
-        assert!(
-            revenue_share_bps <= 10000,
-            "revenue_share_bps must be <= 10000"
-        );
-        assert!(
-            min_payment_per_period >= 0,
-            "min_payment_per_period must be non-negative"
-        );
-        assert!(
-            max_payment_per_period > 0,
-            "max_payment_per_period must be positive"
-        );
-        assert!(
-            max_payment_per_period >= min_payment_per_period,
-            "max must be >= min"
-        );
+        assert!(revenue_share_bps <= 10000, "revenue_share_bps must be <= 10000");
+        assert!(min_payment_per_period >= 0, "min_payment_per_period must be non-negative");
+        assert!(max_payment_per_period > 0, "max_payment_per_period must be positive");
+        assert!(max_payment_per_period >= min_payment_per_period, "max must be >= min");
+        parse_period(&env, issue_period.clone());
         assert!(maturity_periods > 0, "maturity_periods must be positive");
         assert!(!issuer.eq(&initial_owner), "issuer and owner must differ");
 
@@ -231,6 +249,7 @@ impl RevenueBondContract {
             min_payment_per_period,
             max_payment_per_period,
             maturity_periods,
+            issue_period,
             attestation_contract: attestation_contract.clone(),
             token: token.clone(),
             status: BondStatus::Active,
@@ -279,10 +298,8 @@ impl RevenueBondContract {
             .expect("bond not found");
 
         assert_eq!(bond.status, BondStatus::Active, "bond not active");
-        assert!(
-            attested_revenue >= 0,
-            "attested_revenue must be non-negative"
-        );
+        assert!(is_period_within_maturity(&env, &bond, period.clone()), "period exceeds maturity");
+        assert!(attested_revenue >= 0, "attested_revenue must be non-negative");
 
         // Prevent double-redemption for the same period
         let existing: Option<RedemptionRecord> = env
@@ -416,7 +433,7 @@ impl RevenueBondContract {
     /// # Risk Factors
     /// - Default results in loss for bond holders
     /// - Partial redemptions may have occurred before default
-    pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
+pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -431,8 +448,29 @@ impl RevenueBondContract {
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
 
-        assert_eq!(bond.status, BondStatus::Active, "bond not active");
+        assert!(matches!(bond.status, BondStatus::Active), "bond not active");
         bond.status = BondStatus::Defaulted;
+        env.storage().instance().set(&DataKey::Bond(bond_id), &bond);
+    }
+
+    /// Mark bond as matured (admin only).
+    pub fn mark_matured(env: Env, admin: Address, bond_id: u64) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        assert_eq!(admin, stored_admin, "unauthorized");
+        admin.require_auth();
+
+        let mut bond: Bond = env
+            .storage()
+            .instance()
+            .get(&DataKey::Bond(bond_id))
+            .expect("bond not found");
+
+        assert!(matches!(bond.status, BondStatus::Active), "bond not active");
+        bond.status = BondStatus::Matured;
         env.storage().instance().set(&DataKey::Bond(bond_id), &bond);
     }
 
@@ -462,13 +500,17 @@ impl RevenueBondContract {
     }
 
     /// Get remaining face value to be redeemed.
-    pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
+pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
         let bond: Bond = env
             .storage()
             .instance()
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
-
+        
+        if !matches!(bond.status, BondStatus::Active) {
+            return 0;
+        }
+        
         let total_redeemed: i128 = env
             .storage()
             .instance()

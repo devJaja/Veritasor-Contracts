@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), no_std)]
 
 // Production/shared utilities
+pub mod governance_gating;
 pub mod key_rotation;
 pub mod merkle;
 pub mod replay_protection;

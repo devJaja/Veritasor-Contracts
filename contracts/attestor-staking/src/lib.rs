@@ -41,6 +41,7 @@ enum DataKey {
     DisputeContract,
     UnbondingPeriod,
     PendingUnstake(Address),
+    Slashed(u64),
 }
 
 #[contract]
@@ -213,14 +214,7 @@ impl AttestorStakingContract {
 
         assert!(amount > 0, "slash amount must be positive");
 
-        // Check for double slashing using contracttype-compatible key
-        #[contracttype]
-        #[derive(Clone)]
-        enum SlashKey {
-            Slashed(u64),
-        }
-
-        let slash_key = SlashKey::Slashed(dispute_id);
+        let slash_key = DataKey::Slashed(dispute_id);
         if env.storage().instance().has(&slash_key) {
             panic!("dispute already processed");
         }
@@ -271,6 +265,17 @@ impl AttestorStakingContract {
     pub fn get_stake(env: Env, attestor: Address) -> Option<Stake> {
         let stake_key = DataKey::Stake(attestor);
         env.storage().instance().get(&stake_key)
+    }
+
+    /// Returns whether a dispute has already been applied as a slash.
+    pub fn is_dispute_processed(env: Env, dispute_id: u64) -> bool {
+        let slash_key = DataKey::Slashed(dispute_id);
+        env.storage().instance().has(&slash_key)
+    }
+
+    /// Get dispute contract address.
+    pub fn get_dispute_contract(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::DisputeContract).unwrap()
     }
 
     /// Get pending unstake information for an attestor.

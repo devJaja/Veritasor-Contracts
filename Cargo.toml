@@ -3,16 +3,20 @@
 members = [
     "contracts/aggregated-attestations",
     "contracts/attestation",
+    "contracts/attestation-registry",
     "contracts/attestation-snapshot",
     "contracts/attestor-staking",
     "contracts/audit-log",
     "contracts/business-config",
     "contracts/integration-registry",
+    "contracts/lender-access-list",
+    "contracts/lender-consumer",
     "contracts/network-config",
     "contracts/protocol-dao",
     "contracts/protocol-simulation",
     "contracts/revenue-bonds",
     "contracts/revenue-curve",
+    "contracts/revenue-share",
     "contracts/revenue-stream",
 ]
 resolver = "2"
