@@ -45,6 +45,19 @@ Constants: STATUS_ACTIVE = 0, STATUS_REVOKED = 1, STATUS_FILTER_ALL = 2.
 3. Apply period_start / period_end / status_filter / version_filter as needed. Filtering is done on-chain to reduce payload.
 4. For the next page, use the same period list with cursor = next_cursor until next_cursor >= periods.len().
 
+## Handling Sparse Periods
+
+Pagination remains stable under sparse conditions (gaps/missing attestations):
+
+- Missing periods skipped efficiently (storage miss fast).
+- next_cursor +=1 per period scanned (hits or misses).
+- Adversarial lists (unsorted/duplicates) handled without panic.
+- Cursor jumps to sparse regions bounded.
+- Filters + sparsity correct.
+- Roundtrips reproducible.
+
+See `query_pagination_test.rs` sparse suite.
+
 ## Performance considerations
 
 - One call does at most min(limit, QUERY_LIMIT_MAX) attestation lookups plus the same number of status lookups. Keep period list size and page size reasonable (e.g. 30–50 periods per request).
