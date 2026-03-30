@@ -26,12 +26,12 @@ mod attestation_import {
 #[cfg(not(target_arch = "wasm32"))]
 mod attestation_import {
     use soroban_sdk::{Address, BytesN, Env, String};
-    
+
     pub struct AttestationContractClient {
         env: Env,
         address: Address,
     }
-    
+
     impl AttestationContractClient {
         pub fn new(env: &Env, address: &Address) -> Self {
             Self {
@@ -39,27 +39,30 @@ mod attestation_import {
                 address: address.clone(),
             }
         }
-        
+
         #[cfg(test)]
-        pub fn get_attestation(&self, _business: &Address, _period: &String) -> Option<(BytesN<32>, u64, u32, i128)> {
-            Some((
-                BytesN::from_array(&self.env, &[0u8; 32]),
-                1000,
-                1,
-                0,
-            ))
+        pub fn get_attestation(
+            &self,
+            _business: &Address,
+            _period: &String,
+        ) -> Option<(BytesN<32>, u64, u32, i128)> {
+            Some((BytesN::from_array(&self.env, &[0u8; 32]), 1000, 1, 0))
         }
-        
+
         #[cfg(test)]
         pub fn is_revoked(&self, _business: &Address, _period: &String) -> bool {
             false
         }
-        
+
         #[cfg(not(test))]
-        pub fn get_attestation(&self, _business: &Address, _period: &String) -> Option<(BytesN<32>, u64, u32, i128)> {
+        pub fn get_attestation(
+            &self,
+            _business: &Address,
+            _period: &String,
+        ) -> Option<(BytesN<32>, u64, u32, i128)> {
             panic!("attestation contract not available in non-wasm32 non-test builds");
         }
-        
+
         #[cfg(not(test))]
         pub fn is_revoked(&self, _business: &Address, _period: &String) -> bool {
             panic!("attestation contract not available in non-wasm32 non-test builds");
@@ -101,11 +104,12 @@ pub enum BondStructure {
 pub enum BondStatus {
     Active = 0,
     FullyRedeemed = 1,
-    Defaulted = 2,
+Defaulted = 2,
+    Matured = 3,
 }
 
 /// Bond issuance and terms
-/// 
+///
 /// # Risk Factors
 /// - Revenue volatility may affect repayment timing
 /// - Business default risk if revenue falls below minimum thresholds
@@ -124,8 +128,9 @@ pub struct Bond {
     pub maturity_periods: u32,
     pub attestation_contract: Address,
     pub token: Address,
-    pub status: BondStatus,
+pub status: BondStatus,
     pub issued_at: u64,
+    pub issue_period: String,
 }
 
 /// Redemption record for a specific period
@@ -136,7 +141,33 @@ pub struct RedemptionRecord {
     pub period: String,
     pub attested_revenue: i128,
     pub redemption_amount: i128,
-    pub redeemed_at: u64,
+pub redeemed_at: u64,
+}
+
+fn parse_period(env: &Env, period: String) -> u64 {
+    let bytes = period.to_bytes();
+    assert!(bytes.len() == 7, "invalid period length");
+    assert!(bytes[4] == b'-', "invalid period separator");
+    let mut year = 0u64;
+    for i in 0..4 {
+        let d = bytes[i] as u64 - b'0' as u64;
+        assert!(d <= 9, "invalid year digit");
+        year = year * 10 + d;
+    }
+    let mut month = 0u64;
+    for i in 0..2 {
+        let d = bytes[5 + i] as u64 - b'0' as u64;
+        assert!(d <= 9, "invalid month digit");
+        month = month * 10 + d;
+    }
+    assert!(month >= 1 && month <= 12, "invalid month");
+    year * 12 + month - 1
+}
+
+fn is_period_within_maturity(env: &Env, bond: &Bond, period: String) -> bool {
+    let issue_months = parse_period(env, bond.issue_period.clone());
+    let period_months = parse_period(env, period);
+    period_months >= issue_months && period_months < issue_months + (bond.maturity_periods as u64)
 }
 
 #[contract]
@@ -188,16 +219,18 @@ impl RevenueBondContract {
         min_payment_per_period: i128,
         max_payment_per_period: i128,
         maturity_periods: u32,
+        issue_period: String,
         attestation_contract: Address,
         token: Address,
     ) -> u64 {
         issuer.require_auth();
-        
+
         assert!(face_value > 0, "face_value must be positive");
         assert!(revenue_share_bps <= 10000, "revenue_share_bps must be <= 10000");
         assert!(min_payment_per_period >= 0, "min_payment_per_period must be non-negative");
         assert!(max_payment_per_period > 0, "max_payment_per_period must be positive");
         assert!(max_payment_per_period >= min_payment_per_period, "max must be >= min");
+        parse_period(&env, issue_period.clone());
         assert!(maturity_periods > 0, "maturity_periods must be positive");
         assert!(!issuer.eq(&initial_owner), "issuer and owner must differ");
 
@@ -216,6 +249,7 @@ impl RevenueBondContract {
             min_payment_per_period,
             max_payment_per_period,
             maturity_periods,
+            issue_period,
             attestation_contract: attestation_contract.clone(),
             token: token.clone(),
             status: BondStatus::Active,
@@ -223,9 +257,15 @@ impl RevenueBondContract {
         };
 
         env.storage().instance().set(&DataKey::Bond(id), &bond);
-        env.storage().instance().set(&DataKey::BondOwner(id), &initial_owner);
-        env.storage().instance().set(&DataKey::TotalRedeemed(id), &0i128);
-        env.storage().instance().set(&DataKey::NextBondId, &(id + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::BondOwner(id), &initial_owner);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRedeemed(id), &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextBondId, &(id + 1));
 
         id
     }
@@ -258,6 +298,7 @@ impl RevenueBondContract {
             .expect("bond not found");
 
         assert_eq!(bond.status, BondStatus::Active, "bond not active");
+        assert!(is_period_within_maturity(&env, &bond, period.clone()), "period exceeds maturity");
         assert!(attested_revenue >= 0, "attested_revenue must be non-negative");
 
         // Prevent double-redemption for the same period
@@ -268,7 +309,8 @@ impl RevenueBondContract {
         assert!(existing.is_none(), "already redeemed for period");
 
         // Verify attestation exists and is not revoked
-        let client = attestation_import::AttestationContractClient::new(&env, &bond.attestation_contract);
+        let client =
+            attestation_import::AttestationContractClient::new(&env, &bond.attestation_contract);
         assert!(
             client.get_attestation(&bond.issuer, &period).is_some(),
             "attestation not found"
@@ -279,10 +321,7 @@ impl RevenueBondContract {
         );
 
         // Calculate redemption amount based on bond structure
-        let redemption_amount = Self::calculate_redemption(
-            &bond,
-            attested_revenue,
-        );
+        let redemption_amount = Self::calculate_redemption(&bond, attested_revenue);
 
         // Check if redemption would exceed face value
         let total_redeemed: i128 = env
@@ -290,7 +329,7 @@ impl RevenueBondContract {
             .instance()
             .get(&DataKey::TotalRedeemed(bond_id))
             .unwrap_or(0);
-        
+
         let actual_redemption = redemption_amount.min(bond.face_value - total_redeemed);
         assert!(actual_redemption >= 0, "bond already fully redeemed");
 
@@ -301,7 +340,7 @@ impl RevenueBondContract {
                 .instance()
                 .get(&DataKey::BondOwner(bond_id))
                 .expect("owner not found");
-            
+
             let token_client = token::Client::new(&env, &bond.token);
             token_client.transfer(&bond.issuer, &owner, &actual_redemption);
         }
@@ -315,20 +354,23 @@ impl RevenueBondContract {
             redeemed_at: env.ledger().timestamp(),
         };
 
-        env.storage().instance().set(
-            &DataKey::Redemption(bond_id, period),
-            &redemption,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Redemption(bond_id, period), &redemption);
 
         // Update total redeemed
         let new_total = total_redeemed + actual_redemption;
-        env.storage().instance().set(&DataKey::TotalRedeemed(bond_id), &new_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRedeemed(bond_id), &new_total);
 
         // Check if bond is fully redeemed
         if new_total >= bond.face_value {
             let mut updated_bond = bond;
             updated_bond.status = BondStatus::FullyRedeemed;
-            env.storage().instance().set(&DataKey::Bond(bond_id), &updated_bond);
+            env.storage()
+                .instance()
+                .set(&DataKey::Bond(bond_id), &updated_bond);
         }
     }
 
@@ -344,7 +386,9 @@ impl RevenueBondContract {
                 let share = (attested_revenue as u128)
                     .saturating_mul(bond.revenue_share_bps as u128)
                     .saturating_div(10000) as i128;
-                share.max(bond.min_payment_per_period).min(bond.max_payment_per_period)
+                share
+                    .max(bond.min_payment_per_period)
+                    .min(bond.max_payment_per_period)
             }
             BondStructure::Hybrid => {
                 // Minimum fixed + revenue share
@@ -371,11 +415,13 @@ impl RevenueBondContract {
             .instance()
             .get(&DataKey::BondOwner(bond_id))
             .expect("bond not found");
-        
+
         assert_eq!(current_owner, stored_owner, "not bond owner");
         assert!(!current_owner.eq(&new_owner), "cannot transfer to self");
 
-        env.storage().instance().set(&DataKey::BondOwner(bond_id), &new_owner);
+        env.storage()
+            .instance()
+            .set(&DataKey::BondOwner(bond_id), &new_owner);
     }
 
     /// Mark bond as defaulted (admin only).
@@ -387,7 +433,7 @@ impl RevenueBondContract {
     /// # Risk Factors
     /// - Default results in loss for bond holders
     /// - Partial redemptions may have occurred before default
-    pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
+pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -402,8 +448,29 @@ impl RevenueBondContract {
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
 
-        assert_eq!(bond.status, BondStatus::Active, "bond not active");
+        assert!(matches!(bond.status, BondStatus::Active), "bond not active");
         bond.status = BondStatus::Defaulted;
+        env.storage().instance().set(&DataKey::Bond(bond_id), &bond);
+    }
+
+    /// Mark bond as matured (admin only).
+    pub fn mark_matured(env: Env, admin: Address, bond_id: u64) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        assert_eq!(admin, stored_admin, "unauthorized");
+        admin.require_auth();
+
+        let mut bond: Bond = env
+            .storage()
+            .instance()
+            .get(&DataKey::Bond(bond_id))
+            .expect("bond not found");
+
+        assert!(matches!(bond.status, BondStatus::Active), "bond not active");
+        bond.status = BondStatus::Matured;
         env.storage().instance().set(&DataKey::Bond(bond_id), &bond);
     }
 
@@ -419,28 +486,37 @@ impl RevenueBondContract {
 
     /// Get redemption record for a period.
     pub fn get_redemption(env: Env, bond_id: u64, period: String) -> Option<RedemptionRecord> {
-        env.storage().instance().get(&DataKey::Redemption(bond_id, period))
+        env.storage()
+            .instance()
+            .get(&DataKey::Redemption(bond_id, period))
     }
 
     /// Get total amount redeemed for a bond.
     pub fn get_total_redeemed(env: Env, bond_id: u64) -> i128 {
-        env.storage().instance().get(&DataKey::TotalRedeemed(bond_id)).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalRedeemed(bond_id))
+            .unwrap_or(0)
     }
 
     /// Get remaining face value to be redeemed.
-    pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
+pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
         let bond: Bond = env
             .storage()
             .instance()
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
         
+        if !matches!(bond.status, BondStatus::Active) {
+            return 0;
+        }
+        
         let total_redeemed: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalRedeemed(bond_id))
             .unwrap_or(0);
-        
+
         bond.face_value - total_redeemed
     }
 

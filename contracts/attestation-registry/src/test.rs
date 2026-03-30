@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 //! Comprehensive test suite for the Attestation Registry contract.
 //!
 //! Tests cover:
@@ -43,14 +41,13 @@ fn setup_uninitialized() -> (Env, AttestationRegistryClient<'static>) {
     (env, client)
 }
 
-
 // ════════════════════════════════════════════════════════════════════
 //  Initialization tests
 // ════════════════════════════════════════════════════════════════════
 
 #[test]
 fn initialize_success() {
-    let (env, client, admin, initial_impl) = setup();
+    let (_env, client, admin, initial_impl) = setup();
 
     assert!(client.is_initialized());
     assert_eq!(client.get_admin(), Some(admin));
@@ -63,7 +60,7 @@ fn initialize_success() {
 #[test]
 #[should_panic(expected = "already initialized")]
 fn double_initialize_panics() {
-    let (env, client, admin, initial_impl) = setup();
+    let (_env, client, admin, initial_impl) = setup();
     client.initialize(&admin, &initial_impl, &1u32);
 }
 
@@ -77,13 +74,13 @@ fn operations_before_initialization_panic() {
 
 #[test]
 fn is_initialized_returns_false_when_uninitialized() {
-    let (env, client) = setup_uninitialized();
+    let (_env, client) = setup_uninitialized();
     assert!(!client.is_initialized());
 }
 
 #[test]
 fn query_functions_return_none_when_uninitialized() {
-    let (env, client) = setup_uninitialized();
+    let (_env, client) = setup_uninitialized();
     assert_eq!(client.get_admin(), None);
     assert_eq!(client.get_current_implementation(), None);
     assert_eq!(client.get_current_version(), None);
@@ -98,7 +95,7 @@ fn query_functions_return_none_when_uninitialized() {
 
 #[test]
 fn upgrade_success() {
-    let (env, client, admin, initial_impl) = setup();
+    let (env, client, _admin, initial_impl) = setup();
     let new_impl = Address::generate(&env);
     let new_version = 2u32;
 
@@ -112,7 +109,7 @@ fn upgrade_success() {
 
 #[test]
 fn upgrade_with_migration_data() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_impl = Address::generate(&env);
     let migration_data = Bytes::from_array(&env, &[1u8, 2u8, 3u8]);
 
@@ -127,7 +124,7 @@ fn upgrade_with_migration_data() {
 
 #[test]
 fn upgrade_multiple_versions() {
-    let (env, client, admin, impl_v1) = setup();
+    let (env, client, _admin, _impl_v1) = setup();
     let impl_v2 = Address::generate(&env);
     let impl_v3 = Address::generate(&env);
     let impl_v4 = Address::generate(&env);
@@ -153,7 +150,7 @@ fn upgrade_multiple_versions() {
 #[test]
 #[should_panic(expected = "new version must be greater than current version")]
 fn upgrade_with_same_version_panics() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_impl = Address::generate(&env);
     client.upgrade(&new_impl, &1u32, &None); // Same as initial version
 }
@@ -161,7 +158,7 @@ fn upgrade_with_same_version_panics() {
 #[test]
 #[should_panic(expected = "new version must be greater than current version")]
 fn upgrade_with_lower_version_panics() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_impl = Address::generate(&env);
     client.upgrade(&new_impl, &2u32, &None); // Upgrade to v2
     client.upgrade(&new_impl, &1u32, &None); // Try to downgrade to v1
@@ -177,7 +174,7 @@ fn upgrade_before_initialization_panics() {
 
 #[test]
 fn upgrade_preserves_previous_implementation() {
-    let (env, client, admin, impl_v1) = setup();
+    let (env, client, _admin, impl_v1) = setup();
     let impl_v2 = Address::generate(&env);
     let impl_v3 = Address::generate(&env);
 
@@ -192,7 +189,7 @@ fn upgrade_preserves_previous_implementation() {
 
 #[test]
 fn upgrade_allows_skipping_versions() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_impl = Address::generate(&env);
 
     // Skip from v1 to v5
@@ -207,12 +204,15 @@ fn upgrade_allows_skipping_versions() {
 
 #[test]
 fn rollback_success() {
-    let (env, client, admin, impl_v1) = setup();
+    let (env, client, _admin, impl_v1) = setup();
     let impl_v2 = Address::generate(&env);
     let impl_v2_clone = impl_v2.clone();
 
     client.upgrade(&impl_v2, &2u32, &None);
-    assert_eq!(client.get_current_implementation(), Some(impl_v2_clone.clone()));
+    assert_eq!(
+        client.get_current_implementation(),
+        Some(impl_v2_clone.clone())
+    );
     assert_eq!(client.get_current_version(), Some(2u32));
 
     client.rollback();
@@ -225,7 +225,7 @@ fn rollback_success() {
 
 #[test]
 fn rollback_multiple_times() {
-    let (env, client, admin, impl_v1) = setup();
+    let (env, client, _admin, _impl_v1) = setup();
     let impl_v2 = Address::generate(&env);
     let impl_v3 = Address::generate(&env);
 
@@ -246,14 +246,14 @@ fn rollback_multiple_times() {
 #[test]
 #[should_panic(expected = "no previous implementation to rollback to")]
 fn rollback_on_first_version_panics() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (_env, client, _admin, _initial_impl) = setup();
     client.rollback(); // No previous version exists
 }
 
 #[test]
 #[should_panic(expected = "registry not initialized")]
 fn rollback_before_initialization_panics() {
-    let (env, client) = setup_uninitialized();
+    let (_env, client) = setup_uninitialized();
     client.rollback();
 }
 
@@ -273,7 +273,7 @@ fn rollback_before_initialization_panics() {
 
 #[test]
 fn transfer_admin_success() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_admin = Address::generate(&env);
 
     client.transfer_admin(&new_admin);
@@ -282,7 +282,7 @@ fn transfer_admin_success() {
 
 #[test]
 fn new_admin_can_upgrade() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_admin = Address::generate(&env);
     let new_impl = Address::generate(&env);
 
@@ -298,11 +298,11 @@ fn admin_transfer_changes_admin() {
     let new_admin = Address::generate(&env);
 
     client.transfer_admin(&new_admin);
-    
+
     // Verify admin changed
     assert_eq!(client.get_admin(), Some(new_admin));
     assert_ne!(client.get_admin(), Some(admin));
-    
+
     // New admin should be able to upgrade
     let new_impl = Address::generate(&env);
     client.upgrade(&new_impl, &2u32, &None);
@@ -310,12 +310,127 @@ fn admin_transfer_changes_admin() {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  Query function tests
+//  Duplicate-key protection tests
+// ════════════════════════════════════════════════════════════════════
+
+#[test]
+fn register_attestation_key_success() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let attester = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    client.register_attestation_key(&attester, &key);
+
+    assert!(client.has_attestation_key(&attester, &key));
+}
+
+#[test]
+#[should_panic(expected = "attestation key already registered")]
+fn register_duplicate_key_panics() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let attester = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    client.register_attestation_key(&attester, &key);
+    client.register_attestation_key(&attester, &key); // duplicate → panic
+}
+
+#[test]
+fn different_attesters_same_key_allowed() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let attester_a = Address::generate(&env);
+    let attester_b = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    // Same key string, different attester addresses → both succeed
+    client.register_attestation_key(&attester_a, &key);
+    client.register_attestation_key(&attester_b, &key);
+
+    assert!(client.has_attestation_key(&attester_a, &key));
+    assert!(client.has_attestation_key(&attester_b, &key));
+}
+
+#[test]
+fn same_attester_different_keys_allowed() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let attester = Address::generate(&env);
+    let key_a = soroban_sdk::String::from_str(&env, "2024-Q1");
+    let key_b = soroban_sdk::String::from_str(&env, "2024-Q2");
+
+    client.register_attestation_key(&attester, &key_a);
+    client.register_attestation_key(&attester, &key_b);
+
+    assert!(client.has_attestation_key(&attester, &key_a));
+    assert!(client.has_attestation_key(&attester, &key_b));
+}
+
+#[test]
+fn has_attestation_key_returns_false_for_unregistered() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let attester = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    assert!(!client.has_attestation_key(&attester, &key));
+}
+
+#[test]
+fn has_attestation_key_returns_false_when_uninitialized() {
+    let (env, client) = setup_uninitialized();
+    let attester = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    assert!(!client.has_attestation_key(&attester, &key));
+}
+
+#[test]
+#[should_panic(expected = "registry not initialized")]
+fn register_key_before_initialization_panics() {
+    let (env, client) = setup_uninitialized();
+    let attester = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    client.register_attestation_key(&attester, &key);
+}
+
+#[test]
+fn duplicate_key_rejected_after_upgrade() {
+    // Duplicate-key protection persists across implementation upgrades.
+    let (env, client, _admin, _initial_impl) = setup();
+    let attester = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    client.register_attestation_key(&attester, &key);
+
+    // Upgrade the implementation
+    let new_impl = Address::generate(&env);
+    client.upgrade(&new_impl, &2u32, &None);
+
+    // Key must still be blocked after upgrade
+    assert!(client.has_attestation_key(&attester, &key));
+}
+
+#[test]
+#[should_panic(expected = "attestation key already registered")]
+fn duplicate_key_still_rejected_after_upgrade() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let attester = Address::generate(&env);
+    let key = soroban_sdk::String::from_str(&env, "2024-Q1");
+
+    client.register_attestation_key(&attester, &key);
+
+    let new_impl = Address::generate(&env);
+    client.upgrade(&new_impl, &2u32, &None);
+
+    client.register_attestation_key(&attester, &key); // must still panic
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Version info tests
 // ════════════════════════════════════════════════════════════════════
 
 #[test]
 fn get_version_info_returns_correct_data() {
-    let (env, client, admin, initial_impl) = setup();
+    let (env, client, _admin, initial_impl) = setup();
     let version_info = client.get_version_info().unwrap();
 
     assert_eq!(version_info.version, 1u32);
@@ -328,7 +443,7 @@ fn get_version_info_returns_correct_data() {
 
 #[test]
 fn get_version_info_after_upgrade() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_impl = Address::generate(&env);
     let migration_data = Bytes::from_array(&env, &[42u8; 10]);
 
@@ -343,14 +458,17 @@ fn get_version_info_after_upgrade() {
 
 #[test]
 fn query_functions_work_after_multiple_upgrades() {
-    let (env, client, admin, impl_v1) = setup();
+    let (env, client, _admin, impl_v1) = setup();
     let impl_v2 = Address::generate(&env);
     let impl_v2_clone = impl_v2.clone();
     let impl_v3 = Address::generate(&env);
     let impl_v3_clone = impl_v3.clone();
 
     client.upgrade(&impl_v2, &2u32, &None);
-    assert_eq!(client.get_current_implementation(), Some(impl_v2_clone.clone()));
+    assert_eq!(
+        client.get_current_implementation(),
+        Some(impl_v2_clone.clone())
+    );
     assert_eq!(client.get_current_version(), Some(2u32));
     assert_eq!(client.get_previous_implementation(), Some(impl_v1));
     assert_eq!(client.get_previous_version(), Some(1u32));
@@ -368,7 +486,7 @@ fn query_functions_work_after_multiple_upgrades() {
 
 #[test]
 fn upgrade_to_same_implementation_allowed() {
-    let (env, client, admin, initial_impl) = setup();
+    let (_env, client, _admin, initial_impl) = setup();
     // Upgrading to the same implementation with a higher version is allowed
     // (though unusual, it might be used for version tracking)
     client.upgrade(&initial_impl, &2u32, &None);
@@ -378,7 +496,7 @@ fn upgrade_to_same_implementation_allowed() {
 
 #[test]
 fn upgrade_with_empty_migration_data() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let new_impl = Address::generate(&env);
     let empty_data = Bytes::from_array(&env, &[]);
 
@@ -388,7 +506,7 @@ fn upgrade_with_empty_migration_data() {
 
 #[test]
 fn complex_upgrade_rollback_scenario() {
-    let (env, client, admin, impl_v1) = setup();
+    let (env, client, _admin, _impl_v1) = setup();
     let impl_v2 = Address::generate(&env);
     let impl_v3 = Address::generate(&env);
     let impl_v4 = Address::generate(&env);
@@ -415,7 +533,7 @@ fn complex_upgrade_rollback_scenario() {
 
 #[test]
 fn version_info_activated_at_is_reasonable() {
-    let (env, client, admin, _initial_impl) = setup();
+    let (env, client, _admin, _initial_impl) = setup();
     let version_info = client.get_version_info().unwrap();
     let ledger_time = env.ledger().timestamp();
 
@@ -423,4 +541,43 @@ fn version_info_activated_at_is_reasonable() {
     // Allow some small difference for test execution time
     assert!(version_info.activated_at <= ledger_time);
     assert!(ledger_time - version_info.activated_at < 1000); // Within 1 second
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Reorg-resilience tests
+// ════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "new version must be greater than current version")]
+fn reorg_resilience_replay_upgrade_panics() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let new_impl = Address::generate(&env);
+    client.upgrade(&new_impl, &2u32, &None);
+    client.upgrade(&new_impl, &2u32, &None);
+}
+
+#[test]
+#[should_panic(expected = "new version must be greater than current version")]
+fn reorg_resilience_out_of_order_upgrade_panics() {
+    let (env, client, _admin, _initial_impl) = setup();
+    let impl_v2 = Address::generate(&env);
+    let impl_v3 = Address::generate(&env);
+    client.upgrade(&impl_v3, &3u32, &None);
+    client.upgrade(&impl_v2, &2u32, &None);
+}
+
+#[test]
+fn reorg_resilience_upgrade_after_rollback() {
+    let (env, client, _admin, impl_v1) = setup();
+    let impl_v2 = Address::generate(&env);
+    let impl_v3 = Address::generate(&env);
+
+    client.upgrade(&impl_v2, &2u32, &None);
+    client.rollback();
+    assert_eq!(client.get_current_version(), Some(1u32));
+
+    client.upgrade(&impl_v3, &3u32, &None);
+    assert_eq!(client.get_current_version(), Some(3u32));
+    assert_eq!(client.get_previous_version(), Some(1u32));
+    assert_eq!(client.get_previous_implementation(), Some(impl_v1));
 }

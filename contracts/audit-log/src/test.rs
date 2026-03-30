@@ -1,5 +1,7 @@
 //! Tests for on-chain audit log.
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Address, BytesN, Env, String};
@@ -16,6 +18,50 @@ fn setup() -> (Env, AuditLogContractClient<'static>, Address) {
 
 fn zero_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[0; 32])
+}
+
+/// Extract a readable panic message from a `catch_unwind` payload.
+fn panic_message(err: &std::boxed::Box<dyn std::any::Any + Send>) -> std::string::String {
+    if let Some(s) = err.downcast_ref::<&str>() {
+        std::string::String::from(*s)
+    } else if let Some(s) = err.downcast_ref::<std::string::String>() {
+        s.clone()
+    } else {
+        std::string::String::from("(non-string panic payload)")
+    }
+}
+
+/// Assert that the append-only log is contiguous from `0..get_log_count()`
+/// and that the stored hash chain is internally consistent.
+fn assert_no_sequence_gaps(env: &Env, client: &AuditLogContractClient<'_>) {
+    let log_count = client.get_log_count();
+    let mut expected_prev_hash = zero_hash(env);
+
+    for seq in 0..log_count {
+        let record = client
+            .get_entry(&seq)
+            .unwrap_or_else(|| panic!("sequence gap detected at seq {}", seq));
+
+        assert_eq!(
+            record.seq, seq,
+            "entry seq mismatch at position {}",
+            seq
+        );
+        assert_eq!(
+            record.prev_hash, expected_prev_hash,
+            "hash chain mismatch at seq {}",
+            seq
+        );
+
+        expected_prev_hash = record.entry_hash;
+    }
+
+    assert_eq!(
+        client.get_last_hash(),
+        expected_prev_hash,
+        "chain head mismatch after scanning {} entries",
+        log_count
+    );
 }
 
 #[test]
@@ -101,6 +147,7 @@ fn test_append_ordering() {
     assert_eq!(r1.prev_hash, r0.entry_hash);
     assert_eq!(r2.prev_hash, r1.entry_hash);
     assert_eq!(client.get_last_hash(), r2.entry_hash);
+    assert_no_sequence_gaps(&env, &client);
 }
 
 #[test]
@@ -130,6 +177,7 @@ fn test_tamper_evident_chain_linking() {
     assert_eq!(r0.prev_hash, zero_hash(&env));
     assert_eq!(r1.prev_hash, r0.entry_hash);
     assert_ne!(r0.entry_hash, r1.entry_hash);
+    assert_no_sequence_gaps(&env, &client);
 }
 
 #[test]
@@ -235,6 +283,151 @@ fn test_get_seqs_by_contract() {
     assert_eq!(seqs1.get(0).unwrap(), 0);
     assert_eq!(seqs1.get(1).unwrap(), 2);
     assert_eq!(seqs2.get(0).unwrap(), 1);
+}
+
+#[test]
+fn test_sequence_gap_detection_accepts_contiguous_log() {
+    let (env, client, _admin) = setup();
+    let actor_a = Address::generate(&env);
+    let actor_b = Address::generate(&env);
+    let source_a = Address::generate(&env);
+    let source_b = Address::generate(&env);
+
+    client.append(
+        &1u64,
+        &actor_a,
+        &source_a,
+        &String::from_str(&env, "submit_attestation"),
+        &String::from_str(&env, "payload-0"),
+    );
+    client.append(
+        &2u64,
+        &actor_b,
+        &source_b,
+        &String::from_str(&env, "revoke_attestation"),
+        &String::from_str(&env, "payload-1"),
+    );
+    client.append(
+        &3u64,
+        &actor_a,
+        &source_b,
+        &String::from_str(&env, "migrate_attestation"),
+        &String::from_str(&env, "payload-2"),
+    );
+
+    assert_no_sequence_gaps(&env, &client);
+}
+
+#[test]
+fn test_sequence_gap_detection_rejects_missing_middle_entry() {
+    let (env, client, _admin) = setup();
+    let actor = Address::generate(&env);
+    let source = Address::generate(&env);
+
+    for nonce in 1u64..=3 {
+        client.append(
+            &nonce,
+            &actor,
+            &source,
+            &String::from_str(&env, "submit"),
+            &String::from_str(&env, "payload"),
+        );
+    }
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&DataKey::Entry(1));
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_no_sequence_gaps(&env, &client);
+    }));
+
+    let err = result.expect_err("missing middle entry must be detected as a sequence gap");
+    let msg = panic_message(&err);
+    assert!(
+        msg.contains("sequence gap detected at seq 1"),
+        "unexpected panic message: {msg}"
+    );
+}
+
+#[test]
+fn test_sequence_gap_detection_rejects_overreported_log_count() {
+    let (env, client, _admin) = setup();
+    let actor = Address::generate(&env);
+    let source = Address::generate(&env);
+
+    client.append(
+        &1u64,
+        &actor,
+        &source,
+        &String::from_str(&env, "submit"),
+        &String::from_str(&env, "payload-0"),
+    );
+    client.append(
+        &2u64,
+        &actor,
+        &source,
+        &String::from_str(&env, "submit"),
+        &String::from_str(&env, "payload-1"),
+    );
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::NextSeq, &3u64);
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_no_sequence_gaps(&env, &client);
+    }));
+
+    let err = result.expect_err("overreported log count must expose a trailing sequence gap");
+    let msg = panic_message(&err);
+    assert!(
+        msg.contains("sequence gap detected at seq 2"),
+        "unexpected panic message: {msg}"
+    );
+}
+
+#[test]
+fn test_sequence_gap_detection_rejects_last_hash_desync() {
+    let (env, client, _admin) = setup();
+    let actor = Address::generate(&env);
+    let source = Address::generate(&env);
+
+    client.append(
+        &1u64,
+        &actor,
+        &source,
+        &String::from_str(&env, "submit"),
+        &String::from_str(&env, "payload-0"),
+    );
+    client.append(
+        &2u64,
+        &actor,
+        &source,
+        &String::from_str(&env, "submit"),
+        &String::from_str(&env, "payload-1"),
+    );
+
+    let contract_id = client.address.clone();
+    let forged_head = BytesN::from_array(&env, &[9; 32]);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHash, &forged_head);
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_no_sequence_gaps(&env, &client);
+    }));
+
+    let err = result.expect_err("forged chain head must be detected");
+    let msg = panic_message(&err);
+    assert!(
+        msg.contains("chain head mismatch"),
+        "unexpected panic message: {msg}"
+    );
 }
 
 #[test]

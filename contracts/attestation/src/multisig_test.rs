@@ -1,13 +1,11 @@
 //! # Multisig Tests
 //!
-//! Comprehensive tests for the multisignature admin system including proposal
-//! creation, approval, execution, and edge cases.
+//! Comprehensive tests for the multisignature admin system...
 
-#![allow(unused_variables)] // test helpers return (env, client, admin, owners); not all tests use all
+#![allow(unused_variables)]
 
 use super::*;
-use crate::access_control::ROLE_ADMIN;
-use crate::multisig::{ProposalAction, ProposalStatus};
+use crate::multisig::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Address, Env, Vec};
 
@@ -405,4 +403,35 @@ fn test_full_threshold_approval() {
 
     assert_eq!(client.get_approval_count(&proposal_id), 3);
     assert!(client.is_proposal_approved(&proposal_id));
+}
+
+#[test]
+fn test_threshold_rotation() {
+    let (env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+
+    // 1. Propose threshold change to 3
+    let action = ProposalAction::ChangeThreshold(3);
+    let proposal_id = client.create_proposal(&admin, &action, &0u64);
+
+    // 2. Approve and Execute
+    client.approve_proposal(&owner2, &proposal_id, &0u64);
+    client.execute_proposal(&admin, &proposal_id, &0u64);
+
+    // 3. Verify
+    assert_eq!(client.get_multisig_threshold(), 3);
+}
+
+#[test]
+#[should_panic(expected = "new threshold cannot exceed number of owners")]
+fn test_threshold_rotation_invalid_exceeds_owners() {
+    let (env, client, admin, owners) = setup_with_multisig();
+
+    // Propose threshold of 4 (we only have 3 owners)
+    let action = ProposalAction::ChangeThreshold(4);
+    let proposal_id = client.create_proposal(&admin, &action, &0u64);
+
+    let owner2 = owners.get(1).unwrap();
+    client.approve_proposal(&owner2, &proposal_id, &0u64);
+    client.execute_proposal(&admin, &proposal_id, &0u64);
 }

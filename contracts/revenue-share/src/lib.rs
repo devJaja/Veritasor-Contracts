@@ -2,39 +2,72 @@
 
 //! # Revenue Share Distribution Contract
 //!
-//! Automatically distributes on-chain revenue to multiple stakeholders based on
-//! attested revenue data from the Veritasor attestation protocol.
+//! Automatically distributes caller-supplied revenue amounts to configured
+//! stakeholders using deterministic basis-point allocation rules.
 //!
-//! ## Distribution Model
+//! ## Distribution model
 //!
 //! The contract maintains a list of stakeholders with their respective share percentages.
 //! When revenue is distributed:
 //!
-//! 1. Fetches attested revenue amount from the attestation contract
-//! 2. Calculates each stakeholder's share: `amount = revenue × share_bps / 10_000`
-//! 3. Transfers tokens to each stakeholder
-//! 4. Handles rounding residuals by allocating to the first stakeholder
+//! 1. Verifies an on-chain attestation exists for `(business, period)` and that the
+//!    declared `revenue_amount` matches the attested Merkle root (`SHA256(revenue BE bytes)`).
+//! 2. Rejects expired or revoked attestations (when exposed by the attestation contract).
+//! 3. Calculates each stakeholder's share: `amount = revenue × share_bps / 10_000` using
+//!    checked arithmetic.
+//! 4. Transfers tokens to each stakeholder after confirming the business holds sufficient balance.
+//! 5. Handles rounding residuals by allocating to the first stakeholder and asserts the final
+//!    vector sums exactly to `revenue_amount`.
 //!
-//! ## Share Configuration
+//! ## Share configuration
 //!
-//! - Shares are expressed in basis points (1 bps = 0.01%)
-//! - Total shares must equal exactly 10,000 bps (100%)
-//! - Minimum 1 stakeholder, maximum 50 stakeholders
-//! - Each stakeholder must have at least 1 bps (0.01%)
+//! - Shares are expressed in basis points (1 bps = 0.01%).
+//! - Total shares must equal exactly 10,000 bps (100%).
+//! - Minimum 1 stakeholder, maximum 50 stakeholders.
+//! - Each stakeholder must have at least 1 bps (0.01%).
 //!
-//! ## Security Features
+//! ## Security / guardrails
 //!
-//! - Admin-only configuration changes
-//! - Validates share totals on every update
-//! - Prevents distribution without valid attestation
-//! - Tracks distribution history for audit
-//! - Safe rounding with residual allocation
+//! - Admin-only configuration changes with per-admin replay nonces.
+//! - Per-business replay nonces on each successful distribution.
+//! - Attestation binding, expiry, and revocation checks before any transfer.
+//! - Period identifier length cap to bound storage and cross-contract work.
+//! - Checked arithmetic for share aggregation and intermediate products.
+//! - Explicit pre-transfer balance check and post-calculation sum invariant.
+//! - One distribution per `(business, period)` (idempotent storage key).
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, String, Vec,
+};
 use veritasor_common::replay_protection;
 
-/// Nonce channels for replay protection
+/// Nonce channel for admin configuration calls (`initialize` uses `0` as first nonce).
 pub const NONCE_CHANNEL_ADMIN: u32 = 1;
+
+/// Nonce channel for `distribute_revenue` (per `business` address).
+pub const NONCE_CHANNEL_DISTRIBUTE: u32 = 2;
+
+/// Maximum UTF-8 byte length for `period` strings (DoS / storage guardrail).
+pub const MAX_PERIOD_BYTES: u32 = 128;
+
+// ════════════════════════════════════════════════════════════════════
+//  Attestation client (WASM import vs. dev crate)
+// ════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "wasm32")]
+mod attestation_import {
+    soroban_sdk::contractimport!(
+        file = "../../target/wasm32-unknown-unknown/release/veritasor_attestation.wasm"
+    );
+    pub use Client as AttestationContractClient;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod attestation_import {
+    pub use veritasor_attestation::AttestationContractClient;
+}
+
+use attestation_import::AttestationContractClient;
 
 // ════════════════════════════════════════════════════════════════════
 //  Storage types
@@ -45,7 +78,7 @@ pub const NONCE_CHANNEL_ADMIN: u32 = 1;
 pub enum DataKey {
     /// Contract administrator
     Admin,
-    /// Attestation contract address
+    /// Attestation contract address reserved for integration and off-chain coordination
     AttestationContract,
     /// Token contract for distributions
     Token,
@@ -94,25 +127,30 @@ impl RevenueShareContract {
     ///
     /// # Parameters
     /// - `admin`: Administrator address with configuration privileges
-    /// - `nonce`: Replay protection nonce (must be 0 for first call)
+    /// - `nonce`: Replay protection nonce for admin channel (must be `0` on first call)
     /// - `attestation_contract`: Address of the Veritasor attestation contract
     /// - `token`: Token contract address for revenue distributions
     ///
     /// # Panics
     /// - If already initialized
-    /// - If nonce is invalid
-    pub fn initialize(env: Env, admin: Address, nonce: u64, attestation_contract: Address, token: Address) {
+    /// - If nonce is invalid for `(admin, NONCE_CHANNEL_ADMIN)`
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        nonce: u64,
+        attestation_contract: Address,
+        token: Address,
+    ) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         admin.require_auth();
-        
-        // Verify and increment nonce for replay protection
+
         replay_protection::verify_and_increment_nonce(
-            &env, 
-            &admin, 
-            NONCE_CHANNEL_ADMIN, 
-            nonce
+            &env,
+            &admin,
+            NONCE_CHANNEL_ADMIN,
+            nonce,
         );
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -125,9 +163,6 @@ impl RevenueShareContract {
     // ── Admin: Configuration ────────────────────────────────────────
 
     /// Configure stakeholders and their revenue shares.
-    ///
-    /// # Parameters
-    /// - `stakeholders`: Vector of stakeholder configurations
     ///
     /// # Validation
     /// - Total shares must equal exactly 10,000 bps (100%)
@@ -146,12 +181,10 @@ impl RevenueShareContract {
     pub fn configure_stakeholders(env: Env, nonce: u64, stakeholders: Vec<Stakeholder>) {
         let _admin = Self::require_admin_with_nonce(&env, nonce);
 
-        // Validate stakeholder count
         let count = stakeholders.len();
         assert!(count > 0, "must have at least one stakeholder");
         assert!(count <= 50, "cannot exceed 50 stakeholders");
 
-        // Validate shares and check for duplicates
         let mut total_bps = 0u32;
         for i in 0..count {
             let stakeholder = stakeholders.get(i).unwrap();
@@ -159,9 +192,10 @@ impl RevenueShareContract {
                 stakeholder.share_bps > 0,
                 "each stakeholder must have at least 1 bps"
             );
-            total_bps += stakeholder.share_bps;
+            total_bps = total_bps
+                .checked_add(stakeholder.share_bps)
+                .expect("stakeholder bps overflow");
 
-            // Check for duplicate addresses
             for j in (i + 1)..count {
                 let other = stakeholders.get(j).unwrap();
                 assert!(
@@ -182,14 +216,6 @@ impl RevenueShareContract {
     }
 
     /// Update the attestation contract address.
-    ///
-    /// # Parameters
-    /// - `nonce`: Replay protection nonce for admin
-    /// - `attestation_contract`: New attestation contract address
-    ///
-    /// # Panics
-    /// - If caller is not admin
-    /// - If nonce is invalid
     pub fn set_attestation_contract(env: Env, nonce: u64, attestation_contract: Address) {
         Self::require_admin_with_nonce(&env, nonce);
         env.storage()
@@ -198,14 +224,6 @@ impl RevenueShareContract {
     }
 
     /// Update the token contract address.
-    ///
-    /// # Parameters
-    /// - `nonce`: Replay protection nonce for admin
-    /// - `token`: New token contract address
-    ///
-    /// # Panics
-    /// - If caller is not admin
-    /// - If nonce is invalid
     pub fn set_token(env: Env, nonce: u64, token: Address) {
         Self::require_admin_with_nonce(&env, nonce);
         env.storage().instance().set(&DataKey::Token, &token);
@@ -213,45 +231,63 @@ impl RevenueShareContract {
 
     // ── Distribution Execution ──────────────────────────────────────
 
-    /// Distribute revenue based on attested data.
+    /// Distribute revenue based on attested data and stakeholder configuration.
     ///
     /// # Parameters
-    /// - `business`: Business address with attested revenue
-    /// - `period`: Revenue period identifier
-    /// - `revenue_amount`: Total revenue amount to distribute
+    /// - `business`: Business address whose attestation and token balance are used
+    /// - `period`: Revenue period identifier (length ≤ [`MAX_PERIOD_BYTES`])
+    /// - `revenue_amount`: Total revenue amount to distribute (must match attestation root)
+    /// - `nonce`: Replay protection nonce for `(business, NONCE_CHANNEL_DISTRIBUTE)`
     ///
-    /// # Process
-    /// 1. Validates attestation exists and matches revenue amount
-    /// 2. Calculates each stakeholder's share
-    /// 3. Transfers tokens to stakeholders
-    /// 4. Allocates rounding residual to first stakeholder
-    /// 5. Records distribution for audit
+    /// # Guardrails
+    /// - Business must authorize; after other guardrails pass, the distribution nonce must
+    ///   match the expected monotonic counter (incremented only when execution reaches transfers)
+    /// - Attestation must exist, not expired, not revoked; Merkle root must bind `revenue_amount`
+    /// - No prior distribution for the same `(business, period)`
+    /// - Business token balance must be ≥ `revenue_amount` before transfers
+    /// - Final per-recipient amounts sum exactly to `revenue_amount`
     ///
     /// # Panics
-    /// - If stakeholders not configured
-    /// - If distribution already executed for this (business, period)
-    /// - If attestation validation fails
-    /// - If token transfers fail
-    pub fn distribute_revenue(env: Env, business: Address, period: String, revenue_amount: i128) {
+    /// - On any failed validation, failed invariant, insufficient balance, or transfer error
+    pub fn distribute_revenue(
+        env: Env,
+        business: Address,
+        period: String,
+        revenue_amount: i128,
+        nonce: u64,
+    ) {
         business.require_auth();
+
+        Self::assert_period_within_limit(&period);
 
         assert!(revenue_amount >= 0, "revenue amount must be non-negative");
 
-        // Check if already distributed
         let dist_key = DataKey::Distribution(business.clone(), period.clone());
         assert!(
             !env.storage().instance().has(&dist_key),
             "distribution already executed for this period"
         );
 
-        // Get stakeholders
+        let attestation_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AttestationContract)
+            .expect("attestation contract not configured");
+
+        Self::assert_revenue_attested(
+            &env,
+            &attestation_contract,
+            &business,
+            &period,
+            revenue_amount,
+        );
+
         let stakeholders: Vec<Stakeholder> = env
             .storage()
             .instance()
             .get(&DataKey::Stakeholders)
             .expect("stakeholders not configured");
 
-        // Calculate and execute distributions
         let mut amounts = Vec::new(&env);
         let mut total_distributed = 0i128;
 
@@ -259,23 +295,45 @@ impl RevenueShareContract {
             let stakeholder = stakeholders.get(i).unwrap();
             let amount = Self::calculate_share(revenue_amount, stakeholder.share_bps);
             amounts.push_back(amount);
-            total_distributed += amount;
+            total_distributed = total_distributed
+                .checked_add(amount)
+                .expect("total distributed overflow");
         }
 
-        // Handle rounding residual - allocate to first stakeholder
-        let residual = revenue_amount - total_distributed;
+        let residual = revenue_amount
+            .checked_sub(total_distributed)
+            .expect("residual underflow");
         if residual > 0 {
             let first_amount = amounts.get(0).unwrap();
-            amounts.set(0, first_amount + residual);
+            amounts.set(
+                0,
+                first_amount
+                    .checked_add(residual)
+                    .expect("residual allocation overflow"),
+            );
         }
 
-        // Execute transfers
+        Self::assert_amounts_sum(&amounts, revenue_amount);
+
         let token_address: Address = env
             .storage()
             .instance()
             .get(&DataKey::Token)
             .expect("token not configured");
         let token_client = token::Client::new(&env, &token_address);
+
+        let balance = token_client.balance(&business);
+        assert!(
+            balance >= revenue_amount,
+            "insufficient token balance for distribution"
+        );
+
+        replay_protection::verify_and_increment_nonce(
+            &env,
+            &business,
+            NONCE_CHANNEL_DISTRIBUTE,
+            nonce,
+        );
 
         for i in 0..stakeholders.len() {
             let stakeholder = stakeholders.get(i).unwrap();
@@ -285,7 +343,6 @@ impl RevenueShareContract {
             }
         }
 
-        // Record distribution
         let record = DistributionRecord {
             total_amount: revenue_amount,
             timestamp: env.ledger().timestamp(),
@@ -293,13 +350,19 @@ impl RevenueShareContract {
         };
         env.storage().instance().set(&dist_key, &record);
 
-        // Increment distribution counter
         let count_key = DataKey::DistributionCount(business.clone());
         let count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
-        env.storage().instance().set(&count_key, &(count + 1));
+        env.storage()
+            .instance()
+            .set(&count_key, &count.checked_add(1).expect("count overflow"));
     }
 
     // ── Read-only Queries ───────────────────────────────────────────
+
+    /// Returns the maximum allowed byte length for a `period` string.
+    pub fn get_max_period_bytes(_env: Env) -> u32 {
+        MAX_PERIOD_BYTES
+    }
 
     /// Get the current stakeholder configuration.
     pub fn get_stakeholders(env: Env) -> Option<Vec<Stakeholder>> {
@@ -324,11 +387,12 @@ impl RevenueShareContract {
 
     /// Calculate the share amount for a given revenue and basis points.
     ///
-    /// Formula: `amount = revenue × share_bps / 10_000`
-    ///
-    /// This is a pure calculation function exposed for transparency.
+    /// Formula: `amount = revenue × share_bps / 10_000` (checked; panics on overflow).
     pub fn calculate_share(revenue: i128, share_bps: u32) -> i128 {
-        revenue * (share_bps as i128) / 10_000i128
+        revenue
+            .checked_mul(share_bps as i128)
+            .and_then(|p| p.checked_div(10_000i128))
+            .expect("calculate_share overflow")
     }
 
     /// Get the contract admin address.
@@ -355,25 +419,13 @@ impl RevenueShareContract {
             .expect("not initialized")
     }
 
-    /// Get the current nonce for replay protection.
-    /// Returns the nonce value that must be supplied on the next call.
+    /// Get the current nonce for replay protection for `(actor, channel)`.
     pub fn get_replay_nonce(env: Env, actor: Address, channel: u32) -> u64 {
         replay_protection::get_nonce(&env, &actor, channel)
     }
 
     // ── Internal Helpers ────────────────────────────────────────────
 
-    fn require_admin(env: &Env) -> Address {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("contract not initialized");
-        admin.require_auth();
-        admin
-    }
-    
-    /// Helper function to require admin auth and verify replay protection nonce
     fn require_admin_with_nonce(env: &Env, nonce: u64) -> Address {
         let admin: Address = env
             .storage()
@@ -381,16 +433,70 @@ impl RevenueShareContract {
             .get(&DataKey::Admin)
             .expect("contract not initialized");
         admin.require_auth();
-        
-        // Verify and increment nonce for replay protection
-        replay_protection::verify_and_increment_nonce(
-            env, 
-            &admin, 
-            NONCE_CHANNEL_ADMIN, 
-            nonce
-        );
-        
+
+        replay_protection::verify_and_increment_nonce(env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+
         admin
+    }
+
+    fn assert_period_within_limit(period: &String) {
+        assert!(
+            period.len() <= MAX_PERIOD_BYTES,
+            "period exceeds maximum length"
+        );
+    }
+
+    /// Binds `revenue_amount` to the attestation Merkle root (`SHA256(i128 BE)`), matching
+    /// the pattern used elsewhere in Veritasor (e.g. lender revenue submission).
+    fn assert_revenue_attested(
+        env: &Env,
+        attestation_contract: &Address,
+        business: &Address,
+        period: &String,
+        revenue_amount: i128,
+    ) {
+        let client = AttestationContractClient::new(env, attestation_contract);
+
+        let att = client.get_attestation(business.clone(), period.clone());
+        assert!(att.is_some(), "attestation not found");
+
+        assert!(
+            !client.is_revoked(business.clone(), period.clone()),
+            "attestation is revoked"
+        );
+        assert!(
+            !client.is_expired(business.clone(), period.clone()),
+            "attestation expired"
+        );
+
+        let (stored_root, _, _, _, _, _): (
+            BytesN<32>,
+            u64,
+            u32,
+            i128,
+            Option<BytesN<32>>,
+            Option<u64>,
+        ) = att.expect("attestation not found");
+
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&revenue_amount.to_be_bytes());
+        let payload = Bytes::from_slice(env, &buf);
+        let calculated_root: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        assert_eq!(
+            calculated_root, stored_root,
+            "revenue amount does not match attested merkle root"
+        );
+    }
+
+    fn assert_amounts_sum(amounts: &Vec<i128>, expected: i128) {
+        let mut sum = 0i128;
+        for i in 0..amounts.len() {
+            sum = sum
+                .checked_add(amounts.get(i).unwrap())
+                .expect("amount sum overflow");
+        }
+        assert_eq!(sum, expected, "distribution amounts must sum to revenue");
     }
 }
 

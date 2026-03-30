@@ -105,6 +105,8 @@ pub struct RotationRecord {
     pub completed_at: u32,
     /// Whether this was an emergency rotation.
     pub is_emergency: bool,
+    /// Ledger sequence until which the old admin retains grace period privileges.
+    pub grace_period_end: u32,
 }
 
 /// Configuration for the key rotation system.
@@ -120,6 +122,9 @@ pub struct RotationConfig {
     /// Minimum number of ledger sequences between consecutive rotations.
     /// At ~5 seconds per ledger, 8_640 ≈ 12 hours.
     pub cooldown_ledgers: u32,
+    /// Number of ledger sequences the old key remains valid after a planned rotation.
+    /// At ~5 seconds per ledger, 17_280 ≈ 24 hours.
+    pub grace_period_ledgers: u32,
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -134,6 +139,9 @@ pub const DEFAULT_CONFIRMATION_WINDOW: u32 = 34_560;
 
 /// Default cooldown between rotations: ~12 hours at 5 s/ledger.
 pub const DEFAULT_COOLDOWN_LEDGERS: u32 = 8_640;
+
+/// Default grace period: ~24 hours at 5 s/ledger.
+pub const DEFAULT_GRACE_PERIOD_LEDGERS: u32 = 17_280;
 
 /// Maximum number of rotation records kept in history.
 pub const MAX_ROTATION_HISTORY: u32 = 50;
@@ -151,6 +159,7 @@ pub fn get_rotation_config(env: &Env) -> RotationConfig {
             timelock_ledgers: DEFAULT_TIMELOCK_LEDGERS,
             confirmation_window_ledgers: DEFAULT_CONFIRMATION_WINDOW,
             cooldown_ledgers: DEFAULT_COOLDOWN_LEDGERS,
+            grace_period_ledgers: DEFAULT_GRACE_PERIOD_LEDGERS,
         })
 }
 
@@ -397,6 +406,25 @@ pub fn get_last_rotation_ledger(env: &Env) -> u32 {
         .unwrap_or(0)
 }
 
+/// Check if an old admin is still within their grace period.
+/// Emergency rotations have no grace period.
+pub fn is_in_grace_period(env: &Env, admin: &Address) -> bool {
+    let history = get_rotation_history(env);
+    let current_seq = env.ledger().sequence();
+    
+    if history.len() == 0 {
+        return false;
+    }
+    
+    for i in (0..history.len()).rev() {
+        let record = history.get(i).unwrap();
+        if record.old_admin == *admin {
+            return !record.is_emergency && current_seq <= record.grace_period_end;
+        }
+    }
+    false
+}
+
 // ════════════════════════════════════════════════════════════════════
 //  Internal Helpers
 // ════════════════════════════════════════════════════════════════════
@@ -411,6 +439,11 @@ fn finalize_rotation(env: &Env, request: &RotationRequest) {
         new_admin: request.new_admin.clone(),
         completed_at: current_seq,
         is_emergency: request.is_emergency,
+        grace_period_end: if request.is_emergency {
+            current_seq
+        } else {
+            current_seq + get_rotation_config(env).grace_period_ledgers
+        },
     };
 
     let mut history = get_rotation_history(env);

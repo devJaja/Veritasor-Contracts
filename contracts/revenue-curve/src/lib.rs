@@ -10,6 +10,14 @@
 //! - Governance-controlled pricing policy updates
 //! - Integration with attestation contract for revenue verification
 //! - Transparent and auditable pricing decisions
+//!
+//! ## Arithmetic and extreme inputs
+//!
+//! `anomaly_score * risk_premium_bps_per_point` and `base_apr_bps + risk_premium_bps` use
+//! saturating `u64` intermediates capped at `u32::MAX` before tier discount and min/max clamp.
+//! This yields deterministic outputs under adversarial admin parameters (no silent `u32` wrap).
+//! Tier matching uses `revenue >= min_revenue` on `i128`; tiers must be strictly ascending by
+//! `min_revenue` at configuration time.
 
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
@@ -145,6 +153,14 @@ impl RevenueCurveContract {
             policy.base_apr_bps >= policy.min_apr_bps && policy.base_apr_bps <= policy.max_apr_bps,
             "base_apr must be within [min_apr, max_apr]"
         );
+        assert!(
+            policy.max_apr_bps <= 10000,
+            "max_apr cannot exceed 10000 bps (100%)"
+        );
+        assert!(
+            policy.risk_premium_bps_per_point <= 1000,
+            "risk premium per point cannot exceed 1000 bps"
+        );
         env.storage()
             .instance()
             .set(&DataKey::PricingPolicy, &policy);
@@ -163,9 +179,12 @@ impl RevenueCurveContract {
     pub fn set_revenue_tiers(env: Env, admin: Address, tiers: Vec<RevenueTier>) {
         Self::require_admin(&env, &admin);
 
+        assert!(tiers.len() <= 20, "maximum of 20 tiers allowed");
+
         // Validate tiers are sorted and discounts are reasonable
         let mut prev_revenue: Option<i128> = None;
         for tier in tiers.iter() {
+            assert!(tier.min_revenue >= 0, "min_revenue cannot be negative");
             if let Some(prev) = prev_revenue {
                 assert!(
                     tier.min_revenue > prev,
@@ -188,7 +207,8 @@ impl RevenueCurveContract {
     /// - `anomaly_score`: Risk score (0-100, where 0 is lowest risk)
     ///
     /// # Returns
-    /// `PricingOutput` with calculated APR and breakdown
+    /// `PricingOutput` with calculated APR and breakdown. Risk and sum-of-components use
+    /// saturating arithmetic (see module docs).
     ///
     /// # Panics
     /// - If pricing policy not configured
@@ -227,28 +247,7 @@ impl RevenueCurveContract {
         assert!(exists, "attestation not found");
         assert!(!revoked, "attestation is revoked");
 
-        // Calculate risk premium
-        let risk_premium_bps = anomaly_score * policy.risk_premium_bps_per_point;
-
-        // Find applicable tier discount
-        let (tier_discount_bps, tier_level) = Self::find_tier_discount(&env, revenue);
-
-        // Calculate final APR
-        let mut apr_bps = policy.base_apr_bps + risk_premium_bps;
-
-        // Apply tier discount (cannot go below 0)
-        apr_bps = apr_bps.saturating_sub(tier_discount_bps);
-
-        // Clamp to min/max bounds
-        apr_bps = apr_bps.max(policy.min_apr_bps).min(policy.max_apr_bps);
-
-        PricingOutput {
-            apr_bps,
-            base_apr_bps: policy.base_apr_bps,
-            risk_premium_bps,
-            tier_discount_bps,
-            tier_level,
-        }
+        Self::pricing_output_for_inputs(&env, &policy, revenue, anomaly_score)
     }
 
     /// Get a pricing quote without attestation verification (for estimation).
@@ -258,7 +257,7 @@ impl RevenueCurveContract {
     /// - `anomaly_score`: Risk score (0-100)
     ///
     /// # Returns
-    /// `PricingOutput` with calculated APR and breakdown
+    /// `PricingOutput` with calculated APR and breakdown (same saturating rules as [`calculate_pricing`]).
     ///
     /// # Panics
     /// - If pricing policy not configured
@@ -274,20 +273,7 @@ impl RevenueCurveContract {
 
         assert!(policy.enabled, "pricing policy is disabled");
 
-        let risk_premium_bps = anomaly_score * policy.risk_premium_bps_per_point;
-        let (tier_discount_bps, tier_level) = Self::find_tier_discount(&env, revenue);
-
-        let mut apr_bps = policy.base_apr_bps + risk_premium_bps;
-        apr_bps = apr_bps.saturating_sub(tier_discount_bps);
-        apr_bps = apr_bps.max(policy.min_apr_bps).min(policy.max_apr_bps);
-
-        PricingOutput {
-            apr_bps,
-            base_apr_bps: policy.base_apr_bps,
-            risk_premium_bps,
-            tier_discount_bps,
-            tier_level,
-        }
+        Self::pricing_output_for_inputs(&env, &policy, revenue, anomaly_score)
     }
 
     /// Get the current pricing policy.
@@ -314,6 +300,46 @@ impl RevenueCurveContract {
     }
 
     // ── Internal helpers ────────────────────────────────────────────
+
+    /// `anomaly_score * risk_premium_bps_per_point`, saturated at `u32::MAX` (no wrap).
+    fn scaled_risk_premium_bps(anomaly_score: u32, risk_premium_bps_per_point: u32) -> u32 {
+        (anomaly_score as u64)
+            .saturating_mul(risk_premium_bps_per_point as u64)
+            .min(u32::MAX as u64) as u32
+    }
+
+    /// `base_apr_bps + risk_premium_bps` via `u64`, capped at `u32::MAX` before discount and clamp.
+    fn assemble_pricing_output(
+        policy: &PricingPolicy,
+        risk_premium_bps: u32,
+        tier_discount_bps: u32,
+        tier_level: u32,
+    ) -> PricingOutput {
+        let combined = (policy.base_apr_bps as u64)
+            .saturating_add(risk_premium_bps as u64)
+            .min(u32::MAX as u64) as u32;
+        let mut apr_bps = combined.saturating_sub(tier_discount_bps);
+        apr_bps = apr_bps.max(policy.min_apr_bps).min(policy.max_apr_bps);
+        PricingOutput {
+            apr_bps,
+            base_apr_bps: policy.base_apr_bps,
+            risk_premium_bps,
+            tier_discount_bps,
+            tier_level,
+        }
+    }
+
+    fn pricing_output_for_inputs(
+        env: &Env,
+        policy: &PricingPolicy,
+        revenue: i128,
+        anomaly_score: u32,
+    ) -> PricingOutput {
+        let risk_premium_bps =
+            Self::scaled_risk_premium_bps(anomaly_score, policy.risk_premium_bps_per_point);
+        let (tier_discount_bps, tier_level) = Self::find_tier_discount(env, revenue);
+        Self::assemble_pricing_output(policy, risk_premium_bps, tier_discount_bps, tier_level)
+    }
 
     fn require_admin(env: &Env, admin: &Address) {
         let stored_admin: Address = env
