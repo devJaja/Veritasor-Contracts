@@ -490,7 +490,7 @@ impl AttestationContract {
         access_control::require_admin(&env, &caller);
         dispute::require_not_revoked_for_update(&env, &business, &period);
         let key = DataKey::Attestation(business.clone(), period.clone());
-        let (old_root, ts, old_ver, fee, proof_hash, expiry): AttestationData = env
+        let (_old_root, ts, old_ver, fee, proof_hash, expiry): AttestationData = env
             .storage()
             .instance()
             .get(&key)
