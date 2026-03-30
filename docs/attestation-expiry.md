@@ -1,29 +1,31 @@
-# Attestation Expiry Semantics
+# Attestation Expiry Enforcement
 
 ## Overview
 
-Attestations can optionally include an expiry timestamp to help lenders, auditors, and counterparties reason about data freshness. Expired attestations remain on-chain and queryable but are clearly marked as stale.
+The attestation contract now enforces expiry at write time and at verification time.
 
-## Design Principles
+- Expiry remains optional (`None` means no expiry).
+- If expiry is present, it must be valid at submission time.
+- Expired attestations remain stored and queryable for audit/history.
+- `verify_attestation()` now treats expired attestations as invalid.
 
-1. **Optional by default** – Businesses can submit attestations without expiry for permanent records
-2. **Explicit checking** – Expiry is not enforced; consumers must explicitly check `is_expired()`
-3. **Audit preservation** – Expired attestations are never deleted, maintaining full history
-4. **Separation of concerns** – `verify_attestation()` checks integrity; `is_expired()` checks freshness
+## Enforced Rules
 
-## Storage Schema
+When calling `submit_attestation(...)` with `expiry_timestamp = Some(expiry_ts)`:
 
-Each attestation is stored as a 5-tuple:
+1. `expiry_ts` MUST be strictly greater than `timestamp`
+2. `expiry_ts` MUST be strictly greater than current ledger timestamp (`env.ledger().timestamp()`)
 
 ```rust
 (merkle_root: BytesN<32>, timestamp: u64, version: u32, fee_paid: i128, proof_hash: Option<BytesN<32>>, expiry_timestamp: Option<u64>)
 ```
 
-- `expiry_timestamp` – Unix timestamp (seconds) when attestation becomes stale, or `None` for no expiry
+- `"expiry must be after attestation timestamp"` or
+- `"expiry must be in the future"`
 
-## Contract Methods
+This prevents expired-on-arrival records and malformed time windows.
 
-### `submit_attestation`
+## Contract Behavior
 
 ```rust
 pub fn submit_attestation(
@@ -62,42 +64,21 @@ pub fn get_attestation(
 
 ### `is_expired`
 
-```rust
-pub fn is_expired(
-    env: Env,
-    business: Address,
-    period: String,
-) -> bool
-```
+Returns:
 
-**Returns:**
-- `true` if attestation exists, has expiry set, and current ledger time >= expiry
-- `false` if attestation doesn't exist, has no expiry, or is not yet expired
-
-**Usage:**
-```rust
-if client.is_expired(&business, &period) {
-    // Attestation is stale, request fresh data
-}
-```
+- `true` when attestation exists, has expiry, and `ledger_time >= expiry`
+- `false` otherwise (no attestation, no expiry, or still fresh)
 
 ### `verify_attestation`
 
-```rust
-pub fn verify_attestation(
-    env: Env,
-    business: Address,
-    period: String,
-    merkle_root: BytesN<32>,
-) -> bool
-```
+Returns `true` only when all of the following hold:
 
-**Important:** This method does NOT check expiry. It only verifies:
 1. Attestation exists
-2. Not revoked
-3. Merkle root matches
+2. Attestation is not revoked
+3. Attestation is not expired
+4. Stored Merkle root equals supplied Merkle root
 
-Consumers must call `is_expired()` separately to validate freshness.
+This is the core freshness enforcement entry point for contract consumers.
 
 ## Expiry Semantics
 
@@ -186,23 +167,15 @@ fn calculate_expiry(current: u64, seconds: u64) -> Option<u64> {
 
 ## Usage Patterns
 
-### Lender Due Diligence
+Unchanged for auditability. Even expired attestations are still returned.
 
-```rust
-// Check attestation exists and is valid
-if !client.verify_attestation(&business, &period, &expected_root) {
-    return Err("Invalid attestation");
-}
+### `migrate_attestation`
 
-// Check freshness
-if client.is_expired(&business, &period) {
-    return Err("Attestation expired, request updated data");
-}
+Unchanged for expiry field semantics: migration preserves existing `expiry_timestamp`.
 
-// Proceed with loan approval
-```
+## Data Model
 
-### Quarterly Financial Reports
+Attestation payload remains:
 
 ```rust
 // Submit Q1 2026 report, expires after 90 days
@@ -268,11 +241,12 @@ To change expiry, the business must:
 
 ## Security Notes
 
-1. **No automatic enforcement** – Expiry is advisory only. Smart contracts consuming attestations must implement their own expiry policies.
+- Enforcing future-only expiry prevents stale attestations from being created intentionally.
+- Enforcing `expiry > timestamp` prevents inconsistent temporal claims.
+- Verification-time enforcement ensures freshness checks are not accidentally skipped by consumers.
+- Ledger time is validator-controlled; if an integration requires stricter time guarantees, pair on-chain checks with off-chain controls.
 
-2. **Time manipulation** – Ledger timestamp is controlled by validators. For critical applications, consider additional off-chain verification.
-
-3. **Revocation vs. Expiry** – Revoked attestations are invalid; expired attestations are stale but not necessarily invalid. Check both conditions.
+## Test Coverage
 
 4. **Timestamp overflow** – While the contract safely handles all `u64` values, be cautious when calculating expiry using arithmetic to avoid overflow in your client code.
 
@@ -280,9 +254,11 @@ To change expiry, the business must:
 
 ## Testing
 
-See `contracts/attestation/src/expiry_test.rs` for comprehensive test coverage including:
-- Attestations with and without expiry
-- Expiry boundary conditions
+- Submissions without expiry
+- Valid future expiry submissions
+- Rejection of past/edge/invalid expiry values
+- Expiry boundary behavior (`ledger_time == expiry`)
+- Verification failing after expiry
 - Queryability of expired attestations
 - Migration preservation
 - Interaction with `verify_attestation()`

@@ -35,6 +35,23 @@ Contracts that integrate with this access list should choose a minimum tier per 
 
 Events emitted for all role changes.
 
+## Security assumptions and privilege boundaries
+
+- Governance authority and lender allowlist membership are separate capabilities.
+- A lender with active tier access is still non-governance unless explicitly granted governance by admin.
+- Governance addresses cannot grant or revoke governance for other accounts; this is admin-only.
+- Revoked governance takes effect immediately for all mutating methods.
+- Access checks are tier-based and status-aware (`Active` and `tier >= min_tier`).
+
+Expected behavior for privilege-escalation resistance:
+
+- Non-admin callers must fail when attempting `grant_governance` or `revoke_governance`.
+- Non-governance callers must fail when attempting `set_lender` or `remove_lender`.
+- A lender account must fail if it attempts to self-upgrade its own tier through `set_lender`.
+- A previously authorized governance account must fail to mutate lender state after revocation.
+
+These invariants are covered by adversarial regression tests in `contracts/lender-access-list/src/test.rs`.
+
 ## Interface summary
 
 ### Initialization

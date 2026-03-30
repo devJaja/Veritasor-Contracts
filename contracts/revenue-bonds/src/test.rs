@@ -59,6 +59,7 @@ fn test_issue_bond_fixed_structure() {
 
     client.initialize(&admin);
 
+let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
         &issuer,
         &owner,
@@ -68,6 +69,7 @@ fn test_issue_bond_fixed_structure() {
         &500_000,
         &500_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -87,6 +89,7 @@ fn test_issue_bond_revenue_linked() {
 
     client.initialize(&admin);
 
+let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
         &issuer,
         &owner,
@@ -96,6 +99,7 @@ fn test_issue_bond_revenue_linked() {
         &100_000,
         &1_000_000,
         &24,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -113,6 +117,7 @@ fn test_issue_bond_hybrid() {
 
     client.initialize(&admin);
 
+let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
         &issuer,
         &owner,
@@ -122,6 +127,7 @@ fn test_issue_bond_hybrid() {
         &200_000,
         &800_000,
         &18,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -138,6 +144,7 @@ fn test_issue_bond_invalid_face_value() {
     let client = RevenueBondContractClient::new(&env, &contract_id);
 
     client.initialize(&admin);
+let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
         &issuer,
         &owner,
@@ -147,6 +154,7 @@ fn test_issue_bond_invalid_face_value() {
         &500_000,
         &500_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -160,6 +168,7 @@ fn test_issue_bond_invalid_revenue_share() {
     let client = RevenueBondContractClient::new(&env, &contract_id);
 
     client.initialize(&admin);
+let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
         &issuer,
         &owner,
@@ -169,6 +178,7 @@ fn test_issue_bond_invalid_revenue_share() {
         &100_000,
         &1_000_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );
@@ -182,6 +192,7 @@ fn test_issue_bond_invalid_payment_range() {
     let client = RevenueBondContractClient::new(&env, &contract_id);
 
     client.initialize(&admin);
+let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
         &issuer,
         &owner,
@@ -191,6 +202,7 @@ fn test_issue_bond_invalid_payment_range() {
         &1_000_000,
         &500_000,
         &12,
+        &issue_period,
         &attestation_contract,
         &token,
     );

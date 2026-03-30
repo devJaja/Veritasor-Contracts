@@ -32,6 +32,7 @@ pub enum DataKey {
     Agreement(u64),
     Committed(u64, String),
     Settlement(u64, String),
+    BusinessPeriodToken(Address, String),
 }
 
 #[contracttype]
@@ -173,6 +174,24 @@ impl RevenueSettlementContract {
             !client.is_revoked(&agreement.business, &period),
             "attestation is revoked"
         );
+
+        // Prevent cross-token settlement for the same business and attestation period.
+        let business_period_token_key =
+            DataKey::BusinessPeriodToken(agreement.business.clone(), period.clone());
+        let business_period_token: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&business_period_token_key);
+        if let Some(existing_token) = business_period_token {
+            assert_eq!(
+                existing_token, agreement.token,
+                "multi-currency settlement not allowed for period"
+            );
+        } else {
+            env.storage()
+                .instance()
+                .set(&business_period_token_key, &agreement.token);
+        }
 
         // Check commitment not already made for this period
         let committed_key = DataKey::Committed(agreement_id, period.clone());
