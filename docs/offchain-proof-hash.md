@@ -58,11 +58,11 @@ pub fn get_attestation(
     env: Env,
     business: Address,
     period: String,
-) -> Option<(BytesN<32>, u64, u32, i128, Option<BytesN<32>>)>
-//          merkle_root  ts   ver  fee    proof_hash (NEW)
+) -> Option<(BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>)>
+//          merkle_root  ts   ver  fee    proof_hash (NEW)    expiry (NEW)
 ```
 
-Returns the full attestation record including the optional proof hash as the 5th tuple element.
+Returns the full attestation record including the optional proof hash as the 5th tuple element, and the optional expiry timestamp as the 6th element.
 
 ### New Methods
 
@@ -87,7 +87,7 @@ Convenience method that returns only the proof hash for a given attestation. Ret
 
 ## Storage Layout
 
-The attestation record stored under `DataKey::Attestation(Address, String)` is now a 5-element tuple:
+The attestation record stored under `DataKey::Attestation(Address, String)` is now a 6-element tuple:
 
 | Index | Type | Description |
 |-------|------|-------------|
@@ -96,6 +96,7 @@ The attestation record stored under `DataKey::Attestation(Address, String)` is n
 | 2 | `u32` | Version |
 | 3 | `i128` | Fee paid |
 | 4 | `Option<BytesN<32>>` | **Proof hash (new)** |
+| 5 | `Option<u64>` | **Expiry timestamp (new)** |
 
 No new `DataKey` variants are required.
 

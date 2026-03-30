@@ -12,7 +12,7 @@ fn setup() -> (Env, AttestationContractClient<'static>) {
     env.mock_all_auths();
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
-    client.initialize(&Address::generate(&env));
+    client.initialize(&Address::generate(&env), &0u64);
     (env, client)
 }
 
@@ -23,7 +23,7 @@ fn setup_with_admin() -> (Env, AttestationContractClient<'static>, Address) {
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &0u64);
     (env, client, admin)
 }
 
