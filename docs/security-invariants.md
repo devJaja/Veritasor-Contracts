@@ -14,94 +14,63 @@
 
 ## Table of Contents
 
-1. [Scope and Threat Model](#scope-and-threat-model)
-2. [Role Definitions](#role-definitions)
-3. [Enforced Invariants](#enforced-invariants)
-   - [Attestation Contract](#attestation-contract)
-   - [Integration Registry](#integration-registry)
-   - [Attestation Snapshot Contract](#attestation-snapshot-contract)
-   - [Aggregated Attestations Contract](#aggregated-attestations-contract)
-4. [Detailed Invariant Reference](#detailed-invariant-reference)
-5. [Access Control Matrix](#access-control-matrix)
-6. [Adversarial Scenarios Considered](#adversarial-scenarios-considered)
-7. [Regression Tests and Stress Cases](#regression-tests-and-stress-cases)
-8. [How to Add New Invariants](#how-to-add-new-invariants)
-9. [Gas and Performance Notes](#gas-and-performance-notes)
-10. [Retired Invariants](#retired-invariants)
-11. [Changelog](#changelog)
+#### Access Control & Authorization
 
----
+- **Role-based access control (RBAC)**  
+  Four distinct roles: ADMIN, ATTESTOR, BUSINESS, OPERATOR. Each role has specific permissions:
+  - ADMIN: Full protocol control, can grant/revoke all roles
+  - ATTESTOR: Can submit attestations on behalf of businesses
+  - BUSINESS: Can submit own attestations, view own data
+  - OPERATOR: Can perform routine operations (pause, unpause)
 
-## Scope and Threat Model
+- **Strict authorization checks**  
+  All sensitive operations require explicit authentication via `require_auth()` followed by role verification. Authentication always precedes authorization checks to prevent spoofing.
 
-### In scope
+- **Role bitmap validation**  
+  Role bitmaps must only use defined bits (0b1111 = 0xF). Attempts to set undefined bits are rejected with panic. This prevents invalid role states and undefined behavior.
 
-| Asset | Risk |
-|---|---|
-| Admin address stored in contract state | Unauthorized write access |
-| Fee configuration (token, collector, base fee, enabled flag) | Manipulation to drain collector or skip fee payment |
-| Role assignments (ADMIN, ATTESTOR, BUSINESS, OPERATOR) | Privilege escalation — unauthorized role grant |
-| Attestation records (Merkle root, timestamp, version, fee_paid, proof_hash, expiry) | Forgery, duplication, or unauthorized revocation/migration |
-| Multi-period attestation ranges | Overlapping range injection |
-| Dispute records | Challenger impersonation; id collision |
-| Integration registry providers | Unauthorized registration or status change |
-| Snapshot records | Unauthorized writes |
-| Portfolio definitions | Unauthorized registration or update |
+- **Non-zero role requirement**  
+  Granting or setting a zero-value role is rejected. Roles must be non-zero and within the valid range.
 
-### Out of scope
-
-- Off-chain storage of revenue datasets (integrity protected by the proof hash
-  but not enforced on-chain — see `docs/offchain-proof-hash.md`).
-- Key management of admin Stellar keypairs (operational concern).
-- Stellar network-level DoS.
-
-### Attacker capabilities assumed
-
-1. Any Stellar account can call any public entry point.
-2. An attacker may craft every argument, including `caller` fields.
-3. All on-chain state is observable by anyone.
-4. A compromised role holder may attempt lateral escalation.
-5. A removed/revoked address may attempt to reuse previously granted access.
-
----
-
-## Role Definitions
-
-| Role | Constant | How obtained | Mutable |
-|---|---|---|---|
-| **Admin** | `ROLE_ADMIN` | Set at `initialize` | No — immutable post-init |
-| **Attestor** | `ROLE_ATTESTOR` | Granted by admin via `grant_role` | Yes |
-| **Business** | `ROLE_BUSINESS` | Granted by admin via `grant_role` | Yes |
-| **Operator** | `ROLE_OPERATOR` | Granted by admin via `grant_role` | Yes |
-| **Governance** | _(registry)_ | Set at registry `initialize` | Contract-specific |
-| **Writer** | _(snapshot)_ | Set at snapshot `initialize` | Contract-specific |
-
----
-
-## Enforced Invariants
-
-### Attestation Contract
-
-- **Single initialization** (SI-001)  
-  The contract can be initialized only once. A second call to `initialize`
-  panics with `"already initialized"`.
-
-- **No unauthorized role grants** (SI-003)  
-  Only an address with `ROLE_ADMIN` can call `grant_role`. Any other caller
-  causes a panic (auth failure or `"caller is not admin"`).
-
-- **No unauthorized writes to attestation data** (SI-004, SI-005, SI-006)  
-  Attestation submission requires the business address to authorize (`require_auth`).
-  Revocation requires admin (`caller` validated against stored admin).
-  Migration requires admin and a strictly increasing version number.
+- **No unauthorized role grants**  
+  Only an address with the ADMIN role can grant roles. An address without ADMIN that calls `grant_role` panics with "caller does not have ADMIN role".
 
 - **No duplicate attestations** (SI-004)  
   A second submission for the same `(business, period)` panics with
   `"attestation exists"`.
 
-- **No overlapping multi-period ranges** (SI-007)  
-  `submit_multi_period_attestation` panics with `"overlap"` if the new range
-  intersects any existing non-revoked range for the same business.
+- **Privilege escalation prevention**  
+  Non-admin users cannot grant any roles, including ADMIN. Attempts by ATTESTOR, BUSINESS, or OPERATOR to grant roles result in panic.
+
+- **Audit trail for role changes**  
+  All role grants and revocations emit diagnostic events for off-chain monitoring and compliance auditing.
+
+#### Replay Attack Prevention
+
+- **Nonce validation required**  
+  State-changing operations (grant_role, revoke_role, revoke_attestation) require strictly increasing nonces per account per channel. Nonce validation prevents replay attacks where an attacker re-submits a previously valid transaction.
+
+- **Monotonically increasing nonces**  
+  Each account maintains a last-used nonce per channel. New nonces must be strictly greater than the previous value. Zero and duplicate nonces are rejected.
+
+- **Channel-based nonce separation**  
+  Nonces are tracked per account per channel (e.g., ADMIN channel, BUSINESS channel), allowing independent nonce sequences for different operation types.
+
+- **Replay attack mitigation**  
+  Attempting to reuse a nonce results in panic with "invalid nonce: must be greater than previous nonce". This applies even across different recipient addresses.
+
+#### Pause Mechanism
+
+- **Pause gate**  
+  When the contract is paused, attestation submission and other sensitive operations are blocked. Only ADMIN can pause/unpause; OPERATOR can pause but not unpause.
+
+- **Pause state validation**  
+  Operations that check pause state will panic with "contract is paused" if attempted while paused.
+
+#### Single Initialization
+
+- **One-time initialization**  
+  The contract can be initialized only once. A second call to `initialize` panics with "already initialized".
 
 - **Expiry semantics** (SI-008)  
   `is_expired` returns `true` when `expiry_timestamp ≤ ledger().timestamp()`.
@@ -286,191 +255,42 @@ new_version)`
 
 ### SI-007 — submit_multi_period_attestation: business auth, no overlap
 
-**Applies to:** `submit_multi_period_attestation(business, start_period,
-end_period, merkle_root, timestamp, version)`
+## Attack Vectors Considered and Mitigated
 
-**Statement:**
+### Unauthorized Access
+- **Mitigation**: All sensitive operations require `require_auth()` + role check
+- **Protection**: Authentication precedes authorization to prevent credential bypass
+- **Enforcement**: Panic messages clearly indicate authorization failures
 
-1. `business.require_auth()` — impersonation panics.
-2. A new range that intersects any existing non-revoked range for the same
-   business panics with `"overlap"`.
-3. Non-overlapping (including adjacent) ranges succeed.
+### Replay Attacks
+- **Mitigation**: Strictly increasing nonces per account per channel
+- **Protection**: First nonce must be >= 1, subsequent nonces must be > last_used
+- **Enforcement**: Duplicate or decreasing nonces cause transaction to panic
+- **Scope**: Nonce tracking prevents replay across all state-changing operations
 
-**Tests:** `test_submit_multi_period_by_business_succeeds`,
-`test_submit_multi_period_by_impersonator_panics`,
-`test_submit_multi_period_overlap_panics`,
-`test_submit_multi_period_non_overlapping_succeeds`
+### Privilege Escalation
+- **Mitigation**: Only ADMIN can grant roles; non-admin users cannot escalate
+- **Protection**: Role bitmap validation prevents setting arbitrary bits
+- **Enforcement**: Invalid role values or unauthorized grant attempts panic
+- **Audit Trail**: All role changes emit events for detection and compliance
 
----
+### Input Validation Attacks
+- **Mitigation**: Role bitmaps validated against ROLE_VALID_MASK (0b1111)
+- **Protection**: Zero-value roles rejected; undefined bits rejected
+- **Enforcement**: Invalid inputs cause immediate panic before state changes
 
-### SI-008 — is_expired: expiry semantics
+### State Transition Attacks
+- **Mitigation**: Business status transitions validated (Pending→Active, Active→Suspended, etc.)
+- **Protection**: Invalid transitions (e.g., Pending→Suspended) are rejected
+- **Enforcement**: Status machine enforces valid lifecycle paths
 
-**Applies to:** `is_expired(business, period)`
+## Security Assumptions
 
-**Statement:**
-
-| Condition | Return value |
-|---|---|
-| No `expiry_timestamp` set | `false` |
-| `expiry_timestamp` in the far future | `false` |
-| `expiry_timestamp ≤ ledger().timestamp()` | `true` |
-| Attestation does not exist | `false` (no panic) |
-
-**Tests:** `test_is_expired_no_expiry_returns_false`,
-`test_is_expired_far_future_returns_false`,
-`test_is_expired_past_expiry_returns_true`,
-`test_is_expired_nonexistent_attestation_returns_false`
-
----
-
-### SI-009 — open_dispute: challenger auth, unique ids
-
-**Applies to:** `open_dispute(challenger, business, period, dispute_type,
-evidence)`
-
-**Statement:**
-
-1. `challenger.require_auth()` — impersonation panics.
-2. Every dispute receives a unique `id`; two calls on the same
-   `(business, period)` yield different ids.
-3. `get_dispute` returns `None` for an id that was never issued.
-
-**Tests:** `test_open_dispute_by_challenger_succeeds`,
-`test_open_dispute_multiple_have_unique_ids`,
-`test_open_dispute_by_impersonator_panics`,
-`test_get_dispute_nonexistent_returns_none`
-
----
-
-### SI-010 — get_admin: read-only, immutable post-initialization
-
-**Statement:**  
-Once set, the admin address cannot be changed. No `set_admin` entry point
-exists. `get_admin` is idempotent and always returns the address from
-`initialize`.
-
-**Rationale:**  
-Mutable admin creates a social-engineering target. Immutability is a deliberate
-trade-off (admin rotation via contract redeploy, not in-place key swap).
-
-**Tests:** `test_get_admin_matches_initializer`,
-`test_get_admin_is_idempotent`,
-`test_get_admin_does_not_return_non_admin`
-
----
-
-### SI-011 — Cross-feature role isolation
-
-**Statement:**  
-Roles are strictly scoped:
-
-| Role | Can do | Cannot do |
-|---|---|---|
-| Admin | Fee config, role grants, revocation, migration | Bypasses `challenger.require_auth` on disputes |
-| ATTESTOR / OPERATOR / BUSINESS | Domain-specific actions | `configure_fees`, `grant_role`, revoke, migrate |
-
-**Tests:** `test_fee_token_has_no_role_after_configure_fees`,
-`test_role_holder_cannot_configure_fees`
-
----
-
-### SI-012 — Caller-field spoofing prevention
-
-**Statement:**  
-Methods accepting an explicit `caller: Address` argument validate it against
-the stored admin using `require_admin`. Passing a non-admin `caller` panics
-even when `mock_all_auths` is active, because the contract calls
-`caller.require_auth()` first and then compares `caller` to the stored admin.
-
-**Implementation pattern (correct):**
-```rust
-caller.require_auth();
-let admin = read_admin(&env);
-if caller != admin {
-    panic!("unauthorized");
-}
-```
-
-**Tests:** `test_caller_spoofing_revoke_panics`,
-`test_caller_spoofing_migrate_panics`,
-`test_caller_spoofing_grant_role_panics`
-
----
-
-### SI-013 — get_attestation: read-only, returns correct stored tuple
-
-**Applies to:** `get_attestation(business, period)`
-
-**Statement:**
-
-1. Returns `None` for a record that was never stored.
-2. Returns the exact tuple `(merkle_root, timestamp, version, fee_paid,
-   proof_hash, expiry_timestamp)` that was stored at submission.
-3. Does not mutate any storage slot.
-
-**Tests:** `test_get_attestation_nonexistent_returns_none`,
-`test_get_attestation_returns_correct_fields`,
-`test_get_attestation_with_proof_hash_returns_hash`,
-`test_get_attestation_with_expiry_returns_expiry`
-
----
-
-## Access Control Matrix
-
-| Entry Point | Admin | ATTESTOR | BUSINESS | OPERATOR | Any |
-|---|:---:|:---:|:---:|:---:|:---:|
-| `initialize` | First call only | ✗ | ✗ | ✗ | ✗ |
-| `configure_fees` | ✔ | ✗ | ✗ | ✗ | ✗ |
-| `grant_role` | ✔ | ✗ | ✗ | ✗ | ✗ |
-| `revoke_attestation` | ✔ | ✗ | ✗ | ✗ | ✗ |
-| `migrate_attestation` | ✔ | ✗ | ✗ | ✗ | ✗ |
-| `submit_attestation` | ✗ | ✗ | ✔ (own) | ✗ | ✗ |
-| `submit_multi_period_attestation` | ✗ | ✗ | ✔ (own) | ✗ | ✗ |
-| `open_dispute` | ✗ | ✗ | ✗ | ✗ | ✔ (self-auth) |
-| `get_attestation` | ✔ | ✔ | ✔ | ✔ | ✔ |
-| `get_admin` | ✔ | ✔ | ✔ | ✔ | ✔ |
-| `has_role` | ✔ | ✔ | ✔ | ✔ | ✔ |
-| `is_expired` | ✔ | ✔ | ✔ | ✔ | ✔ |
-| `get_dispute` | ✔ | ✔ | ✔ | ✔ | ✔ |
-
-> ✔ = permitted, ✗ = must panic if attempted.
-
----
-
-## Adversarial Scenarios Considered
-
-### Admin key leak
-
-An attacker holding the admin key can revoke attestations and change fee
-configuration. This is an operational risk, not a contract bug. Mitigation:
-use a multisig or governance contract as the admin address.
-
-### Front-running attestation submission
-
-An attacker observing a pending `submit_attestation` could attempt to submit
-the same `(business, period)` before the legitimate transaction lands. The
-`business.require_auth()` requirement means only the business's own key can
-sign, so a third-party front-run is impossible.
-
-### Version roll-back via migration
-
-`migrate_attestation` enforces `new_version > current_version`, preventing
-an admin from rolling back to an earlier (potentially forged) root.
-
-### Overlapping multi-period injection
-
-The overlap check in `submit_multi_period_attestation` prevents an attacker
-(or errant business) from inserting a range that would shadow or conflict with
-an existing attestation.
-
-### Dispute impersonation
-
-`open_dispute` requires `challenger.require_auth()`. A third party cannot
-file disputes on behalf of a challenger address they do not control.
-
----
-
-## Regression Tests and Stress Cases
+1. **Admin Existence**: At least one address must always hold the ADMIN role
+2. **Address Validity**: Soroban's `require_auth()` validates address ownership
+3. **Nonce Channels**: Different operation types use separate nonce channels to prevent cross-context replay
+4. **Event Monitoring**: Off-chain systems monitor role change events for anomalies
+5. **Least Privilege**: Accounts start with no roles; privileges granted explicitly
 
 The invariant tests are written so that:
 

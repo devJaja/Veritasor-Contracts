@@ -12,6 +12,7 @@
 //! - Version metadata for tracking upgrades
 //! - Migration hooks for upgrade coordination
 //! - Governance-controlled upgrade mechanism
+//! - Duplicate-key protection for attestation keys
 //!
 //! ## Upgrade Process
 //!
@@ -21,12 +22,20 @@
 //! 4. Optional migration hook is called on new implementation
 //! 5. Version metadata is updated
 //!
+//! ## Duplicate-Key Protection
+//!
+//! The registry enforces that each `(attester, key)` pair can only be registered
+//! once. Callers invoke `register_attestation_key` before writing to the
+//! implementation contract; the registry rejects any attempt to reuse a key.
+//! This prevents replay attacks and accidental overwrites at the registry layer.
+//!
 //! ## Safety Constraints
 //!
 //! - Only the admin (governance) can perform upgrades
 //! - Registry must be initialized before use
 //! - Version numbers must be strictly increasing
 //! - Previous implementation address is preserved for rollback scenarios
+//! - Attestation keys are globally unique per `(attester, key)` pair
 //!
 //! ## Trust Model
 //!
@@ -60,6 +69,9 @@ pub enum DataKey {
     PreviousVersion,
     /// Initialization flag.
     Initialized,
+    /// Duplicate-key guard: marks a `(attester, key)` pair as registered.
+    /// Value is the ledger timestamp at registration time.
+    AttestationKey(Address, String),
 }
 
 /// Version metadata for an implementation.
@@ -103,12 +115,7 @@ impl AttestationRegistry {
     /// # Safety
     ///
     /// This is a one-time setup. The admin must be a trusted governance address.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        initial_impl: Address,
-        initial_version: u32,
-    ) {
+    pub fn initialize(env: Env, admin: Address, initial_impl: Address, initial_version: u32) {
         if env.storage().instance().has(&DataKey::Initialized) {
             panic!("registry already initialized");
         }
@@ -148,12 +155,7 @@ impl AttestationRegistry {
     ///
     /// Only the admin (governance) can perform upgrades. The new implementation
     /// should be thoroughly tested before upgrade.
-    pub fn upgrade(
-        env: Env,
-        new_impl: Address,
-        new_version: u32,
-        _migration_data: Option<Bytes>,
-    ) {
+    pub fn upgrade(env: Env, new_impl: Address, new_version: u32, _migration_data: Option<Bytes>) {
         Self::require_initialized(&env);
         let _admin = Self::require_admin(&env);
 
@@ -226,10 +228,7 @@ impl AttestationRegistry {
             .storage()
             .instance()
             .get(&DataKey::PreviousImplementation);
-        let prev_version: Option<u32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::PreviousVersion);
+        let prev_version: Option<u32> = env.storage().instance().get(&DataKey::PreviousVersion);
 
         if prev_impl.is_none() || prev_version.is_none() {
             panic!("no previous implementation to rollback to");
@@ -274,7 +273,9 @@ impl AttestationRegistry {
         if !env.storage().instance().has(&DataKey::Initialized) {
             return None;
         }
-        env.storage().instance().get(&DataKey::CurrentImplementation)
+        env.storage()
+            .instance()
+            .get(&DataKey::CurrentImplementation)
     }
 
     /// Get the current version number.
@@ -298,7 +299,9 @@ impl AttestationRegistry {
         if !env.storage().instance().has(&DataKey::Initialized) {
             return None;
         }
-        env.storage().instance().get(&DataKey::PreviousImplementation)
+        env.storage()
+            .instance()
+            .get(&DataKey::PreviousImplementation)
     }
 
     /// Get the previous version number.
@@ -364,6 +367,57 @@ impl AttestationRegistry {
             migration_data: None, // Migration data is not stored, only used during upgrade
             activated_at: env.ledger().timestamp(),
         })
+    }
+
+    // ── Duplicate-key protection ────────────────────────────────────
+
+    /// Register an attestation key for `(attester, key)`, enforcing uniqueness.
+    ///
+    /// This is the registry-layer duplicate-key guard. Call this before writing
+    /// an attestation to the implementation contract. The registry records the
+    /// `(attester, key)` pair and rejects any future attempt to register the
+    /// same pair, preventing replay attacks and accidental overwrites.
+    ///
+    /// # Arguments
+    ///
+    /// * `attester` - The address submitting the attestation (must authorize)
+    /// * `key`      - Opaque string key identifying the attestation (e.g. period, subject ID)
+    ///
+    /// # Panics
+    ///
+    /// * If registry is not initialized
+    /// * If `attester` does not authorize the call
+    /// * If `(attester, key)` has already been registered
+    ///
+    /// # Security
+    ///
+    /// Authorization is required from `attester` so that no third party can
+    /// pre-emptively occupy a key on behalf of another address.
+    pub fn register_attestation_key(env: Env, attester: Address, key: String) {
+        Self::require_initialized(&env);
+        attester.require_auth();
+
+        let dk = DataKey::AttestationKey(attester, key);
+        if env.storage().persistent().has(&dk) {
+            panic!("attestation key already registered");
+        }
+        env.storage()
+            .persistent()
+            .set(&dk, &env.ledger().timestamp());
+    }
+
+    /// Check whether an `(attester, key)` pair has already been registered.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the key exists, `false` otherwise.
+    pub fn has_attestation_key(env: Env, attester: Address, key: String) -> bool {
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            return false;
+        }
+        env.storage()
+            .persistent()
+            .has(&DataKey::AttestationKey(attester, key))
     }
 
     // ── Admin management ────────────────────────────────────────────

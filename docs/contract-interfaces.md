@@ -520,6 +520,21 @@ Check if an address is a multisig owner.
 **Returns:** `bool` - Whether address is owner
 
 ---
+### Multisig Threshold Rotation
+The Attestation contract now supports dynamic threshold rotation via the multisig proposal system.
+
+#### Functions
+- `get_multisig_threshold(env: Env) -> u32`
+  - Returns the current number of required signatures for multisig actions.
+- `rotate_threshold(env: &Env, new_threshold: u32)` (Internal Logic)
+  - Updates the required threshold. 
+  - **Security:** Validates that `0 < new_threshold <= owners.len()`.
+- `execute_proposal(...)`
+  - Now handles `ProposalAction::ChangeThreshold(u32)`.
+
+#### Security Notes
+- Threshold changes can only be performed through a successfully approved multisig proposal.
+- Logic prevents setting a threshold higher than the current owner count, which would otherwise "brick" the contract.
 
 ### 1.7 Read-Only Query Methods
 
@@ -926,17 +941,17 @@ Initialize the contract with an admin address.
 
 ---
 
-### 5.2 Admin Functions
+### 5.2 Global Admin Functions
 
 #### `grant_governance(admin: Address, account: Address)`
 
-Grant governance role to an address.
+Grant global governance role to an address. Global governance can manage all namespaces and providers.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
 | `admin` | `Address` | Admin address |
-| `account` | `Address` | Address to grant governance |
+| `account` | `Address` | Address to grant global governance |
 
 **Authorization:** Caller must be admin
 
@@ -944,63 +959,112 @@ Grant governance role to an address.
 
 #### `revoke_governance(admin: Address, account: Address)`
 
-Revoke governance role from an address.
+Revoke global governance role from an address.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
 | `admin` | `Address` | Admin address |
-| `account` | `Address` | Address to revoke governance |
+| `account` | `Address` | Address to revoke global governance |
 
 **Authorization:** Caller must be admin
 
 ---
 
-### 5.3 Provider Registration
+### 5.3 Namespace Management
 
-#### `register_provider(caller: Address, id: String, metadata: ProviderMetadata)`
+#### `register_namespace(caller: Address, namespace: String, initial_owner: Address)`
 
-Register a new integration provider.
+Register a new namespace and assign an initial owner.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
 | `caller` | `Address` | Address making the call |
-| `id` | `String` | Unique provider identifier |
+| `namespace` | `String` | Unique namespace identifier |
+| `initial_owner` | `Address` | First owner of the namespace |
+
+**Authorization:** Caller must have global governance role or be admin
+
+---
+
+#### `grant_namespace_governance(caller: Address, namespace: String, account: Address)`
+
+Grant ownership of a specific namespace to an address.
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `caller` | `Address` | Address making the call |
+| `namespace` | `String` | Namespace identifier |
+| `account` | `Address` | Address to grant ownership |
+
+**Authorization:** Caller must be a namespace owner, global governance, or admin
+
+---
+
+#### `revoke_namespace_governance(caller: Address, namespace: String, account: Address)`
+
+Revoke ownership of a specific namespace.
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `caller` | `Address` | Address making the call |
+| `namespace` | `String` | Namespace identifier |
+| `account` | `Address` | Address to revoke ownership |
+
+**Authorization:** Caller must be a namespace owner, global governance, or admin
+
+---
+
+### 5.4 Provider Registration
+
+#### `register_provider(caller: Address, namespace: String, id: String, metadata: ProviderMetadata)`
+
+Register a new integration provider within a namespace.
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `caller` | `Address` | Address making the call |
+| `namespace` | `String` | Namespace for the provider |
+| `id` | `String` | Unique provider identifier within the namespace |
 | `metadata` | `ProviderMetadata` | Provider metadata |
 
-**Authorization:** Caller must have governance role
+**Authorization:** Caller must have governance role for the namespace
 
 **Panics:**
-- `"provider already registered"` if ID exists
+- `"provider already registered in namespace"` if ID exists in the namespace
 
 **Events Emitted:** `ProviderRegistered`
 
 ---
 
-### 5.4 Provider Status Management
+### 5.5 Provider Status Management
 
-#### `enable_provider(caller: Address, id: String)`
+#### `enable_provider(caller: Address, namespace: String, id: String)`
 
-Enable an integration provider.
+Enable an integration provider in a namespace.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
 | `caller` | `Address` | Address making the call |
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
-**Authorization:** Caller must have governance role
+**Authorization:** Caller must have governance role for the namespace
 
 **Panics:**
-- `"provider not found"` if provider doesn't exist
+- `"provider not found"` if provider doesn't exist in the namespace
 - `"provider cannot be enabled from current status"` if not Registered/Deprecated/Disabled
 
 **Events Emitted:** `ProviderEnabled`
 
 ---
 
-#### `deprecate_provider(caller: Address, id: String)`
+#### `deprecate_provider(caller: Address, namespace: String, id: String)`
 
 Deprecate an integration provider.
 
@@ -1008,9 +1072,10 @@ Deprecate an integration provider.
 | Name | Type | Description |
 |------|------|-------------|
 | `caller` | `Address` | Address making the call |
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
-**Authorization:** Caller must have governance role
+**Authorization:** Caller must have governance role for the namespace
 
 **Panics:**
 - `"provider not found"` if provider doesn't exist
@@ -1020,7 +1085,7 @@ Deprecate an integration provider.
 
 ---
 
-#### `disable_provider(caller: Address, id: String)`
+#### `disable_provider(caller: Address, namespace: String, id: String)`
 
 Disable an integration provider.
 
@@ -1028,9 +1093,10 @@ Disable an integration provider.
 | Name | Type | Description |
 |------|------|-------------|
 | `caller` | `Address` | Address making the call |
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
-**Authorization:** Caller must have governance role
+**Authorization:** Caller must have governance role for the namespace
 
 **Panics:**
 - `"provider not found"` if provider doesn't exist
@@ -1040,9 +1106,9 @@ Disable an integration provider.
 
 ---
 
-### 5.5 Provider Metadata Management
+### 5.6 Provider Metadata Management
 
-#### `update_metadata(caller: Address, id: String, metadata: ProviderMetadata)`
+#### `update_metadata(caller: Address, namespace: String, id: String, metadata: ProviderMetadata)`
 
 Update provider metadata.
 
@@ -1050,101 +1116,130 @@ Update provider metadata.
 | Name | Type | Description |
 |------|------|-------------|
 | `caller` | `Address` | Address making the call |
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 | `metadata` | `ProviderMetadata` | New metadata |
 
-**Authorization:** Caller must have governance role
+**Authorization:** Caller must have governance role for the namespace
 
 **Events Emitted:** `ProviderUpdated`
 
 ---
 
-### 5.6 Query Functions
+### 5.7 Query Functions
 
-#### `get_provider(id: String) -> Option<Provider>`
+#### `get_provider(namespace: String, id: String) -> Option<Provider>`
 
-Get a provider by ID.
+Get a provider by ID and namespace.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
 **Returns:** `Option<Provider>` - Provider or None
 
 ---
 
-#### `is_enabled(id: String) -> bool`
+#### `is_enabled(namespace: String, id: String) -> bool`
 
 Check if a provider is enabled.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
 **Returns:** `bool` - Whether provider is enabled
 
 ---
 
-#### `is_deprecated(id: String) -> bool`
+#### `is_deprecated(namespace: String, id: String) -> bool`
 
 Check if a provider is deprecated.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
 **Returns:** `bool` - Whether provider is deprecated
 
 ---
 
-#### `is_valid_for_attestation(id: String) -> bool`
+#### `is_valid_for_attestation(namespace: String, id: String) -> bool`
 
 Check if a provider can be used for attestations.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
 **Returns:** `bool` - Whether provider is valid (Enabled or Deprecated)
 
 ---
 
-#### `get_status(id: String) -> Option<ProviderStatus>`
+#### `get_status(namespace: String, id: String) -> Option<ProviderStatus>`
 
 Get the status of a provider.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 | `id` | `String` | Provider identifier |
 
 **Returns:** `Option<ProviderStatus>` - Status or None
 
 ---
 
-#### `get_all_providers() -> Vec<String>`
+#### `get_all_namespaces() -> Vec<String>`
 
-Get all registered provider IDs.
+Get all registered namespaces.
+
+**Returns:** `Vec<String>` - List of registered namespaces
+
+---
+
+#### `get_namespace_providers(namespace: String) -> Vec<String>`
+
+Get all registered provider IDs in a namespace.
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 
 **Returns:** `Vec<String>` - List of provider IDs
 
 ---
 
-#### `get_enabled_providers() -> Vec<String>`
+#### `get_enabled_providers(namespace: String) -> Vec<String>`
 
-Get all enabled provider IDs.
+Get all enabled provider IDs in a namespace.
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 
 **Returns:** `Vec<String>` - List of enabled provider IDs
 
 ---
 
-#### `get_deprecated_providers() -> Vec<String>`
+#### `get_deprecated_providers(namespace: String) -> Vec<String>`
 
-Get all deprecated provider IDs.
+Get all deprecated provider IDs in a namespace.
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `namespace` | `String` | Namespace identifier |
 
 **Returns:** `Vec<String>` - List of deprecated provider IDs
 
@@ -1493,6 +1588,8 @@ Emitted when a new attestation is submitted.
 | `timestamp` | `u64` | Timestamp |
 | `version` | `u32` | Schema version |
 | `fee_paid` | `i128` | Fee paid |
+| `proof_hash` | `Option<BytesN<32>>` | Optional off-chain proof hash |
+| `expiry_timestamp` | `Option<u64>` | Optional expiry timestamp |
 
 **Topic:** `att_sub`
 
@@ -1598,6 +1695,57 @@ Emitted when fee configuration changes.
 **Topic:** `fee_cfg`
 
 ---
+
+#### `RateLimitConfigChanged`
+
+Emitted when rate limit configuration changes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `max_submissions` | `u32` | Max submissions per window |
+| `window_seconds` | `u64` | Window duration in seconds |
+| `enabled` | `bool` | Enabled status |
+| `changed_by` | `Address` | Changer address |
+
+**Topic:** `rate_lm`
+
+---
+
+#### `KeyRotationProposed`
+
+Emitted when an admin rotation is proposed.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `old_admin` | `Address` | Current admin |
+| `new_admin` | `Address` | Proposed new admin |
+| `timelock_until` | `u32` | Timelock expiry |
+| `expires_at` | `u32` | Proposal expiry |
+
+**Topic:** `kr_prop`
+
+---
+
+#### `KeyRotationConfirmed`
+
+Emitted when an admin rotation is confirmed.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `old_admin` | `Address` | Previous admin |
+| `new_admin` | `Address` | New admin |
+| `is_emergency` | `bool` | Whether rotation was emergency |
+
+**Topic:** `kr_conf`
+
+### 8.1.11 Gas and Performance Considerations
+
+Event emission in Soroban consumes CPU instructions and adds to the transaction's entry size.
+
+- **Topic Efficiency:** Veritasor uses `symbol_short!` (up to 9 characters) for event topics to minimize storage and processing costs.
+- **Data Serialization:** Event data is serialized as Soroban `Val` types. Large collections or strings in event data can significantly increase gas costs.
+- **Indexing Overhead:** While on-chain costs are relatively low, frequent event emission can increase the load on off-chain indexers.
+- **Typical Cost:** Standard `AttestationSubmitted` event cost: ~1,500 - 3,000 instructions (depending on metadata size).
 
 ### 8.2 IntegrationRegistryContract Events
 

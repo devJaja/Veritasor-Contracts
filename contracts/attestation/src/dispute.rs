@@ -1,5 +1,7 @@
-//! Dispute management module for attestation challenges
-use crate::dynamic_fees::DataKey;
+//! Dispute management module for attestation challenges and revocation policy.
+use crate::access_control;
+use crate::dynamic_fees::{self, DataKey};
+use crate::ROLE_ADMIN;
 use soroban_sdk::{contracttype, Address, Env, String, Vec};
 
 /// Status of a dispute
@@ -243,4 +245,70 @@ pub fn validate_dispute_closure(env: &Env, dispute_id: u64) -> Result<Dispute, &
     }
 
     Ok(dispute)
+}
+
+/// Returns true when revocation metadata exists for the attestation.
+pub fn is_attestation_revoked(env: &Env, business: &Address, period: &String) -> bool {
+    let key = DataKey::Revoked(business.clone(), period.clone());
+    env.storage().instance().has(&key)
+}
+
+/// Loads revocation metadata for an attestation, if present.
+pub fn get_attestation_revocation(
+    env: &Env,
+    business: &Address,
+    period: &String,
+) -> Option<crate::RevocationData> {
+    let key = DataKey::Revoked(business.clone(), period.clone());
+    env.storage().instance().get(&key)
+}
+
+/// Persists revocation metadata for an attestation.
+pub fn store_attestation_revocation(
+    env: &Env,
+    business: &Address,
+    period: &String,
+    revocation: &crate::RevocationData,
+) {
+    let key = DataKey::Revoked(business.clone(), period.clone());
+    env.storage().instance().set(&key, revocation);
+}
+
+/// Enforces the authorization and state preconditions for attestation revocation.
+///
+/// Revocation is allowed only when:
+/// - the contract is not paused,
+/// - the target attestation exists,
+/// - the target attestation has not already been revoked,
+/// - the caller is the business owner or a protocol administrator.
+pub fn require_revocation_authorized(
+    env: &Env,
+    caller: &Address,
+    business: &Address,
+    period: &String,
+) {
+    access_control::require_not_paused(env);
+    caller.require_auth();
+
+    let attestation_key = DataKey::Attestation(business.clone(), period.clone());
+    assert!(env.storage().instance().has(&attestation_key), "attestation not found");
+    assert!(
+        !is_attestation_revoked(env, business, period),
+        "attestation already revoked"
+    );
+
+    let caller_is_admin = *caller == dynamic_fees::get_admin(env)
+        || access_control::has_role(env, caller, ROLE_ADMIN);
+    assert!(
+        caller_is_admin || *caller == *business,
+        "caller must be ADMIN or the business owner"
+    );
+}
+
+/// Enforces revocation finality for write paths that would otherwise mutate a revoked record.
+pub fn require_not_revoked_for_update(env: &Env, business: &Address, period: &String) {
+    assert!(
+        !is_attestation_revoked(env, business, period),
+        "attestation revoked"
+    );
 }

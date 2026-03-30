@@ -47,11 +47,15 @@ mod test;
 pub enum DataKey {
     /// Contract administrator
     Admin,
-    /// Provider data by identifier
-    Provider(String),
-    /// List of all registered provider identifiers
-    ProviderList,
-    /// Governance addresses that can manage providers
+    /// Provider data by namespace and identifier: (Namespace, ID)
+    Provider(String, String),
+    /// List of all registered provider identifiers in a namespace: (Namespace)
+    NamespaceProviderList(String),
+    /// Governance addresses that can manage a specific namespace: (Namespace, Account)
+    NamespaceGovernance(String, Address),
+    /// List of all registered namespaces
+    NamespaceList,
+    /// Global governance addresses that can manage all namespaces
     GovernanceRole(Address),
 }
 
@@ -89,7 +93,9 @@ pub struct ProviderMetadata {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Provider {
-    /// Unique identifier (e.g., "stripe", "shopify")
+    /// Namespace identifier
+    pub namespace: String,
+    /// Unique identifier within the namespace (e.g., "stripe", "shopify")
     pub id: String,
     /// Current status
     pub status: ProviderStatus,
@@ -120,6 +126,7 @@ const TOPIC_PROVIDER_UPDATED: Symbol = symbol_short!("prv_upd");
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProviderEvent {
+    pub namespace: String,
     pub provider_id: String,
     pub status: ProviderStatus,
     pub changed_by: Address,
@@ -128,8 +135,17 @@ pub struct ProviderEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProviderMetadataEvent {
+    pub namespace: String,
     pub provider_id: String,
     pub metadata: ProviderMetadata,
+    pub changed_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct NamespaceEvent {
+    pub namespace: String,
+    pub account: Address,
     pub changed_by: Address,
 }
 
@@ -145,6 +161,7 @@ impl IntegrationRegistryContract {
     // Logical nonce channels for replay protection.
     pub const NONCE_CHANNEL_ADMIN: u32 = 1;
     pub const NONCE_CHANNEL_GOVERNANCE: u32 = 2;
+    pub const NONCE_CHANNEL_NAMESPACE: u32 = 3;
 
     // ── Initialization ──────────────────────────────────────────────
 
@@ -212,6 +229,130 @@ impl IntegrationRegistryContract {
             .set(&DataKey::GovernanceRole(account), &false);
     }
 
+    // ── Namespace Management ────────────────────────────────────────
+
+    /// Register a new namespace.
+    ///
+    /// Only the admin or global governance can register namespaces.
+    ///
+    /// Replay protection: uses the caller address and `NONCE_CHANNEL_GOVERNANCE`.
+    pub fn register_namespace(
+        env: Env,
+        caller: Address,
+        namespace: String,
+        initial_owner: Address,
+        nonce: u64,
+    ) {
+        Self::require_governance(&env, &caller);
+        replay_protection::verify_and_increment_nonce(
+            &env,
+            &caller,
+            Self::NONCE_CHANNEL_GOVERNANCE,
+            nonce,
+        );
+
+        let key = DataKey::NamespaceGovernance(namespace.clone(), initial_owner.clone());
+        if env.storage().instance().has(&key) {
+            panic!("namespace owner already exists");
+        }
+
+        env.storage().instance().set(&key, &true);
+
+        // Add to namespace list
+        let mut namespaces: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::NamespaceList)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        // Ensure uniqueness in list (optional, but good practice)
+        let mut exists = false;
+        for i in 0..namespaces.len() {
+            if namespaces.get(i).unwrap() == namespace {
+                exists = true;
+                break;
+            }
+        }
+        if !exists {
+            namespaces.push_back(namespace.clone());
+            env.storage().instance().set(&DataKey::NamespaceList, &namespaces);
+        }
+
+        // Emit event
+        let event = NamespaceEvent {
+            namespace: namespace.clone(),
+            account: initial_owner,
+            changed_by: caller,
+        };
+        env.events().publish((symbol_short!("ns_reg"), namespace), event);
+    }
+
+    /// Grant ownership of a namespace to an address.
+    ///
+    /// Only the admin or an existing namespace owner can grant ownership.
+    ///
+    /// Replay protection: uses the caller address and `NONCE_CHANNEL_NAMESPACE`.
+    pub fn grant_namespace_governance(
+        env: Env,
+        caller: Address,
+        namespace: String,
+        account: Address,
+        nonce: u64,
+    ) {
+        Self::require_namespace_governance(&env, &namespace, &caller);
+        replay_protection::verify_and_increment_nonce(
+            &env,
+            &caller,
+            Self::NONCE_CHANNEL_NAMESPACE,
+            nonce,
+        );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::NamespaceGovernance(namespace.clone(), account.clone()), &true);
+
+        // Emit event
+        let event = NamespaceEvent {
+            namespace: namespace.clone(),
+            account,
+            changed_by: caller,
+        };
+        env.events().publish((symbol_short!("ns_grnt"), namespace), event);
+    }
+
+    /// Revoke ownership of a namespace from an address.
+    ///
+    /// Only the admin or an existing namespace owner can revoke ownership.
+    ///
+    /// Replay protection: uses the caller address and `NONCE_CHANNEL_NAMESPACE`.
+    pub fn revoke_namespace_governance(
+        env: Env,
+        caller: Address,
+        namespace: String,
+        account: Address,
+        nonce: u64,
+    ) {
+        Self::require_namespace_governance(&env, &namespace, &caller);
+        replay_protection::verify_and_increment_nonce(
+            &env,
+            &caller,
+            Self::NONCE_CHANNEL_NAMESPACE,
+            nonce,
+        );
+
+        env.storage()
+            .instance()
+            .set(&DataKey::NamespaceGovernance(namespace.clone(), account.clone()), &false);
+
+        // Emit event
+        let event = NamespaceEvent {
+            namespace: namespace.clone(),
+            account,
+            changed_by: caller,
+        };
+        env.events().publish((symbol_short!("ns_rvk"), namespace), event);
+    }
+
     // ── Provider Registration ───────────────────────────────────────
 
     /// Register a new integration provider.
@@ -227,11 +368,12 @@ impl IntegrationRegistryContract {
     pub fn register_provider(
         env: Env,
         caller: Address,
+        namespace: String,
         id: String,
         metadata: ProviderMetadata,
         nonce: u64,
     ) {
-        Self::require_governance(&env, &caller);
+        Self::require_namespace_governance(&env, &namespace, &caller);
         replay_protection::verify_and_increment_nonce(
             &env,
             &caller,
@@ -239,12 +381,13 @@ impl IntegrationRegistryContract {
             nonce,
         );
 
-        let key = DataKey::Provider(id.clone());
+        let key = DataKey::Provider(namespace.clone(), id.clone());
         if env.storage().instance().has(&key) {
-            panic!("provider already registered");
+            panic!("provider already registered in namespace");
         }
 
         let provider = Provider {
+            namespace: namespace.clone(),
             id: id.clone(),
             status: ProviderStatus::Registered,
             metadata,
@@ -255,19 +398,20 @@ impl IntegrationRegistryContract {
 
         env.storage().instance().set(&key, &provider);
 
-        // Add to provider list
+        // Add to namespace provider list
         let mut providers: Vec<String> = env
             .storage()
             .instance()
-            .get(&DataKey::ProviderList)
+            .get(&DataKey::NamespaceProviderList(namespace.clone()))
             .unwrap_or_else(|| Vec::new(&env));
         providers.push_back(id.clone());
         env.storage()
             .instance()
-            .set(&DataKey::ProviderList, &providers);
+            .set(&DataKey::NamespaceProviderList(namespace.clone()), &providers);
 
         // Emit event
         let event = ProviderEvent {
+            namespace,
             provider_id: id,
             status: ProviderStatus::Registered,
             changed_by: caller,
@@ -282,8 +426,8 @@ impl IntegrationRegistryContract {
     /// Only registered or deprecated providers can be enabled.
     ///
     /// Replay protection: uses the caller address and `NONCE_CHANNEL_GOVERNANCE`.
-    pub fn enable_provider(env: Env, caller: Address, id: String, nonce: u64) {
-        Self::require_governance(&env, &caller);
+    pub fn enable_provider(env: Env, caller: Address, namespace: String, id: String, nonce: u64) {
+        Self::require_namespace_governance(&env, &namespace, &caller);
         replay_protection::verify_and_increment_nonce(
             &env,
             &caller,
@@ -291,7 +435,7 @@ impl IntegrationRegistryContract {
             nonce,
         );
 
-        let key = DataKey::Provider(id.clone());
+        let key = DataKey::Provider(namespace.clone(), id.clone());
         let mut provider: Provider = env
             .storage()
             .instance()
@@ -311,6 +455,7 @@ impl IntegrationRegistryContract {
 
         // Emit event
         let event = ProviderEvent {
+            namespace,
             provider_id: id,
             status: ProviderStatus::Enabled,
             changed_by: caller,
@@ -323,8 +468,8 @@ impl IntegrationRegistryContract {
     /// Deprecated providers are still valid but discouraged for new attestations.
     ///
     /// Replay protection: uses the caller address and `NONCE_CHANNEL_GOVERNANCE`.
-    pub fn deprecate_provider(env: Env, caller: Address, id: String, nonce: u64) {
-        Self::require_governance(&env, &caller);
+    pub fn deprecate_provider(env: Env, caller: Address, namespace: String, id: String, nonce: u64) {
+        Self::require_namespace_governance(&env, &namespace, &caller);
         replay_protection::verify_and_increment_nonce(
             &env,
             &caller,
@@ -332,7 +477,7 @@ impl IntegrationRegistryContract {
             nonce,
         );
 
-        let key = DataKey::Provider(id.clone());
+        let key = DataKey::Provider(namespace.clone(), id.clone());
         let mut provider: Provider = env
             .storage()
             .instance()
@@ -350,6 +495,7 @@ impl IntegrationRegistryContract {
 
         // Emit event
         let event = ProviderEvent {
+            namespace,
             provider_id: id,
             status: ProviderStatus::Deprecated,
             changed_by: caller,
@@ -362,8 +508,8 @@ impl IntegrationRegistryContract {
     /// Disabled providers cannot be used in new attestations.
     ///
     /// Replay protection: uses the caller address and `NONCE_CHANNEL_GOVERNANCE`.
-    pub fn disable_provider(env: Env, caller: Address, id: String, nonce: u64) {
-        Self::require_governance(&env, &caller);
+    pub fn disable_provider(env: Env, caller: Address, namespace: String, id: String, nonce: u64) {
+        Self::require_namespace_governance(&env, &namespace, &caller);
         replay_protection::verify_and_increment_nonce(
             &env,
             &caller,
@@ -371,7 +517,7 @@ impl IntegrationRegistryContract {
             nonce,
         );
 
-        let key = DataKey::Provider(id.clone());
+        let key = DataKey::Provider(namespace.clone(), id.clone());
         let mut provider: Provider = env
             .storage()
             .instance()
@@ -389,6 +535,7 @@ impl IntegrationRegistryContract {
 
         // Emit event
         let event = ProviderEvent {
+            namespace,
             provider_id: id,
             status: ProviderStatus::Disabled,
             changed_by: caller,
@@ -406,11 +553,12 @@ impl IntegrationRegistryContract {
     pub fn update_metadata(
         env: Env,
         caller: Address,
+        namespace: String,
         id: String,
         metadata: ProviderMetadata,
         nonce: u64,
     ) {
-        Self::require_governance(&env, &caller);
+        Self::require_namespace_governance(&env, &namespace, &caller);
         replay_protection::verify_and_increment_nonce(
             &env,
             &caller,
@@ -418,7 +566,7 @@ impl IntegrationRegistryContract {
             nonce,
         );
 
-        let key = DataKey::Provider(id.clone());
+        let key = DataKey::Provider(namespace.clone(), id.clone());
         let mut provider: Provider = env
             .storage()
             .instance()
@@ -431,6 +579,7 @@ impl IntegrationRegistryContract {
 
         // Emit event
         let event = ProviderMetadataEvent {
+            namespace,
             provider_id: id,
             metadata,
             changed_by: caller,
@@ -440,16 +589,16 @@ impl IntegrationRegistryContract {
 
     // ── Query Functions ─────────────────────────────────────────────
 
-    /// Get a provider by ID.
-    pub fn get_provider(env: Env, id: String) -> Option<Provider> {
-        env.storage().instance().get(&DataKey::Provider(id))
+    /// Get a provider by ID and namespace.
+    pub fn get_provider(env: Env, namespace: String, id: String) -> Option<Provider> {
+        env.storage().instance().get(&DataKey::Provider(namespace, id))
     }
 
     /// Check if a provider is enabled.
     ///
     /// Returns true only if the provider exists and has `Enabled` status.
-    pub fn is_enabled(env: Env, id: String) -> bool {
-        if let Some(provider) = Self::get_provider(env, id) {
+    pub fn is_enabled(env: Env, namespace: String, id: String) -> bool {
+        if let Some(provider) = Self::get_provider(env, namespace, id) {
             provider.status == ProviderStatus::Enabled
         } else {
             false
@@ -459,8 +608,8 @@ impl IntegrationRegistryContract {
     /// Check if a provider is deprecated.
     ///
     /// Returns true only if the provider exists and has `Deprecated` status.
-    pub fn is_deprecated(env: Env, id: String) -> bool {
-        if let Some(provider) = Self::get_provider(env, id) {
+    pub fn is_deprecated(env: Env, namespace: String, id: String) -> bool {
+        if let Some(provider) = Self::get_provider(env, namespace, id) {
             provider.status == ProviderStatus::Deprecated
         } else {
             false
@@ -471,8 +620,8 @@ impl IntegrationRegistryContract {
     ///
     /// Returns true if the provider is either `Enabled` or `Deprecated`.
     /// Deprecated providers are still valid but discouraged.
-    pub fn is_valid_for_attestation(env: Env, id: String) -> bool {
-        if let Some(provider) = Self::get_provider(env, id) {
+    pub fn is_valid_for_attestation(env: Env, namespace: String, id: String) -> bool {
+        if let Some(provider) = Self::get_provider(env, namespace, id) {
             provider.status == ProviderStatus::Enabled
                 || provider.status == ProviderStatus::Deprecated
         } else {
@@ -483,26 +632,34 @@ impl IntegrationRegistryContract {
     /// Get the status of a provider.
     ///
     /// Returns None if the provider is not registered.
-    pub fn get_status(env: Env, id: String) -> Option<ProviderStatus> {
-        Self::get_provider(env, id).map(|p| p.status)
+    pub fn get_status(env: Env, namespace: String, id: String) -> Option<ProviderStatus> {
+        Self::get_provider(env, namespace, id).map(|p| p.status)
     }
 
-    /// Get all registered provider IDs.
-    pub fn get_all_providers(env: Env) -> Vec<String> {
+    /// Get all registered namespaces.
+    pub fn get_all_namespaces(env: Env) -> Vec<String> {
         env.storage()
             .instance()
-            .get(&DataKey::ProviderList)
+            .get(&DataKey::NamespaceList)
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Get all enabled provider IDs.
-    pub fn get_enabled_providers(env: Env) -> Vec<String> {
-        let all = Self::get_all_providers(env.clone());
+    /// Get all registered provider IDs in a namespace.
+    pub fn get_namespace_providers(env: Env, namespace: String) -> Vec<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::NamespaceProviderList(namespace))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Get all enabled provider IDs in a namespace.
+    pub fn get_enabled_providers(env: Env, namespace: String) -> Vec<String> {
+        let all = Self::get_namespace_providers(env.clone(), namespace.clone());
         let mut enabled = Vec::new(&env);
 
         for i in 0..all.len() {
             let id = all.get(i).unwrap();
-            if Self::is_enabled(env.clone(), id.clone()) {
+            if Self::is_enabled(env.clone(), namespace.clone(), id.clone()) {
                 enabled.push_back(id);
             }
         }
@@ -510,14 +667,14 @@ impl IntegrationRegistryContract {
         enabled
     }
 
-    /// Get all deprecated provider IDs.
-    pub fn get_deprecated_providers(env: Env) -> Vec<String> {
-        let all = Self::get_all_providers(env.clone());
+    /// Get all deprecated provider IDs in a namespace.
+    pub fn get_deprecated_providers(env: Env, namespace: String) -> Vec<String> {
+        let all = Self::get_namespace_providers(env.clone(), namespace.clone());
         let mut deprecated = Vec::new(&env);
 
         for i in 0..all.len() {
             let id = all.get(i).unwrap();
-            if Self::is_deprecated(env.clone(), id.clone()) {
+            if Self::is_deprecated(env.clone(), namespace.clone(), id.clone()) {
                 deprecated.push_back(id);
             }
         }
@@ -533,11 +690,34 @@ impl IntegrationRegistryContract {
             .expect("contract not initialized")
     }
 
-    /// Check if an address has governance role.
+    /// Check if an address has global governance role.
     pub fn has_governance(env: Env, account: Address) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::GovernanceRole(account))
+            .unwrap_or(false)
+    }
+
+    /// Check if an address has governance role for a specific namespace.
+    ///
+    /// Returns true if the address is a namespace owner, global governance, or admin.
+    pub fn has_namespace_governance(env: Env, namespace: String, account: Address) -> bool {
+        // Admin has global access
+        if let Some(admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+            if account == admin {
+                return true;
+            }
+        }
+
+        // Global governance has access to all namespaces
+        if Self::has_governance(env.clone(), account.clone()) {
+            return true;
+        }
+
+        // Namespace-specific owner
+        env.storage()
+            .instance()
+            .get(&DataKey::NamespaceGovernance(namespace, account))
             .unwrap_or(false)
     }
 
@@ -554,15 +734,30 @@ impl IntegrationRegistryContract {
         assert!(*caller == admin, "caller is not admin");
     }
 
-    /// Require the caller to have governance role.
+    /// Require the caller to have global governance role.
     fn require_governance(env: &Env, caller: &Address) {
         caller.require_auth();
-        let has_role: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::GovernanceRole(caller.clone()))
-            .unwrap_or(false);
-        assert!(has_role, "caller does not have governance role");
+        assert!(
+            Self::is_admin(env, caller) || Self::has_governance(env.clone(), caller.clone()),
+            "caller does not have governance role"
+        );
+    }
+
+    /// Require the caller to have governance role for a specific namespace.
+    fn require_namespace_governance(env: &Env, namespace: &String, caller: &Address) {
+        caller.require_auth();
+        assert!(
+            Self::has_namespace_governance(env.clone(), namespace.clone(), caller.clone()),
+            "caller does not have namespace governance role"
+        );
+    }
+
+    fn is_admin(env: &Env, account: &Address) -> bool {
+        if let Some(admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+            account == &admin
+        } else {
+            false
+        }
     }
 
     /// Get the current nonce for a given `(actor, channel)` pair.
