@@ -332,10 +332,22 @@ fn apply_action(env: &Env, action: &ProposalAction) {
                 .set(&DataKey::AttestationFeeConfig, &cfg);
         }
         ProposalAction::UpdateGovernanceConfig(min_votes, duration) => {
-            env.storage().instance().set(&DataKey::MinVotes, min_votes);
+            validate_min_votes(*min_votes);
+            validate_proposal_duration(*duration);
+            let mv = if *min_votes == 0 {
+                DEFAULT_MIN_VOTES
+            } else {
+                *min_votes
+            };
+            let dur = if *duration == 0 {
+                DEFAULT_PROPOSAL_DURATION
+            } else {
+                *duration
+            };
+            env.storage().instance().set(&DataKey::MinVotes, &mv);
             env.storage()
                 .instance()
-                .set(&DataKey::ProposalDuration, duration);
+                .set(&DataKey::ProposalDuration, &dur);
         }
     }
 }
@@ -591,11 +603,25 @@ impl ProtocolDao {
         creator.require_auth();
         ensure_token_holder(&env, &creator);
 
+        validate_min_votes(min_votes);
+        validate_proposal_duration(proposal_duration);
+
+        let mv = if min_votes == 0 {
+            DEFAULT_MIN_VOTES
+        } else {
+            min_votes
+        };
+        let dur = if proposal_duration == 0 {
+            DEFAULT_PROPOSAL_DURATION
+        } else {
+            proposal_duration
+        };
+
         let id = next_proposal_id(&env);
         let proposal = Proposal {
             id,
             creator: creator.clone(),
-            action: ProposalAction::UpdateGovernanceConfig(min_votes, proposal_duration),
+            action: ProposalAction::UpdateGovernanceConfig(mv, dur),
             status: ProposalStatus::Pending,
             created_at: env.ledger().sequence(),
         };
