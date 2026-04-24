@@ -10,7 +10,7 @@ struct TestSetup<'a> {
     client: AttestationContractClient<'a>,
     admin: Address,
     token_addr: Address,
-    treasury: Address,
+    collector: Address,
 }
 
 fn setup_with_flat_fees(amount: i128) -> TestSetup<'static> {
@@ -18,7 +18,7 @@ fn setup_with_flat_fees(amount: i128) -> TestSetup<'static> {
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
+    let collector = Address::generate(&env);
 
     // Deploy a Stellar asset token for fee payment.
     let token_admin = Address::generate(&env);
@@ -28,17 +28,17 @@ fn setup_with_flat_fees(amount: i128) -> TestSetup<'static> {
     // Register and initialize the attestation contract.
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
+    client.initialize(&admin, &0);
 
     // Configure flat fees.
-    client.configure_flat_fee(&token_addr, &treasury, &amount, &true);
+    client.configure_flat_fee(&token_addr, &collector, &amount, &true);
 
     TestSetup {
         env,
         client,
         admin,
         token_addr,
-        treasury,
+        collector,
     }
 }
 
@@ -61,29 +61,34 @@ fn test_collect_flat_fee_success() {
     let period = String::from_str(&t.env, "2026-02");
     let root = BytesN::from_array(&t.env, &[1u8; 32]);
     
-    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1);
+    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1, &None, &None, &0);
 
     assert_eq!(balance(&t.env, &t.token_addr, &business), 500);
-    assert_eq!(balance(&t.env, &t.token_addr, &t.treasury), 500);
+    assert_eq!(balance(&t.env, &t.token_addr, &t.collector), 500);
 
-    let (_, _, _, fee_paid) = t.client.get_attestation(&business, &period).unwrap();
-    assert_eq!(fee_paid, 500);
+    let (fee_paid, _, _, _, _, _) = match t.client.get_attestation(&business, &period) {
+        Some((_, _, _, fee, _, _)) => (fee, 0, 0, 0, 0, 0), // Simplifying for the test
+        None => panic!("attestation not found"),
+    };
+    // Wait, let's fix the tuple unpack properly based on lib.rs:655
+    let record = t.client.get_attestation(&business, &period).unwrap();
+    assert_eq!(record.3, 500); // fee_paid is the 4th element (index 3)
 }
 
 #[test]
 fn test_flat_fee_disabled() {
     let t = setup_with_flat_fees(500);
-    t.client.configure_flat_fee(&t.token_addr, &t.treasury, &500, &false);
+    t.client.configure_flat_fee(&t.token_addr, &t.collector, &500, &false);
 
     let business = Address::generate(&t.env);
     let period = String::from_str(&t.env, "2026-02");
     let root = BytesN::from_array(&t.env, &[1u8; 32]);
     
-    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1);
+    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1, &None, &None, &0);
 
-    assert_eq!(balance(&t.env, &t.token_addr, &t.treasury), 0);
-    let (_, _, _, fee_paid) = t.client.get_attestation(&business, &period).unwrap();
-    assert_eq!(fee_paid, 0);
+    assert_eq!(balance(&t.env, &t.token_addr, &t.collector), 0);
+    let record = t.client.get_attestation(&business, &period).unwrap();
+    assert_eq!(record.3, 0);
 }
 
 #[test]
@@ -93,9 +98,9 @@ fn test_zero_flat_fee() {
     let period = String::from_str(&t.env, "2026-02");
     let root = BytesN::from_array(&t.env, &[1u8; 32]);
     
-    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1);
+    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1, &None, &None, &0);
 
-    assert_eq!(balance(&t.env, &t.token_addr, &t.treasury), 0);
+    assert_eq!(balance(&t.env, &t.token_addr, &t.collector), 0);
 }
 
 #[test]
@@ -108,15 +113,15 @@ fn test_flat_fee_insufficient_balance() {
     let period = String::from_str(&t.env, "2026-02");
     let root = BytesN::from_array(&t.env, &[1u8; 32]);
     
-    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1);
+    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1, &None, &None, &0);
 }
 
 #[test]
 fn test_combined_fees() {
     let t = setup_with_flat_fees(500);
     // Also enable dynamic fees: base 1000
-    let collector = Address::generate(&t.env);
-    t.client.configure_fees(&t.token_addr, &collector, &1000, &true);
+    let dyn_collector = Address::generate(&t.env);
+    t.client.configure_fees(&t.token_addr, &dyn_collector, &1000, &true);
 
     let business = Address::generate(&t.env);
     mint(&t.env, &t.token_addr, &business, 2000);
@@ -124,13 +129,46 @@ fn test_combined_fees() {
     let period = String::from_str(&t.env, "2026-02");
     let root = BytesN::from_array(&t.env, &[1u8; 32]);
     
-    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1);
+    t.client.submit_attestation(&business, &period, &root, &1_700_000_000, &1, &None, &None, &0);
 
     // Total = 500 (flat) + 1000 (dynamic) = 1500
     assert_eq!(balance(&t.env, &t.token_addr, &business), 500);
-    assert_eq!(balance(&t.env, &t.token_addr, &t.treasury), 500);
-    assert_eq!(balance(&t.env, &t.token_addr, &collector), 1000);
+    assert_eq!(balance(&t.env, &t.token_addr, &t.collector), 500);
+    assert_eq!(balance(&t.env, &t.token_addr, &dyn_collector), 1000);
 
-    let (_, _, _, fee_paid) = t.client.get_attestation(&business, &period).unwrap();
-    assert_eq!(fee_paid, 1500);
+    let record = t.client.get_attestation(&business, &period).unwrap();
+    assert_eq!(record.3, 1500);
 }
+
+#[contract]
+struct MockDao;
+
+#[contractimpl]
+impl MockDao {
+    pub fn get_attestation_flat_fee_config(env: Env) -> Option<(Address, Address, i128, bool)> {
+        // We use a hardcoded amount for testing the override
+        let token = Address::generate(&env);
+        let collector = Address::generate(&env);
+        Some((token, collector, 1000, true))
+    }
+}
+
+// DAO Override Test
+#[test]
+fn test_flat_fee_dao_override() {
+    let t = setup_with_flat_fees(500);
+    
+    let dao_id = t.env.register(MockDao, ());
+    t.client.set_flat_fee_dao(&dao_id);
+
+    // The mock DAO returns 1000, which should override the 500 set in setup
+    let config = t.client.get_effective_flat_fee_config().unwrap();
+    assert_eq!(config.amount, 1000);
+    
+    // Original config is still 500
+    let original = t.client.get_flat_fee_config().unwrap();
+    assert_eq!(original.amount, 500);
+}
+
+
+
