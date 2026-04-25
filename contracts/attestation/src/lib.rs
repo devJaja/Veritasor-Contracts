@@ -400,6 +400,27 @@ impl AttestationContract {
         dispute::get_attestation_revocation(&env, &business, &period)
     }
 
+    /// Returns the ordered list of revoked period strings for a business.
+    ///
+    /// Entries appear in revocation order (oldest first).  This is a secondary
+    /// index maintained atomically alongside the authoritative `Revoked` records.
+    /// Use `is_revoked` for authoritative per-period checks.
+    ///
+    /// Off-chain indexers can use this together with `get_revocation_sequence`
+    /// to efficiently enumerate all revocations without scanning all periods.
+    pub fn get_revoked_periods(env: Env, business: Address) -> Vec<String> {
+        dispute::get_revoked_periods(&env, &business)
+    }
+
+    /// Returns the current global revocation sequence number.
+    ///
+    /// This counter is incremented atomically with every successful revocation.
+    /// Off-chain indexers should persist the last-seen value and compare it on
+    /// the next poll; a gap indicates missed revocation events.
+    pub fn get_revocation_sequence(env: Env) -> u64 {
+        dispute::get_revocation_sequence(&env)
+    }
+
     /// Returns attestation data together with optional revocation metadata.
     pub fn get_attestation_with_status(
         env: Env,
@@ -464,10 +485,15 @@ impl AttestationContract {
         reason: String,
         _nonce: u64,
     ) {
+        // Authorization + precondition checks (pause, existence, idempotency, role).
         dispute::require_revocation_authorized(&env, &caller, &business, &period);
+
         let revoked_at = env.ledger().timestamp();
         let revocation = (caller.clone(), revoked_at, reason.clone());
-        dispute::store_attestation_revocation(&env, &business, &period, &revocation);
+
+        // Atomic write: revocation record + per-business index + global sequence.
+        let _seq = dispute::record_revocation(&env, &business, &period, &revocation);
+
         events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
     }
 
@@ -548,22 +574,6 @@ impl AttestationContract {
         assert!(caller_is_admin, "caller must have ADMIN or OPERATOR role");
         access_control::set_paused(&env, false);
         events::emit_unpaused(&env, &caller);
-    }
-
-        // Keep status key in sync for pagination/filtering.
-        let status_key = (STATUS_KEY_TAG, business.clone(), period.clone());
-        env.storage().instance().set(&status_key, &STATUS_REVOKED);
-
-        events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
-    }
-
-    /// Migrate an attestation to a new version.
-    pub fn verify_attestation(env: Env, business: Address, period: String, merkle_root: BytesN<32>) -> bool {
-        if let Some((stored_root, _ts, _ver, _fee)) = Self::get_attestation(env.clone(), business, period) {
-            stored_root == merkle_root
-        } else {
-            false
-        }
     }
 
     /// Migrate an attestation to a new version.
@@ -857,18 +867,18 @@ impl AttestationContract {
     /// Note: This requires the business to maintain a list of their periods
     /// as the contract does not store a global index of attestations.
     ///
-    /// # Arguments
-    /// * `business` - Business address to query attestations for
-    /// * `periods` - List of period identifiers to retrieve
+    /// Revoke a multi-period attestation by its merkle root.
     ///
-    /// # Returns
-    /// Vector of tuples containing (period, attestation_data, revocation_info)
-    pub fn get_business_attestations(
+    /// Marks the matching range as revoked and increments the global revocation
+    /// sequence counter. Enforces idempotency: panics if the range is already
+    /// revoked. Only the business owner may call this.
     pub fn revoke_multi_period_attestation(
         env: Env,
         business: Address,
         merkle_root: BytesN<32>,
     ) {
+        // SECURITY: pause check and auth before any state reads.
+        access_control::require_not_paused(&env);
         business.require_auth();
 
         let key = MultiPeriodKey::Ranges(business.clone());
@@ -881,9 +891,12 @@ impl AttestationContract {
         let mut found = false;
         let mut updated_ranges = Vec::new(&env);
 
-        // Rebuild the vector, updates the revoked status of the target root
+        // Rebuild the vector, updating the revoked flag on the matching range.
         for mut range in ranges.iter() {
             if range.merkle_root == merkle_root {
+                // Idempotency guard: reject double-revocation to prevent
+                // duplicate entries in the revocation index.
+                assert!(!range.revoked, "multi-period attestation already revoked");
                 range.revoked = true;
                 found = true;
             }
@@ -893,6 +906,24 @@ impl AttestationContract {
         if !found {
             panic!("attestation root not found");
         }
+
+        env.storage().instance().set(&key, &updated_ranges);
+
+        // Increment the global revocation sequence so off-chain indexers can
+        // detect this revocation even without a period string.
+        // We use a synthetic period key derived from the merkle root hex for
+        // the index entry so the sequence stays consistent.
+        // NOTE: multi-period revocations are tracked via the sequence counter
+        // only; the per-business string index is for single-period attestations.
+        let _seq = dispute::increment_revocation_sequence_pub(&env);
+
+        let topics = (
+            soroban_sdk::Symbol::new(&env, "attestation"),
+            soroban_sdk::Symbol::new(&env, "multi_period_revoked"),
+            business.clone(),
+        );
+        env.events().publish(topics, merkle_root);
+    }
 
     /// Return the current flat fee configuration, or None if not set.
     ///
@@ -906,7 +937,6 @@ impl AttestationContract {
     /// Calculate the fee a business would pay for its next attestation.
     pub fn get_fee_quote(env: Env, business: Address) -> i128 {
         dynamic_fees::calculate_fee(&env, &business)
-        env.storage().instance().set(&key, &updated_ranges);
     }
 
 
