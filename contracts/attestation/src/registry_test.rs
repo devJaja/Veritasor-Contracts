@@ -47,7 +47,7 @@ impl Ctx {
         let client = AttestationContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize(&admin);
+        client.initialize(&admin, &0u64);
 
         // Grant ROLE_BUSINESS to admin too so it can register test businesses
         // if needed; individual tests grant it to specific addresses.

@@ -309,7 +309,7 @@ fn prop_data_integrity_and_counter_monotonicity() {
             "case {idx} [{period_str}]: initial count must be 0"
         );
 
-        client.submit_attestation(&business, &period, &root, &timestamp, &version, &None, &None);
+        client.submit_attestation(&business, &period, &root, &timestamp, &version, &None, &None, &0u64);
 
         // P4: Every field must round-trip exactly.
         let (got_root, got_ts, got_ver, got_fee, _, _, _) = client
@@ -341,7 +341,7 @@ fn prop_data_integrity_and_counter_monotonicity() {
 
         // P5 continued: second submit (different period) increments to 2.
         let period2 = String::from_str(&env, &std::format!("{period_str}-v2"));
-        client.submit_attestation(&business, &period2, &root, &timestamp, &version, &None, &None);
+        client.submit_attestation(&business, &period2, &root, &timestamp, &version, &None, &None, &0u64);
         assert_eq!(
             client.get_business_count(&business),
             2,
@@ -394,6 +394,7 @@ fn prop_verify_consistency() {
             &1,
             &None,
             &None,
+            &0u64,
         );
 
         // After submit: correct root → true, wrong roots → false.
@@ -438,7 +439,7 @@ fn prop_revocation_permanence() {
         let period = String::from_str(&env, "2026-01");
         let submitted_root = BytesN::from_array(&env, &sub_bytes);
 
-        client.submit_attestation(&business, &period, &submitted_root, &1_000_000, &1, &None, &None);
+        client.submit_attestation(&business, &period, &submitted_root, &1_000_000, &1, &None, &None, &0u64);
 
         // Sanity: verifies before revocation.
         assert!(
@@ -501,9 +502,9 @@ fn prop_duplicate_attestation_panics() {
             let business = Address::generate(&env);
             let period = String::from_str(&env, &period_owned);
             let root = BytesN::from_array(&env, &[1u8; 32]);
-            client.submit_attestation(&business, &period, &root, &1_000_000, &1, &None, &None);
+            client.submit_attestation(&business, &period, &root, &1_000_000, &1, &None, &None, &0u64);
             // Second call for the same (business, period) must panic.
-            client.submit_attestation(&business, &period, &root, &2_000_000, &2, &None, &None);
+            client.submit_attestation(&business, &period, &root, &2_000_000, &2, &None, &None, &0u64);
         });
 
         let err = result.expect_err(&std::format!(
@@ -546,9 +547,9 @@ fn prop_migration_succeeds_for_increasing_version() {
         let new_root = BytesN::from_array(&env, &[2u8; 32]);
 
         client.submit_attestation(&business, &period, &old_root, &1_000_000, &old_ver, &None, &None);
-        client.migrate_attestation(&admin, &business, &period, &new_root, &new_ver);
+        client.migrate_attestation(&admin, &business, &period, &new_root, &new_ver, &0u64);
 
-        let (got_root, _, got_ver, _, _, _, _) = client.get_attestation(&business, &period).unwrap();
+        let (got_root, _, got_ver, _, _, _) = client.get_attestation(&business, &period).unwrap();
         assert_eq!(
             got_root, new_root,
             "old={old_ver}, new={new_ver}: root must be updated"
@@ -584,8 +585,8 @@ fn prop_migration_panics_for_non_increasing_version() {
             let period = String::from_str(&env, "2026-01");
             let old_root = BytesN::from_array(&env, &[1u8; 32]);
             let new_root = BytesN::from_array(&env, &[2u8; 32]);
-            client.submit_attestation(&business, &period, &old_root, &1_000_000, &old_ver, &None, &None);
-            client.migrate_attestation(&admin_addr, &business, &period, &new_root, &bad_new_ver);
+            client.submit_attestation(&business, &period, &old_root, &1_000_000, &old_ver, &None, &None, &0u64);
+            client.migrate_attestation(&admin_addr, &business, &period, &new_root, &bad_new_ver, &0u64);
         });
 
         let err = result.expect_err(&std::format!(
@@ -612,7 +613,7 @@ fn prop_tier_discount_valid_range_succeeds() {
     for &discount in valid {
         let (_env, client) = setup();
         // Must not panic.
-        client.set_tier_discount(&client.get_admin(), &0u32, &discount);
+        client.set_tier_discount(&0u32, &discount);
     }
 }
 
@@ -627,7 +628,7 @@ fn prop_tier_discount_over_bound_panics() {
             let contract_id = env.register(AttestationContract, ());
             let client = AttestationContractClient::new(&env, &contract_id);
             client.initialize(&Address::generate(&env), &0u64);
-            client.set_tier_discount(&client.get_admin(), &0u32, &discount);
+            client.set_tier_discount(&0u32, &discount);
         });
 
         let err = result.expect_err(&std::format!("set_tier_discount({discount}) must panic"));
@@ -676,7 +677,7 @@ fn prop_volume_brackets_valid_configs() {
             v
         };
         // Must not panic.
-        client.set_volume_brackets(&client.get_admin(), &soroban_t, &soroban_d);
+        client.set_volume_brackets(&soroban_t, &soroban_d);
         let _ = idx; // suppress unused warning
     }
 }
@@ -715,7 +716,7 @@ fn prop_volume_brackets_unordered_panics() {
                 }
                 v
             };
-            client.set_volume_brackets(&client.get_admin(), &soroban_t, &soroban_d);
+            client.set_volume_brackets(&soroban_t, &soroban_d);
         });
 
         result.expect_err(&std::format!(
@@ -758,7 +759,7 @@ fn prop_volume_brackets_length_mismatch_panics() {
                 }
                 v
             };
-            client.set_volume_brackets(&client.get_admin(), &soroban_t, &soroban_d);
+            client.set_volume_brackets(&soroban_t, &soroban_d);
         });
 
         result.expect_err(&std::format!(
@@ -788,8 +789,8 @@ fn prop_business_isolation() {
     let root_a = BytesN::from_array(&env, &[1u8; 32]);
     let root_b = BytesN::from_array(&env, &[2u8; 32]);
 
-    client.submit_attestation(&biz_a, &period, &root_a, &1_000, &1, &None, &None);
-    client.submit_attestation(&biz_b, &period, &root_b, &2_000, &2, &None, &None);
+    client.submit_attestation(&biz_a, &period, &root_a, &1_000, &1, &None, &None, &0u64);
+    client.submit_attestation(&biz_b, &period, &root_b, &2_000, &2, &None, &None, &0u64);
 
     // biz_c has no attestation.
     assert!(
@@ -866,11 +867,11 @@ fn prop_pause_blocks_all_submissions() {
             let client = AttestationContractClient::new(&env, &contract_id);
             let admin = Address::generate(&env);
             client.initialize(&admin, &0u64);
-            client.pause(&client.get_admin());
+            client.pause(&client.get_admin(), &0u64);
             let business = Address::generate(&env);
             let period = String::from_str(&env, &period_owned);
             let root = BytesN::from_array(&env, &[1u8; 32]);
-            client.submit_attestation(&business, &period, &root, &1_000, &1, &None, &None);
+            client.submit_attestation(&business, &period, &root, &1_000, &1, &None, &None, &0u64);
         });
 
         let err = result.expect_err(&std::format!(
@@ -893,11 +894,11 @@ fn prop_unpause_restores_submission() {
     let period = String::from_str(&env, "2026-01");
     let root = BytesN::from_array(&env, &[1u8; 32]);
 
-    client.pause(&client.get_admin());
-    client.unpause(&client.get_admin());
+    client.pause(&client.get_admin(), &0u64);
+    client.unpause(&client.get_admin(), &0u64);
 
     // Must succeed after unpause.
-    client.submit_attestation(&business, &period, &root, &1_000, &1, &None, &None);
+    client.submit_attestation(&business, &period, &root, &1_000, &1, &None, &None, &0u64);
     assert!(
         client.get_attestation(&business, &period).is_some(),
         "attestation must exist after unpause + submit"
@@ -936,15 +937,15 @@ fn prop_fee_quote_matches_actual_charge() {
 
         // Configure tier discount.
         if tier_disc > 0 {
-            client.set_tier_discount(&client.get_admin(), &1u32, &tier_disc);
-            client.set_business_tier(&client.get_admin(), &business, &1u32);
+            client.set_tier_discount(&1u32, &tier_disc);
+            client.set_business_tier(&business, &1u32);
         }
 
         // Configure volume discount bracket.
         if vol_threshold > 0 {
             let thresholds = vec![&env, vol_threshold];
             let discounts = vec![&env, vol_disc];
-            client.set_volume_brackets(&client.get_admin(), &thresholds, &discounts);
+            client.set_volume_brackets(&thresholds, &discounts);
         }
 
         // Fund the business: 10× the maximum possible fee to avoid insufficiency.

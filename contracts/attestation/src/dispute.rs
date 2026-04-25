@@ -312,3 +312,46 @@ pub fn require_not_revoked_for_update(env: &Env, business: &Address, period: &St
         "attestation revoked"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════
+//  Anomaly Escalation Helpers
+// ════════════════════════════════════════════════════════════════════
+
+/// Storage key for anomaly escalation level per business.
+#[contracttype]
+#[derive(Clone)]
+enum EscalationKey {
+    Level(Address),
+}
+
+/// Compute escalation level (0 = none, 1 = warning, 2 = elevated, 3 = critical)
+/// from the maximum anomaly score recorded across all periods for a business.
+/// This is a best-effort scan; in production a separate index would be maintained.
+pub fn get_anomaly_escalation(env: &Env, business: &Address) -> Option<u32> {
+    env.storage()
+        .instance()
+        .get(&EscalationKey::Level(business.clone()))
+}
+
+/// Clear the escalation level for a business (admin recovery path).
+pub fn clear_anomaly_escalation(env: &Env, business: &Address) {
+    env.storage()
+        .instance()
+        .remove(&EscalationKey::Level(business.clone()));
+}
+
+/// Update the escalation level for a business based on score.
+/// Called internally when `set_anomaly` records a new score.
+pub fn update_anomaly_escalation(env: &Env, business: &Address, score: u32) {
+    let level = match score {
+        0..=49 => return, // no escalation — remove any existing
+        50..=74 => 1u32,  // warning
+        75..=89 => 2u32,  // elevated
+        _ => 3u32,        // critical
+    };
+    let key = EscalationKey::Level(business.clone());
+    let current: u32 = env.storage().instance().get(&key).unwrap_or(0);
+    if level > current {
+        env.storage().instance().set(&key, &level);
+    }
+}

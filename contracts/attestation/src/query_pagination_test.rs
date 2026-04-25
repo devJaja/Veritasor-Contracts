@@ -1,4 +1,5 @@
 #![cfg(test)]
+extern crate alloc;
 use super::*;
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Vec};
 
@@ -57,7 +58,7 @@ fn setup_sparse_gaps(
         if i % 10 == 0 {
             let root = BytesN::from_array(env, &[(i as u8); 32]);
             let ver = i / 10; // Version based on hit index
-            client.submit_attestation(&business, &period, &root, &1700000000u64, &ver, &None);
+            client.submit_attestation(&business, &period, &root, &1700000000u64, &ver, &None, &None, &0u64);
         }
     }
     (business, client, periods)
@@ -77,12 +78,17 @@ fn setup_sparse_clustered(
         let period = period_str(env, i);
         periods.push_back(period.clone());
         let root = BytesN::from_array(env, &[i as u8; 32]);
-        client.submit_attestation(&business, &period, &root, &1700000000u64, &i, &None);
+        client.submit_attestation(&business, &period, &root, &1700000000u64, &i, &None, &None, &0u64);
     }
     // Sparse gap 11-200 (no attestations)
     for i in 11..=200 {
-        let period = format!("20{}01", i / 10); // Dummy sparse periods
-        periods.push_back(String::from_str(env, &period));
+        let period_idx = i / 10;
+        let p_str = if period_idx < 10 {
+            alloc::format!("200{}01", period_idx)
+        } else {
+            alloc::format!("20{}01", period_idx)
+        };
+        periods.push_back(String::from_str(env, &p_str));
     }
     (business, client, periods)
 }
@@ -538,7 +544,7 @@ fn test_sparse_100_percent_empty() {
     }
     let contract_id = env.register(AttestationContract, ());
     let empty_client = AttestationContractClient::new(&env, &contract_id);
-    empty_client.initialize(&Address::generate(&env));
+    empty_client.initialize(&Address::generate(&env), &0u64);
     let (out, next) = empty_client.get_attestations_page(&business, &empty_periods, &None, &None, &STATUS_FILTER_ALL, &None, &10, &0);
     assert_eq!(out.len(), 0);
     assert_eq!(next, 10);
