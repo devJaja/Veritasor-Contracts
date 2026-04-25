@@ -41,7 +41,7 @@ use soroban_sdk::{Bytes, BytesN, Env, Vec as SorobanVec};
 
 use crate::merkle::{
     build_merkle_tree, compute_root, generate_proof, hash_leaf, verify_proof, MerkleError,
-    MerkleProof, MerkleTree,
+    MerkleProof, MerkleTree, MAX_TREE_DEPTH,
 };
 
 /// Seed for deterministic fuzz testing (CI-friendly)
@@ -276,6 +276,41 @@ fn fuzz_malformed_proofs_rejected() {
     // Log the results for visibility
     // Note: In a real fuzzing campaign, we'd want most to be rejected
     // but for this simple test, we just verify no panics occur
+}
+
+/// Test: Proofs with more than [`MAX_TREE_DEPTH`] steps are rejected (DoS / malformed).
+#[test]
+fn fuzz_verify_proof_rejects_excessive_path_depth() {
+    let env = Env::default();
+    let mut path = SorobanVec::new(&env);
+    let mut proof = SorobanVec::new(&env);
+    let sample = hash_leaf(&env, &Bytes::from_array(&env, &[0xab_u8; 32]));
+    for _ in 0..(MAX_TREE_DEPTH + 1) {
+        path.push_back(false);
+        proof.push_back(sample.clone());
+    }
+    let bad = MerkleProof {
+        leaf: sample,
+        proof,
+        path,
+    };
+    let root = BytesN::from_array(&env, &[1u8; 32]);
+    assert_eq!(
+        verify_proof(&env, &root, &bad).unwrap_err(),
+        MerkleError::MaxDepthExceeded
+    );
+}
+
+/// Test: Valid trees never emit proofs longer than [`MAX_TREE_DEPTH`].
+#[test]
+fn fuzz_generated_proof_depth_bounded() {
+    let env = Env::default();
+    let tree = build_sequential_tree(&env, 8);
+    for i in 0..tree.leaves.len() {
+        let p = generate_proof(&env, &tree, i).unwrap();
+        assert!(p.proof.len() <= MAX_TREE_DEPTH);
+        assert_eq!(p.proof.len(), p.path.len());
+    }
 }
 
 /// Test: Mismatched proof and path lengths are rejected as malformed input.
