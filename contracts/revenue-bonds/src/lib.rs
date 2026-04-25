@@ -11,6 +11,19 @@
 //! - Double-spending prevention via redemption tracking
 //! - Support for partial and early redemptions
 //! - Default handling and risk management
+//!
+//! ## Soroban Production Deployment Checklist
+//! - Confirm canonical token contract addresses for each environment and verify code hashes.
+//! - Confirm attestation contract address points to the expected registry-backed deployment.
+//! - Set admin to a governed signer (multisig/ops key) and define a documented rotation runbook.
+//! - Validate issuer token funding and allowance expectations for redemption execution.
+//! - Define an emergency response policy: this contract has no global pause; use ops-level redemption
+//!   suspension and `mark_defaulted`/`mark_matured` controls where appropriate.
+//!
+//! ## Security Assumptions
+//! - Cross-contract attestation checks are trusted to enforce existence and revocation semantics.
+//! - Token transfers are delegated to the referenced Soroban token contract.
+//! - Storage is bounded per bond lifecycle by monotonic IDs and one redemption record per period key.
 
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String};
@@ -128,9 +141,8 @@ pub struct Bond {
     pub maturity_periods: u32,
     pub attestation_contract: Address,
     pub token: Address,
-pub status: BondStatus,
+    pub status: BondStatus,
     pub issued_at: u64,
-    pub issue_period: String,
 }
 
 /// Redemption record for a specific period
@@ -141,33 +153,7 @@ pub struct RedemptionRecord {
     pub period: String,
     pub attested_revenue: i128,
     pub redemption_amount: i128,
-pub redeemed_at: u64,
-}
-
-fn parse_period(env: &Env, period: String) -> u64 {
-    let bytes = period.to_bytes();
-    assert!(bytes.len() == 7, "invalid period length");
-    assert!(bytes[4] == b'-', "invalid period separator");
-    let mut year = 0u64;
-    for i in 0..4 {
-        let d = bytes[i] as u64 - b'0' as u64;
-        assert!(d <= 9, "invalid year digit");
-        year = year * 10 + d;
-    }
-    let mut month = 0u64;
-    for i in 0..2 {
-        let d = bytes[5 + i] as u64 - b'0' as u64;
-        assert!(d <= 9, "invalid month digit");
-        month = month * 10 + d;
-    }
-    assert!(month >= 1 && month <= 12, "invalid month");
-    year * 12 + month - 1
-}
-
-fn is_period_within_maturity(env: &Env, bond: &Bond, period: String) -> bool {
-    let issue_months = parse_period(env, bond.issue_period.clone());
-    let period_months = parse_period(env, period);
-    period_months >= issue_months && period_months < issue_months + (bond.maturity_periods as u64)
+    pub redeemed_at: u64,
 }
 
 #[contract]
@@ -219,7 +205,6 @@ impl RevenueBondContract {
         min_payment_per_period: i128,
         max_payment_per_period: i128,
         maturity_periods: u32,
-        issue_period: String,
         attestation_contract: Address,
         token: Address,
     ) -> u64 {
@@ -230,7 +215,6 @@ impl RevenueBondContract {
         assert!(min_payment_per_period >= 0, "min_payment_per_period must be non-negative");
         assert!(max_payment_per_period > 0, "max_payment_per_period must be positive");
         assert!(max_payment_per_period >= min_payment_per_period, "max must be >= min");
-        parse_period(&env, issue_period.clone());
         assert!(maturity_periods > 0, "maturity_periods must be positive");
         assert!(!issuer.eq(&initial_owner), "issuer and owner must differ");
 
@@ -249,7 +233,6 @@ impl RevenueBondContract {
             min_payment_per_period,
             max_payment_per_period,
             maturity_periods,
-            issue_period,
             attestation_contract: attestation_contract.clone(),
             token: token.clone(),
             status: BondStatus::Active,
@@ -290,6 +273,10 @@ impl RevenueBondContract {
     /// - Issuer must have sufficient token balance
     /// - Attestation must be valid and non-revoked
     /// - Revenue volatility affects redemption amounts
+    ///
+    /// # Security Notes
+    /// - This entrypoint is intentionally permissionless; value always routes to current owner.
+    /// - Period-level uniqueness (`Redemption(bond_id, period)`) is the double-spend boundary.
     pub fn redeem(env: Env, bond_id: u64, period: String, attested_revenue: i128) {
         let bond: Bond = env
             .storage()
@@ -298,7 +285,6 @@ impl RevenueBondContract {
             .expect("bond not found");
 
         assert_eq!(bond.status, BondStatus::Active, "bond not active");
-        assert!(is_period_within_maturity(&env, &bond, period.clone()), "period exceeds maturity");
         assert!(attested_revenue >= 0, "attested_revenue must be non-negative");
 
         // Prevent double-redemption for the same period
@@ -454,6 +440,8 @@ pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
     }
 
     /// Mark bond as matured (admin only).
+    ///
+    /// This does not transfer funds and only transitions status from `Active` -> `Matured`.
     pub fn mark_matured(env: Env, admin: Address, bond_id: u64) {
         let stored_admin: Address = env
             .storage()
@@ -500,17 +488,19 @@ pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
     }
 
     /// Get remaining face value to be redeemed.
-pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
+    ///
+    /// Returns 0 for non-active bonds to make integration behavior explicit after terminal states.
+    pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
         let bond: Bond = env
             .storage()
             .instance()
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
-        
+
         if !matches!(bond.status, BondStatus::Active) {
             return 0;
         }
-        
+
         let total_redeemed: i128 = env
             .storage()
             .instance()
