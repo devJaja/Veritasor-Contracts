@@ -11,13 +11,49 @@
 //! - Integration with attestation contract for revenue verification
 //! - Transparent and auditable pricing decisions
 //!
-//! ## Arithmetic and extreme inputs
+//! ## Arithmetic Safety and Overflow Guarantees
 //!
-//! `anomaly_score * risk_premium_bps_per_point` and `base_apr_bps + risk_premium_bps` use
-//! saturating `u64` intermediates capped at `u32::MAX` before tier discount and min/max clamp.
-//! This yields deterministic outputs under adversarial admin parameters (no silent `u32` wrap).
-//! Tier matching uses `revenue >= min_revenue` on `i128`; tiers must be strictly ascending by
-//! `min_revenue` at configuration time.
+//! All intermediate arithmetic is explicitly overflow-safe:
+//!
+//! | Expression | Type | Strategy |
+//! |---|---|---|
+//! | `anomaly_score * risk_premium_bps_per_point` | `u64` | `saturating_mul`, capped at `u32::MAX` |
+//! | `base_apr_bps + risk_premium_bps` | `u64` | `saturating_add`, capped at `u32::MAX` |
+//! | `combined - tier_discount_bps` | `u32` | `saturating_sub` |
+//! | `apr_bps` final clamp | `u32` | `.max(min_apr_bps).min(max_apr_bps)` |
+//!
+//! The `revenue` parameter is `i128` and is only compared (never multiplied or added to
+//! other values), so no overflow is possible in tier matching.
+//!
+//! ## Invariants
+//!
+//! - `min_apr_bps <= base_apr_bps <= max_apr_bps` — enforced at [`set_pricing_policy`](RevenueCurveContract::set_pricing_policy)
+//! - `max_apr_bps <= 10_000` (100 %) — enforced at [`set_pricing_policy`](RevenueCurveContract::set_pricing_policy)
+//! - `risk_premium_bps_per_point <= 1_000` — enforced at [`set_pricing_policy`](RevenueCurveContract::set_pricing_policy)
+//! - Revenue tiers are strictly ascending by `min_revenue` — enforced at [`set_revenue_tiers`](RevenueCurveContract::set_revenue_tiers)
+//! - `tier.discount_bps <= 10_000` for every tier — enforced at [`set_revenue_tiers`](RevenueCurveContract::set_revenue_tiers)
+//! - `anomaly_score <= 100` — enforced at every public pricing entrypoint
+//!
+//! ## Failure Modes
+//!
+//! | Condition | Panic message |
+//! |---|---|
+//! | Contract not initialized | `"not initialized"` |
+//! | Double initialization | `"already initialized"` |
+//! | Caller is not admin | `"caller is not admin"` |
+//! | `min_apr > max_apr` | `"min_apr must be <= max_apr"` |
+//! | `base_apr` outside `[min, max]` | `"base_apr must be within [min_apr, max_apr]"` |
+//! | `max_apr > 10_000` | `"max_apr cannot exceed 10000 bps (100%)"` |
+//! | `risk_premium_bps_per_point > 1_000` | `"risk premium per point cannot exceed 1000 bps"` |
+//! | Tiers not sorted ascending | `"tiers must be sorted by min_revenue ascending"` |
+//! | `tier.discount_bps > 10_000` | `"discount cannot exceed 100%"` |
+//! | More than 20 tiers | `"maximum of 20 tiers allowed"` |
+//! | `anomaly_score > 100` | `"anomaly_score must be <= 100"` |
+//! | Pricing policy not set | `"pricing policy not configured"` |
+//! | Policy disabled | `"pricing policy is disabled"` |
+//! | Attestation contract not set | `"attestation contract not set"` |
+//! | Attestation missing | `"attestation not found"` |
+//! | Attestation revoked | `"attestation is revoked"` |
 
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
@@ -137,14 +173,27 @@ impl RevenueCurveContract {
     ///
     /// # Parameters
     /// - `admin`: Admin address (must authorize)
-    /// - `policy`: Pricing policy configuration
+    /// - `policy`: New pricing policy to store
+    ///
+    /// # Invariants enforced
+    /// - `min_apr_bps <= max_apr_bps`
+    /// - `min_apr_bps <= base_apr_bps <= max_apr_bps`
+    /// - `max_apr_bps <= 10_000` (100 %)
+    /// - `risk_premium_bps_per_point <= 1_000`
     ///
     /// # Panics
-    /// - If caller is not admin
-    /// - If min_apr > max_apr
-    /// - If base_apr is outside [min_apr, max_apr]
+    /// - `"caller is not admin"` — if `admin` is not the stored admin
+    /// - `"min_apr must be <= max_apr"` — if `min_apr_bps > max_apr_bps`
+    /// - `"base_apr must be within [min_apr, max_apr]"` — if `base_apr_bps` is out of range
+    /// - `"max_apr cannot exceed 10000 bps (100%)"` — if `max_apr_bps > 10_000`
+    /// - `"risk premium per point cannot exceed 1000 bps"` — if `risk_premium_bps_per_point > 1_000`
     pub fn set_pricing_policy(env: Env, admin: Address, policy: PricingPolicy) {
         Self::require_admin(&env, &admin);
+        // Validate max_apr first so the subsequent range checks are meaningful.
+        assert!(
+            policy.max_apr_bps <= 10_000,
+            "max_apr cannot exceed 10000 bps (100%)"
+        );
         assert!(
             policy.min_apr_bps <= policy.max_apr_bps,
             "min_apr must be <= max_apr"
@@ -154,11 +203,7 @@ impl RevenueCurveContract {
             "base_apr must be within [min_apr, max_apr]"
         );
         assert!(
-            policy.max_apr_bps <= 10000,
-            "max_apr cannot exceed 10000 bps (100%)"
-        );
-        assert!(
-            policy.risk_premium_bps_per_point <= 1000,
+            policy.risk_premium_bps_per_point <= 1_000,
             "risk premium per point cannot exceed 1000 bps"
         );
         env.storage()
@@ -168,30 +213,41 @@ impl RevenueCurveContract {
 
     /// Set revenue tier thresholds and discounts.
     ///
+    /// Tiers define revenue-based APR discounts. The highest-indexed tier whose
+    /// `min_revenue` is `<= revenue` wins (last-match semantics on sorted input).
+    ///
     /// # Parameters
     /// - `admin`: Admin address (must authorize)
-    /// - `tiers`: Vector of revenue tiers (must be sorted by min_revenue ascending)
+    /// - `tiers`: Vector of revenue tiers, **must be sorted by `min_revenue` strictly ascending**
+    ///
+    /// # Bounds
+    /// - Maximum 20 tiers
+    /// - `min_revenue` values must be strictly ascending (negative values are allowed to
+    ///   support businesses with net-loss periods)
+    /// - `discount_bps <= 10_000` per tier
     ///
     /// # Panics
-    /// - If caller is not admin
-    /// - If tiers are not sorted by min_revenue
-    /// - If any discount exceeds 10000 bps (100%)
+    /// - `"caller is not admin"` — if `admin` is not the stored admin
+    /// - `"maximum of 20 tiers allowed"` — if `tiers.len() > 20`
+    /// - `"tiers must be sorted by min_revenue ascending"` — if not strictly ascending
+    /// - `"discount cannot exceed 100%"` — if any `discount_bps > 10_000`
     pub fn set_revenue_tiers(env: Env, admin: Address, tiers: Vec<RevenueTier>) {
         Self::require_admin(&env, &admin);
 
         assert!(tiers.len() <= 20, "maximum of 20 tiers allowed");
 
-        // Validate tiers are sorted and discounts are reasonable
+        // Validate tiers are strictly ascending and discounts are in range.
+        // Negative min_revenue is intentionally allowed: a business may have net-loss
+        // periods and still qualify for a tier discount.
         let mut prev_revenue: Option<i128> = None;
         for tier in tiers.iter() {
-            assert!(tier.min_revenue >= 0, "min_revenue cannot be negative");
             if let Some(prev) = prev_revenue {
                 assert!(
                     tier.min_revenue > prev,
                     "tiers must be sorted by min_revenue ascending"
                 );
             }
-            assert!(tier.discount_bps <= 10000, "discount cannot exceed 100%");
+            assert!(tier.discount_bps <= 10_000, "discount cannot exceed 100%");
             prev_revenue = Some(tier.min_revenue);
         }
 
@@ -200,21 +256,26 @@ impl RevenueCurveContract {
 
     /// Calculate pricing for a business based on revenue and risk metrics.
     ///
+    /// Verifies the attestation exists and is not revoked before computing the APR.
+    ///
     /// # Parameters
-    /// - `business`: Business address
-    /// - `period`: Revenue period (e.g., "2026-Q1")
-    /// - `revenue`: Revenue amount (must match attested value)
-    /// - `anomaly_score`: Risk score (0-100, where 0 is lowest risk)
+    /// - `business`: Business address whose attestation is verified
+    /// - `period`: Revenue period identifier (e.g., `"2026-Q1"`)
+    /// - `revenue`: Revenue amount in token smallest units (`i128`; negative values are valid
+    ///   for net-loss periods and will match tiers with negative `min_revenue`)
+    /// - `anomaly_score`: Risk score in `[0, 100]` — higher means riskier
     ///
     /// # Returns
-    /// `PricingOutput` with calculated APR and breakdown. Risk and sum-of-components use
-    /// saturating arithmetic (see module docs).
+    /// [`PricingOutput`] with the final `apr_bps` and a full breakdown. All intermediate
+    /// arithmetic uses saturating operations (see module-level docs).
     ///
     /// # Panics
-    /// - If pricing policy not configured
-    /// - If attestation contract not set
-    /// - If attestation not found or revoked
-    /// - If anomaly_score > 100
+    /// - `"anomaly_score must be <= 100"` — if `anomaly_score > 100`
+    /// - `"pricing policy not configured"` — if [`set_pricing_policy`](Self::set_pricing_policy) was never called
+    /// - `"pricing policy is disabled"` — if `policy.enabled == false`
+    /// - `"attestation contract not set"` — if [`set_attestation_contract`](Self::set_attestation_contract) was never called
+    /// - `"attestation not found"` — if no attestation exists for `(business, period)`
+    /// - `"attestation is revoked"` — if the attestation has been revoked
     pub fn calculate_pricing(
         env: Env,
         business: Address,
@@ -252,16 +313,21 @@ impl RevenueCurveContract {
 
     /// Get a pricing quote without attestation verification (for estimation).
     ///
+    /// Useful for off-chain tooling and UI previews. Does **not** verify that an
+    /// attestation exists or is non-revoked.
+    ///
     /// # Parameters
-    /// - `revenue`: Revenue amount
-    /// - `anomaly_score`: Risk score (0-100)
+    /// - `revenue`: Revenue amount (`i128`; negative values are valid)
+    /// - `anomaly_score`: Risk score in `[0, 100]`
     ///
     /// # Returns
-    /// `PricingOutput` with calculated APR and breakdown (same saturating rules as [`calculate_pricing`]).
+    /// [`PricingOutput`] with the same saturating arithmetic guarantees as
+    /// [`calculate_pricing`](Self::calculate_pricing).
     ///
     /// # Panics
-    /// - If pricing policy not configured
-    /// - If anomaly_score > 100
+    /// - `"anomaly_score must be <= 100"` — if `anomaly_score > 100`
+    /// - `"pricing policy not configured"` — if no policy has been set
+    /// - `"pricing policy is disabled"` — if `policy.enabled == false`
     pub fn get_pricing_quote(env: Env, revenue: i128, anomaly_score: u32) -> PricingOutput {
         assert!(anomaly_score <= 100, "anomaly_score must be <= 100");
 
@@ -301,14 +367,25 @@ impl RevenueCurveContract {
 
     // ── Internal helpers ────────────────────────────────────────────
 
-    /// `anomaly_score * risk_premium_bps_per_point`, saturated at `u32::MAX` (no wrap).
+    /// Compute `anomaly_score × risk_premium_bps_per_point` without overflow.
+    ///
+    /// Both operands are widened to `u64` before multiplication. The product is
+    /// capped at `u32::MAX` (4 294 967 295) so the result always fits in a `u32`.
+    /// This prevents silent wrapping when an admin sets an extreme
+    /// `risk_premium_bps_per_point` value.
     fn scaled_risk_premium_bps(anomaly_score: u32, risk_premium_bps_per_point: u32) -> u32 {
         (anomaly_score as u64)
             .saturating_mul(risk_premium_bps_per_point as u64)
             .min(u32::MAX as u64) as u32
     }
 
-    /// `base_apr_bps + risk_premium_bps` via `u64`, capped at `u32::MAX` before discount and clamp.
+    /// Assemble the final [`PricingOutput`] from policy and computed components.
+    ///
+    /// # Overflow safety
+    /// 1. `base_apr_bps + risk_premium_bps` — widened to `u64`, `saturating_add`, then
+    ///    capped at `u32::MAX` before being cast back to `u32`.
+    /// 2. `combined - tier_discount_bps` — `saturating_sub` (floors at 0).
+    /// 3. Final `apr_bps` — clamped to `[min_apr_bps, max_apr_bps]`.
     fn assemble_pricing_output(
         policy: &PricingPolicy,
         risk_premium_bps: u32,

@@ -620,44 +620,38 @@ fn submit_test_attestation(
         &1u32,
         &None,
         &None,
-        &0u64,
     );
 }
 
 #[test]
+#[should_panic(expected = "risk premium per point cannot exceed 1000 bps")]
 fn test_stress_quote_risk_product_saturates_u32_max_then_clamps_to_max_apr() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, client, _, _) = setup(&env);
 
+    // risk_premium_bps_per_point = u32::MAX violates the 1000 bps cap.
+    // This test verifies the guard fires before any arithmetic is attempted.
     let mut policy = create_default_policy();
     policy.risk_premium_bps_per_point = u32::MAX;
     client.set_pricing_policy(&admin, &policy);
-
-    let out = client.get_pricing_quote(&0i128, &100u32);
-    assert_eq!(out.risk_premium_bps, u32::MAX);
-    assert_eq!(out.apr_bps, policy.max_apr_bps);
-    assert!(out.apr_bps <= policy.max_apr_bps);
-    assert!(out.apr_bps >= policy.min_apr_bps);
 }
 
 #[test]
+#[should_panic(expected = "max_apr cannot exceed 10000 bps (100%)")]
 fn test_stress_quote_base_plus_risk_saturates_before_discount() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, client, _, _) = setup(&env);
 
+    // max_apr_bps = u32::MAX violates the 10 000 bps cap.
+    // This test verifies the guard fires before any arithmetic is attempted.
     let mut policy = create_default_policy();
     policy.base_apr_bps = u32::MAX;
     policy.min_apr_bps = 300;
     policy.max_apr_bps = u32::MAX;
     policy.risk_premium_bps_per_point = 1;
     client.set_pricing_policy(&admin, &policy);
-
-    let out = client.get_pricing_quote(&0i128, &100u32);
-    assert_eq!(out.risk_premium_bps, 100);
-    // combined caps at u32::MAX; discount 0; clamp max = u32::MAX
-    assert_eq!(out.apr_bps, u32::MAX);
 }
 
 #[test]
@@ -897,4 +891,577 @@ fn test_stress_calculate_pricing_matches_quote_when_attestation_ok() {
     assert_eq!(c.risk_premium_bps, q.risk_premium_bps);
     assert_eq!(c.tier_discount_bps, q.tier_discount_bps);
     assert_eq!(c.tier_level, q.tier_level);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Numerical safety bounds — new tests
+// ════════════════════════════════════════════════════════════════════
+
+// ── set_pricing_policy bounds ────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "max_apr cannot exceed 10000 bps (100%)")]
+fn test_bounds_max_apr_exactly_10001_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 5000,
+            min_apr_bps: 0,
+            max_apr_bps: 10_001,
+            risk_premium_bps_per_point: 0,
+            enabled: true,
+        },
+    );
+}
+
+#[test]
+fn test_bounds_max_apr_exactly_10000_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 10_000,
+            min_apr_bps: 0,
+            max_apr_bps: 10_000,
+            risk_premium_bps_per_point: 0,
+            enabled: true,
+        },
+    );
+    let stored = client.get_pricing_policy().unwrap();
+    assert_eq!(stored.max_apr_bps, 10_000);
+}
+
+#[test]
+#[should_panic(expected = "risk premium per point cannot exceed 1000 bps")]
+fn test_bounds_risk_premium_1001_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 500,
+            min_apr_bps: 0,
+            max_apr_bps: 5000,
+            risk_premium_bps_per_point: 1_001,
+            enabled: true,
+        },
+    );
+}
+
+#[test]
+fn test_bounds_risk_premium_exactly_1000_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 500,
+            min_apr_bps: 0,
+            max_apr_bps: 5000,
+            risk_premium_bps_per_point: 1_000,
+            enabled: true,
+        },
+    );
+    let stored = client.get_pricing_policy().unwrap();
+    assert_eq!(stored.risk_premium_bps_per_point, 1_000);
+}
+
+#[test]
+#[should_panic(expected = "base_apr must be within [min_apr, max_apr]")]
+fn test_bounds_base_apr_below_min_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    // base_apr_bps = 99 < min_apr_bps = 100
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 99,
+            min_apr_bps: 100,
+            max_apr_bps: 5000,
+            risk_premium_bps_per_point: 0,
+            enabled: true,
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "base_apr must be within [min_apr, max_apr]")]
+fn test_bounds_base_apr_above_max_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    // base_apr_bps = 5001 > max_apr_bps = 5000
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 5001,
+            min_apr_bps: 100,
+            max_apr_bps: 5000,
+            risk_premium_bps_per_point: 0,
+            enabled: true,
+        },
+    );
+}
+
+#[test]
+fn test_bounds_all_apr_equal_is_valid() {
+    // min == base == max is a degenerate but valid policy (fixed rate).
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 500,
+            min_apr_bps: 500,
+            max_apr_bps: 500,
+            risk_premium_bps_per_point: 0,
+            enabled: true,
+        },
+    );
+    // Any anomaly score must still yield exactly 500 bps.
+    let out = client.get_pricing_quote(&0i128, &100u32);
+    assert_eq!(out.apr_bps, 500);
+}
+
+#[test]
+fn test_bounds_zero_policy_all_zeros() {
+    // All-zero policy: min=base=max=0, risk=0 → apr always 0.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 0,
+            min_apr_bps: 0,
+            max_apr_bps: 0,
+            risk_premium_bps_per_point: 0,
+            enabled: true,
+        },
+    );
+    let out = client.get_pricing_quote(&i128::MAX, &100u32);
+    assert_eq!(out.apr_bps, 0);
+    assert_eq!(out.risk_premium_bps, 0);
+}
+
+// ── set_revenue_tiers bounds ─────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "maximum of 20 tiers allowed")]
+fn test_bounds_21_tiers_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let mut tiers = Vec::new(&env);
+    for i in 0u32..21 {
+        tiers.push_back(RevenueTier {
+            min_revenue: i as i128 * 1_000,
+            discount_bps: 10,
+        });
+    }
+    client.set_revenue_tiers(&admin, &tiers);
+}
+
+#[test]
+fn test_bounds_exactly_20_tiers_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let mut tiers = Vec::new(&env);
+    for i in 0u32..20 {
+        tiers.push_back(RevenueTier {
+            min_revenue: i as i128 * 1_000,
+            discount_bps: 10,
+        });
+    }
+    client.set_revenue_tiers(&admin, &tiers);
+    assert_eq!(client.get_revenue_tiers().unwrap().len(), 20);
+}
+
+#[test]
+#[should_panic(expected = "tiers must be sorted by min_revenue ascending")]
+fn test_bounds_duplicate_min_revenue_rejected() {
+    // Strictly ascending means equal values are also rejected.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 100_000, discount_bps: 50 },
+        RevenueTier { min_revenue: 100_000, discount_bps: 100 }, // duplicate
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+}
+
+#[test]
+#[should_panic(expected = "discount cannot exceed 100%")]
+fn test_bounds_discount_exactly_10001_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 0, discount_bps: 10_001 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+}
+
+#[test]
+fn test_bounds_discount_exactly_10000_accepted() {
+    // 10 000 bps = 100 % discount → apr floors at min_apr.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 0, discount_bps: 10_000 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+
+    let out = client.get_pricing_quote(&1i128, &0u32);
+    // 1000 - 10000 saturates to 0, then clamped up to min_apr (300).
+    assert_eq!(out.apr_bps, 300);
+}
+
+#[test]
+fn test_bounds_empty_tiers_accepted_no_discount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = Vec::new(&env);
+    client.set_revenue_tiers(&admin, &tiers);
+
+    let out = client.get_pricing_quote(&1_000_000i128, &0u32);
+    assert_eq!(out.tier_level, 0);
+    assert_eq!(out.tier_discount_bps, 0);
+    assert_eq!(out.apr_bps, 1000);
+}
+
+// ── i128 edge cases ───────────────────────────────────────────────
+
+#[test]
+fn test_bounds_i128_min_revenue_no_tier_match_with_positive_threshold() {
+    // i128::MIN revenue should not match a tier with min_revenue = 0.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 0, discount_bps: 200 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+
+    let out = client.get_pricing_quote(&i128::MIN, &0u32);
+    // i128::MIN < 0, so it does not satisfy revenue >= 0.
+    assert_eq!(out.tier_level, 0);
+    assert_eq!(out.tier_discount_bps, 0);
+    assert_eq!(out.apr_bps, 1000);
+}
+
+#[test]
+fn test_bounds_i128_max_revenue_matches_all_tiers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 0, discount_bps: 50 },
+        RevenueTier { min_revenue: 1_000_000, discount_bps: 150 },
+        RevenueTier { min_revenue: i128::MAX, discount_bps: 300 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+
+    let out = client.get_pricing_quote(&i128::MAX, &0u32);
+    assert_eq!(out.tier_level, 3);
+    assert_eq!(out.tier_discount_bps, 300);
+    assert_eq!(out.apr_bps, 700); // 1000 - 300
+}
+
+#[test]
+fn test_bounds_revenue_exactly_at_tier_boundary() {
+    // revenue == min_revenue should qualify (inclusive lower bound).
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 500_000, discount_bps: 200 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+
+    let at_boundary = client.get_pricing_quote(&500_000i128, &0u32);
+    assert_eq!(at_boundary.tier_level, 1);
+    assert_eq!(at_boundary.tier_discount_bps, 200);
+
+    let just_below = client.get_pricing_quote(&499_999i128, &0u32);
+    assert_eq!(just_below.tier_level, 0);
+    assert_eq!(just_below.tier_discount_bps, 0);
+}
+
+// ── Division-by-zero guard (no division in pricing path) ─────────
+
+#[test]
+fn test_bounds_no_division_zero_anomaly_zero_risk_multiplier() {
+    // Ensures the pricing path is safe when both anomaly and multiplier are 0.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    let mut policy = create_default_policy();
+    policy.risk_premium_bps_per_point = 0;
+    client.set_pricing_policy(&admin, &policy);
+
+    let out = client.get_pricing_quote(&0i128, &0u32);
+    assert_eq!(out.risk_premium_bps, 0);
+    assert_eq!(out.apr_bps, 1000);
+}
+
+// ── Negative input guards ─────────────────────────────────────────
+
+#[test]
+fn test_bounds_negative_revenue_no_tier_match_positive_thresholds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 1, discount_bps: 100 },
+        RevenueTier { min_revenue: 100_000, discount_bps: 300 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+
+    // Negative revenue must not match any positive-threshold tier.
+    let out = client.get_pricing_quote(&-1i128, &0u32);
+    assert_eq!(out.tier_level, 0);
+    assert_eq!(out.tier_discount_bps, 0);
+    assert_eq!(out.apr_bps, 1000);
+}
+
+#[test]
+fn test_bounds_negative_revenue_matches_negative_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: -1_000_000, discount_bps: 100 },
+        RevenueTier { min_revenue: 0, discount_bps: 200 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+
+    // -500_000 >= -1_000_000 but < 0, so only tier 1 matches.
+    let out = client.get_pricing_quote(&-500_000i128, &0u32);
+    assert_eq!(out.tier_level, 1);
+    assert_eq!(out.tier_discount_bps, 100);
+    assert_eq!(out.apr_bps, 900);
+}
+
+// ── Authorization guards ──────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_bounds_non_admin_cannot_set_policy() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client, _, _) = setup(&env);
+    let impostor = Address::generate(&env);
+    client.set_pricing_policy(&impostor, &create_default_policy());
+}
+
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_bounds_non_admin_cannot_set_tiers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client, _, _) = setup(&env);
+    let impostor = Address::generate(&env);
+    client.set_revenue_tiers(&impostor, &Vec::new(&env));
+}
+
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_bounds_non_admin_cannot_set_attestation_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client, _, attestation_id) = setup(&env);
+    let impostor = Address::generate(&env);
+    client.set_attestation_contract(&impostor, &attestation_id);
+}
+
+// ── Pricing entrypoint guards ─────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "pricing policy not configured")]
+fn test_bounds_quote_without_policy_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Fresh contract — no policy set.
+    let contract_id = env.register(RevenueCurveContract, ());
+    let client = RevenueCurveContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    client.get_pricing_quote(&100_000i128, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "attestation contract not set")]
+fn test_bounds_calculate_pricing_without_attestation_contract_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Fresh contract — no attestation contract linked.
+    let contract_id = env.register(RevenueCurveContract, ());
+    let client = RevenueCurveContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    client.set_pricing_policy(&admin, &create_default_policy());
+    // No set_attestation_contract call.
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-Q1");
+    client.calculate_pricing(&business, &period, &100_000i128, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "anomaly_score must be <= 100")]
+fn test_bounds_anomaly_score_u32_max_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+    client.get_pricing_quote(&0i128, &u32::MAX);
+}
+
+// ── Arithmetic correctness spot-checks ───────────────────────────
+
+#[test]
+fn test_bounds_risk_premium_max_valid_product() {
+    // anomaly=100, risk_per_point=1000 → product = 100_000 bps.
+    // Combined = 1000 + 100_000 = 101_000, clamped to max_apr (10_000).
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 1000,
+            min_apr_bps: 300,
+            max_apr_bps: 10_000,
+            risk_premium_bps_per_point: 1_000,
+            enabled: true,
+        },
+    );
+    let out = client.get_pricing_quote(&0i128, &100u32);
+    // risk_premium = 100 * 1000 = 100_000 (fits in u32, no saturation needed here)
+    assert_eq!(out.risk_premium_bps, 100_000);
+    // combined = 1000 + 100_000 = 101_000, clamped to max_apr = 10_000
+    assert_eq!(out.apr_bps, 10_000);
+}
+
+#[test]
+fn test_bounds_tier_discount_exactly_equals_combined_apr() {
+    // discount == combined → saturating_sub gives 0 → clamped up to min_apr.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 1000,
+            min_apr_bps: 200,
+            max_apr_bps: 5000,
+            risk_premium_bps_per_point: 0,
+            enabled: true,
+        },
+    );
+    // discount = 1000 exactly cancels base_apr.
+    let tiers = vec![
+        &env,
+        RevenueTier { min_revenue: 0, discount_bps: 1000 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers);
+
+    let out = client.get_pricing_quote(&1i128, &0u32);
+    // 1000 - 1000 = 0, clamped up to min_apr = 200.
+    assert_eq!(out.apr_bps, 200);
+}
+
+#[test]
+fn test_bounds_policy_update_replaces_previous() {
+    // Verify that a second set_pricing_policy call fully replaces the first.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+
+    client.set_pricing_policy(&admin, &create_default_policy());
+    let first = client.get_pricing_policy().unwrap();
+    assert_eq!(first.base_apr_bps, 1000);
+
+    client.set_pricing_policy(
+        &admin,
+        &PricingPolicy {
+            base_apr_bps: 500,
+            min_apr_bps: 100,
+            max_apr_bps: 2000,
+            risk_premium_bps_per_point: 5,
+            enabled: true,
+        },
+    );
+    let second = client.get_pricing_policy().unwrap();
+    assert_eq!(second.base_apr_bps, 500);
+    assert_eq!(second.risk_premium_bps_per_point, 5);
+}
+
+#[test]
+fn test_bounds_tiers_update_replaces_previous() {
+    // Verify that a second set_revenue_tiers call fully replaces the first.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+    client.set_pricing_policy(&admin, &create_default_policy());
+
+    let tiers_v1 = vec![
+        &env,
+        RevenueTier { min_revenue: 100_000, discount_bps: 50 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers_v1);
+    assert_eq!(client.get_revenue_tiers().unwrap().len(), 1);
+
+    let tiers_v2 = vec![
+        &env,
+        RevenueTier { min_revenue: 50_000, discount_bps: 25 },
+        RevenueTier { min_revenue: 200_000, discount_bps: 75 },
+    ];
+    client.set_revenue_tiers(&admin, &tiers_v2);
+    let stored = client.get_revenue_tiers().unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored.get(0).unwrap().min_revenue, 50_000);
 }
