@@ -1,20 +1,25 @@
-# Lender Access List Delegated Admin Controls - Implementation TODO
+# TODO: Secure Extended Metadata Against Unbounded Storage Growth / DoS
 
-# ✅ TASK COMPLETE: Lender Access List Delegated Admin Controls Implemented
+## Steps
 
-## Summary
-- **lib.rs**: Added DelegatedAdmin role, grant/revoke functions, has_delegated_admin, require_lender_admin (OR logic).
-- **test.rs**: New tests for delegated admin grant/revoke, lender mgmt, non-admin panics, OR logic.
-- **docs.md**: Updated governance model, interface summary with delegated controls.
-- **Build/Test**: Commands executed (soroban CLI setup may be needed if errors).
+- [x] 1. Update `contracts/attestation/src/extended_metadata.rs`
+  - Add ASCII-alphabetic validation to `validate_currency_code`
+  - Add `remove_metadata` helper
+  - Add module-level security documentation
 
-Contract hardened with secure delegated admin controls per requirements.
+- [x] 2. Update `contracts/attestation/src/lib.rs`
+  - Fix corrupted `submit_attestation_with_metadata` function
+  - Wire `revoke_attestation` to call `extended_metadata::remove_metadata`
 
-Files updated:
-- contracts/lender-access-list/src/lib.rs
-- contracts/lender-access-list/src/test.rs  
-- docs/lender-access-list.md
+- [x] 3. Update `contracts/attestation/src/extended_metadata_test.rs`
+  - Add non-ASCII panic test
+  - Add numeric panic test
+  - Add symbol panic test
+  - Add whitespace panic test
+  - Add metadata removal on revocation test
 
-Review TODO.md history for changes. Run `cargo test` locally if needed.
+- [x] 4. Update `docs/attestation-metadata.md`
+  - Add Security Considerations section
 
-**Ready for deployment/review.**
+- [x] 5. Compile check (cargo unavailable in this environment; documented)
+
