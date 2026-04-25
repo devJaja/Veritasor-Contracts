@@ -26,6 +26,15 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 
+/// Maximum UTF-8 byte length for period/epoch identifiers.
+pub const MAX_PERIOD_BYTES: u32 = 128;
+
+/// Maximum indexed periods per business.
+pub const MAX_BUSINESS_PERIODS: u32 = 512;
+
+/// Maximum indexed businesses per epoch.
+pub const MAX_EPOCH_BUSINESSES: u32 = 512;
+
 /// Attestation contract client: WASM import for wasm32 (avoids duplicate symbols), crate for tests.
 #[cfg(target_arch = "wasm32")]
 mod attestation_import {
@@ -205,6 +214,7 @@ impl AttestationSnapshotContract {
         attestation_count: u64,
     ) {
         Self::require_admin_or_writer(&env, &caller);
+        Self::assert_period_within_limit(&period);
         assert!(
             !Self::has_epoch_finalization(&env, &period),
             "epoch already finalized"
@@ -248,6 +258,7 @@ impl AttestationSnapshotContract {
     /// freezes all future writes for that epoch. At least one snapshot must exist.
     pub fn finalize_epoch(env: Env, caller: Address, epoch: String) {
         Self::require_admin(&env, &caller);
+        Self::assert_period_within_limit(&epoch);
         assert!(
             !Self::has_epoch_finalization(&env, &epoch),
             "epoch already finalized"
@@ -328,6 +339,21 @@ impl AttestationSnapshotContract {
         env.storage().instance().get(&DataKey::AttestationContract)
     }
 
+    /// Return the maximum UTF-8 byte length accepted for period/epoch strings.
+    pub fn get_max_period_bytes(_env: Env) -> u32 {
+        MAX_PERIOD_BYTES
+    }
+
+    /// Return the maximum number of indexed periods stored per business.
+    pub fn get_max_business_periods(_env: Env) -> u32 {
+        MAX_BUSINESS_PERIODS
+    }
+
+    /// Return the maximum number of indexed businesses stored per epoch.
+    pub fn get_max_epoch_businesses(_env: Env) -> u32 {
+        MAX_EPOCH_BUSINESSES
+    }
+
     // ── Internal ────────────────────────────────────────────────────
 
     fn require_admin(env: &Env, caller: &Address) {
@@ -385,6 +411,11 @@ impl AttestationSnapshotContract {
             }
         }
 
+        assert!(
+            periods.len() < MAX_BUSINESS_PERIODS,
+            "business period index limit reached"
+        );
+
         periods.push_back(period.clone());
         env.storage().instance().set(&key, &periods);
     }
@@ -403,7 +434,16 @@ impl AttestationSnapshotContract {
             }
         }
 
+        assert!(
+            businesses.len() < MAX_EPOCH_BUSINESSES,
+            "epoch business index limit reached"
+        );
+
         businesses.push_back(business.clone());
         env.storage().instance().set(&key, &businesses);
+    }
+
+    fn assert_period_within_limit(period: &String) {
+        assert!(period.len() <= MAX_PERIOD_BYTES, "period exceeds max bytes");
     }
 }

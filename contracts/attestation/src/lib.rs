@@ -572,6 +572,16 @@ impl AttestationContract {
     /// and version while preserving the audit trail. The existing proof hash
     /// is preserved — proof hashes cannot be modified without explicit migration.
     pub fn migrate_attestation(
+        _env: Env,
+        _caller: Address,
+        _business: Address,
+        _period: String,
+        _new_root: BytesN<32>,
+        _new_version: u32,
+    ) {
+        panic!("migrate_attestation stub: not implemented");
+    }
+
     // ── New: Multi-Period Attestation Methods ───────────────────────
 
     /// Submit a multi-period revenue attestation.
@@ -630,9 +640,6 @@ impl AttestationContract {
             fee_paid,
             proof_hash,
             expiry_timestamp,
-        );
-        env.storage().instance().set(&key, &data);
-            revoked: false,
         });
 
         env.storage().instance().set(&key, &ranges);
@@ -863,7 +870,6 @@ impl AttestationContract {
     ///
     /// # Returns
     /// Vector of tuples containing (period, attestation_data, revocation_info)
-    pub fn get_business_attestations(
     pub fn revoke_multi_period_attestation(
         env: Env,
         business: Address,
@@ -894,6 +900,9 @@ impl AttestationContract {
             panic!("attestation root not found");
         }
 
+        env.storage().instance().set(&key, &updated_ranges);
+    }
+
     /// Return the current flat fee configuration, or None if not set.
     ///
     /// # Returns
@@ -906,7 +915,6 @@ impl AttestationContract {
     /// Calculate the fee a business would pay for its next attestation.
     pub fn get_fee_quote(env: Env, business: Address) -> i128 {
         dynamic_fees::calculate_fee(&env, &business)
-        env.storage().instance().set(&key, &updated_ranges);
     }
 
 
