@@ -102,6 +102,31 @@ fn set_voting_config_by_non_admin_panics() {
 }
 
 #[test]
+#[should_panic(expected = "min_votes exceeds maximum allowed value")]
+fn create_gov_config_proposal_with_invalid_min_votes_panics() {
+    let (env, client, _admin, gov_token) = setup_with_token(1, 100);
+    let voter = Address::generate(&env);
+    mint(&env, &gov_token, &voter, 100);
+
+    client.create_gov_config_proposal(&voter, &(MAX_MIN_VOTES + 1), &100);
+}
+
+#[test]
+fn create_gov_config_proposal_with_zero_values_uses_defaults() {
+    let (env, client, admin, gov_token) = setup_with_token(1, 100);
+    let voter = Address::generate(&env);
+    mint(&env, &gov_token, &voter, 100);
+
+    let proposal_id = client.create_gov_config_proposal(&voter, &0, &0);
+    client.vote_for(&voter, &proposal_id);
+    client.execute_proposal(&admin, &proposal_id);
+
+    let (_, _, min_votes, duration) = client.get_config();
+    assert_eq!(min_votes, DEFAULT_MIN_VOTES);
+    assert_eq!(duration, DEFAULT_PROPOSAL_DURATION);
+}
+
+#[test]
 fn create_and_execute_fee_config_proposal() {
     let (env, client, admin, gov_token) = setup_with_token(1, 100);
 

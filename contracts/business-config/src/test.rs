@@ -2,8 +2,8 @@
 
 use crate::{
     AnchorConfig, AnomalyPolicy, BusinessConfig, BusinessConfigContract,
-    BusinessConfigContractClient, ComplianceConfig, CustomFeeConfig, ExpiryConfig,
-    IntegrationRequirements,
+    BusinessConfigContractClient, ConfigKey, BUSINESS_CONFIG_SCHEMA_VERSION,
+    ComplianceConfig, CustomFeeConfig, ExpiryConfig, IntegrationRequirements,
 };
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol, Vec};
 
@@ -93,6 +93,57 @@ fn test_global_defaults_set_on_init() {
     assert_eq!(defaults.anomaly_policy.alert_threshold, 70);
     assert_eq!(defaults.anomaly_policy.block_threshold, 90);
     assert_eq!(defaults.expiry.default_expiry_seconds, 31536000);
+}
+
+#[test]
+fn test_get_schema_version() {
+    let (env, admin, client) = create_test_env();
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+    assert_eq!(client.get_schema_version(), BUSINESS_CONFIG_SCHEMA_VERSION);
+}
+
+#[test]
+fn test_get_config_returns_safe_defaults_before_initialize() {
+    let (env, _admin, client) = create_test_env();
+    env.mock_all_auths();
+
+    let business = Address::generate(&env);
+    let config = client.get_config(&business);
+
+    assert_eq!(config.schema_version, BUSINESS_CONFIG_SCHEMA_VERSION);
+    assert_eq!(config.version, 0);
+    assert_eq!(config.anomaly_policy.alert_threshold, 70);
+    assert_eq!(config.expiry.default_expiry_seconds, 31536000);
+}
+
+#[test]
+#[should_panic(expected = "unsupported business config schema version")]
+fn test_rejects_unsupported_stored_schema_version() {
+    let (env, admin, client) = create_test_env();
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let business = Address::generate(&env);
+    let invalid_config = BusinessConfig {
+        business: business.clone(),
+        schema_version: BUSINESS_CONFIG_SCHEMA_VERSION + 1,
+        anomaly_policy: create_default_anomaly_policy(),
+        integrations: create_default_integrations(&env),
+        expiry: create_default_expiry(),
+        custom_fees: create_default_custom_fees(),
+        compliance: create_default_compliance(&env),
+        version: 1,
+        created_at: env.ledger().timestamp(),
+        updated_at: env.ledger().timestamp(),
+    };
+
+    env.storage()
+        .instance()
+        .set(&ConfigKey::BusinessConfig(business.clone()), &invalid_config);
+
+    client.get_config(&business);
 }
 
 // ════════════════════════════════════════════════════════════════════

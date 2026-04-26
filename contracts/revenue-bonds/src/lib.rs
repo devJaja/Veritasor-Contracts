@@ -1,21 +1,28 @@
 //! # Revenue-Backed Bond Contract
 //!
 //! Issues tokenized bonds whose repayment profiles are tied to attested business revenue.
-//! Bonds are issued with configurable terms, ownership is tracked on-chain, and redemptions
-//! are processed based on verified revenue attestations.
 //!
-//! ## Key Features
-//! - Bond issuance with flexible terms (fixed, revenue-linked, or hybrid structures)
-//! - Ownership tracking and transferability
-//! - Revenue-based redemption schedules tied to attestations
-//! - Double-spending prevention via redemption tracking
-//! - Support for partial and early redemptions
-//! - Default handling and risk management
+//! ## Security Invariants
+//!
+//! 1. **No double-spend per period**: each `(bond_id, period)` pair can be redeemed at most once.
+//! 2. **Per-period cap**: `actual_redemption <= max_payment_per_period` always holds, even after
+//!    the face-value clamp.
+//! 3. **Cumulative face-value cap**: `total_redeemed` never exceeds `face_value`.
+//! 4. **Issuer authorization**: the bond issuer must authorize every `redeem` call.
+//! 5. **Attestation integrity**: `attested_revenue` is read from the attestation contract —
+//!    callers cannot supply an arbitrary revenue figure.
+//! 6. **Revocation mid-cycle**: if an attestation is revoked after bond issuance, `redeem`
+//!    panics; already-recorded redemptions are unaffected.
+//! 7. **Admin auth ordering**: `require_auth()` is called before any equality check in admin
+//!    operations to prevent admin-address probing.
+//! 8. **Maturity enforcement**: redemptions are rejected for periods outside
+//!    `[issue_period, issue_period + maturity_periods)`.
 
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String};
 
-/// Attestation client: WASM import for wasm32, crate for tests.
+// ─── Attestation client ───────────────────────────────────────────────────────
+
 #[cfg(target_arch = "wasm32")]
 mod attestation_import {
     soroban_sdk::contractimport!(
@@ -23,55 +30,56 @@ mod attestation_import {
     );
     pub use Client as AttestationContractClient;
 }
+
 #[cfg(not(target_arch = "wasm32"))]
 mod attestation_import {
     use soroban_sdk::{Address, BytesN, Env, String};
 
     pub struct AttestationContractClient {
         env: Env,
-        address: Address,
+        pub address: Address,
     }
 
     impl AttestationContractClient {
         pub fn new(env: &Env, address: &Address) -> Self {
-            Self {
-                env: env.clone(),
-                address: address.clone(),
-            }
+            Self { env: env.clone(), address: address.clone() }
         }
 
-        #[cfg(test)]
+        /// Returns `(merkle_root, timestamp, version, revenue)`.
+        ///
+        /// Revenue is read from env temporary storage under key
+        /// `(symbol_short!("rev"), business, period)`.  Tests set this before
+        /// calling `redeem`; the default is `0`.
         pub fn get_attestation(
             &self,
-            _business: &Address,
-            _period: &String,
+            business: &Address,
+            period: &String,
         ) -> Option<(BytesN<32>, u64, u32, i128)> {
-            Some((BytesN::from_array(&self.env, &[0u8; 32]), 1000, 1, 0))
+            let revenue: i128 = self
+                .env
+                .storage()
+                .temporary()
+                .get(&(soroban_sdk::symbol_short!("rev"), business.clone(), period.clone()))
+                .unwrap_or(0i128);
+            Some((BytesN::from_array(&self.env, &[0u8; 32]), 1000, 1, revenue))
         }
 
-        #[cfg(test)]
-        pub fn is_revoked(&self, _business: &Address, _period: &String) -> bool {
-            false
-        }
-
-        #[cfg(not(test))]
-        pub fn get_attestation(
-            &self,
-            _business: &Address,
-            _period: &String,
-        ) -> Option<(BytesN<32>, u64, u32, i128)> {
-            panic!("attestation contract not available in non-wasm32 non-test builds");
-        }
-
-        #[cfg(not(test))]
-        pub fn is_revoked(&self, _business: &Address, _period: &String) -> bool {
-            panic!("attestation contract not available in non-wasm32 non-test builds");
+        pub fn is_revoked(&self, business: &Address, period: &String) -> bool {
+            self.env.storage().temporary()
+                .get(&(soroban_sdk::symbol_short!("rvkd"), business.clone(), period.clone()))
+                .unwrap_or(false)
         }
     }
 }
 
+// ─── Test modules ─────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_maturity;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -80,41 +88,42 @@ pub enum DataKey {
     NextBondId,
     Bond(u64),
     BondOwner(u64),
+    /// Per-period redemption record; written before token transfer.
     Redemption(u64, String),
+    /// Running total of all amounts transferred for a bond.
     TotalRedeemed(u64),
 }
 
-/// Bond structure types
+/// Bond payment structure.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u32)]
 pub enum BondStructure {
-    /// Fixed repayment schedule (not revenue-linked)
+    /// Fixed: pays exactly `min_payment_per_period` each period.
     Fixed = 0,
-    /// Pure revenue-linked (percentage of revenue each period)
+    /// Revenue-linked: `revenue * bps / 10000`, clamped to `[min, max]`.
     RevenueLinked = 1,
-    /// Hybrid (minimum fixed + revenue share)
+    /// Hybrid: `min + revenue * bps / 10000`, capped at `max`.
     Hybrid = 2,
 }
 
-/// Bond status
+/// Bond lifecycle status.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u32)]
 pub enum BondStatus {
     Active = 0,
     FullyRedeemed = 1,
-Defaulted = 2,
+    Defaulted = 2,
     Matured = 3,
 }
 
-/// Bond issuance and terms
+/// Bond issuance terms.
 ///
 /// # Risk Factors
-/// - Revenue volatility may affect repayment timing
-/// - Business default risk if revenue falls below minimum thresholds
-/// - Attestation dependency: repayments require valid, non-revoked attestations
-/// - Early redemption may reduce total yield
+/// - Revenue volatility affects `RevenueLinked` and `Hybrid` repayment timing.
+/// - Issuer default risk if revenue falls below minimum thresholds.
+/// - Attestation dependency: repayments require valid, non-revoked attestations.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bond {
@@ -122,29 +131,45 @@ pub struct Bond {
     pub issuer: Address,
     pub face_value: i128,
     pub structure: BondStructure,
+    /// Revenue share in basis points (0–10 000).
     pub revenue_share_bps: u32,
+    /// Floor payment per period (≥ 0).
     pub min_payment_per_period: i128,
+    /// Ceiling payment per period; also the per-period redemption cap.
     pub max_payment_per_period: i128,
+    /// Number of calendar months the bond is active.
     pub maturity_periods: u32,
     pub attestation_contract: Address,
     pub token: Address,
-pub status: BondStatus,
+    pub status: BondStatus,
     pub issued_at: u64,
     pub issue_period: String,
 }
 
-/// Redemption record for a specific period
+/// Immutable record of a single period's redemption.
+///
+/// Written atomically before the token transfer; Soroban reverts the entire
+/// transaction on panic, so the record and transfer are effectively atomic.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RedemptionRecord {
     pub bond_id: u64,
     pub period: String,
+    /// Revenue read from the attestation contract at redemption time.
     pub attested_revenue: i128,
+    /// Tokens actually transferred; may be less than the calculated amount
+    /// when the remaining face value is smaller than the per-period payment.
     pub redemption_amount: i128,
-pub redeemed_at: u64,
+    pub redeemed_at: u64,
 }
 
-fn parse_period(env: &Env, period: String) -> u64 {
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Parse `"YYYY-MM"` into a monotonic month index.
+///
+/// # Panics
+/// Panics with a descriptive message on any malformed input.
+pub fn parse_period(env: &Env, period: String) -> u64 {
     let bytes = period.to_bytes();
     assert!(bytes.len() == 7, "invalid period length");
     assert!(bytes[4] == b'-', "invalid period separator");
@@ -164,11 +189,40 @@ fn parse_period(env: &Env, period: String) -> u64 {
     year * 12 + month - 1
 }
 
-fn is_period_within_maturity(env: &Env, bond: &Bond, period: String) -> bool {
+/// Returns `true` iff `period` falls within `[issue_period, issue_period + maturity_periods)`.
+pub fn is_period_within_maturity(env: &Env, bond: &Bond, period: String) -> bool {
     let issue_months = parse_period(env, bond.issue_period.clone());
     let period_months = parse_period(env, period);
     period_months >= issue_months && period_months < issue_months + (bond.maturity_periods as u64)
 }
+
+/// Calculate the uncapped redemption amount for a period.
+///
+/// Returns a value in `[min_payment_per_period, max_payment_per_period]` for
+/// `RevenueLinked`/`Hybrid`, or exactly `min_payment_per_period` for `Fixed`.
+/// The caller must still apply the face-value clamp and re-assert the per-period
+/// ceiling afterwards.
+fn calculate_redemption(bond: &Bond, attested_revenue: i128) -> i128 {
+    match bond.structure {
+        BondStructure::Fixed => bond.min_payment_per_period,
+        BondStructure::RevenueLinked => {
+            let share = (attested_revenue as u128)
+                .saturating_mul(bond.revenue_share_bps as u128)
+                .saturating_div(10000) as i128;
+            share
+                .max(bond.min_payment_per_period)
+                .min(bond.max_payment_per_period)
+        }
+        BondStructure::Hybrid => {
+            let revenue_component = (attested_revenue as u128)
+                .saturating_mul(bond.revenue_share_bps as u128)
+                .saturating_div(10000) as i128;
+            (bond.min_payment_per_period + revenue_component).min(bond.max_payment_per_period)
+        }
+    }
+}
+
+// ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct RevenueBondContract;
@@ -177,13 +231,14 @@ pub struct RevenueBondContract;
 impl RevenueBondContract {
     /// Initialize the contract with an admin address.
     ///
-    /// # Arguments
-    /// * `admin` - Administrator address for contract management
+    /// # Panics
+    /// Panics if already initialized.
     pub fn initialize(env: Env, admin: Address) {
         admin.require_auth();
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
+        assert!(
+            !env.storage().instance().has(&DataKey::Admin),
+            "already initialized"
+        );
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextBondId, &0u64);
     }
@@ -191,24 +246,20 @@ impl RevenueBondContract {
     /// Issue a new revenue-backed bond.
     ///
     /// # Arguments
-    /// * `issuer` - Business issuing the bond
-    /// * `initial_owner` - Initial bond holder
-    /// * `face_value` - Total bond value to be repaid
-    /// * `structure` - Bond structure type (Fixed, RevenueLinked, Hybrid)
-    /// * `revenue_share_bps` - Revenue share in basis points (0-10000)
-    /// * `min_payment_per_period` - Minimum payment per period
-    /// * `max_payment_per_period` - Maximum payment per period
-    /// * `maturity_periods` - Number of periods until maturity
-    /// * `attestation_contract` - Attestation contract for revenue verification
-    /// * `token` - Token for repayments
+    /// * `issuer` – Business issuing the bond; must authorize.
+    /// * `initial_owner` – Initial bond holder (must differ from issuer).
+    /// * `face_value` – Total token amount to be repaid (> 0).
+    /// * `structure` – Payment structure (`Fixed`, `RevenueLinked`, or `Hybrid`).
+    /// * `revenue_share_bps` – Revenue share in basis points (0–10 000).
+    /// * `min_payment_per_period` – Floor payment per period (≥ 0).
+    /// * `max_payment_per_period` – Ceiling / per-period cap (> 0, ≥ min).
+    /// * `maturity_periods` – Calendar months the bond is active (> 0).
+    /// * `issue_period` – First eligible redemption period (`"YYYY-MM"`).
+    /// * `attestation_contract` – Revenue attestation contract address.
+    /// * `token` – Soroban token used for repayments.
     ///
     /// # Returns
-    /// Bond ID
-    ///
-    /// # Risk Factors
-    /// - Issuer must maintain sufficient revenue to meet minimum payments
-    /// - Bond holders bear issuer default risk
-    /// - Revenue attestations must be timely and accurate
+    /// The new bond's numeric identifier.
     pub fn issue_bond(
         env: Env,
         issuer: Address,
@@ -234,15 +285,11 @@ impl RevenueBondContract {
         assert!(maturity_periods > 0, "maturity_periods must be positive");
         assert!(!issuer.eq(&initial_owner), "issuer and owner must differ");
 
-        let id: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextBondId)
-            .unwrap_or(0);
+        let id: u64 = env.storage().instance().get(&DataKey::NextBondId).unwrap_or(0);
 
         let bond = Bond {
             id,
-            issuer: issuer.clone(),
+            issuer,
             face_value,
             structure,
             revenue_share_bps,
@@ -250,163 +297,146 @@ impl RevenueBondContract {
             max_payment_per_period,
             maturity_periods,
             issue_period,
-            attestation_contract: attestation_contract.clone(),
-            token: token.clone(),
+            attestation_contract,
+            token,
             status: BondStatus::Active,
             issued_at: env.ledger().timestamp(),
         };
 
         env.storage().instance().set(&DataKey::Bond(id), &bond);
-        env.storage()
-            .instance()
-            .set(&DataKey::BondOwner(id), &initial_owner);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalRedeemed(id), &0i128);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextBondId, &(id + 1));
+        env.storage().instance().set(&DataKey::BondOwner(id), &initial_owner);
+        env.storage().instance().set(&DataKey::TotalRedeemed(id), &0i128);
+        env.storage().instance().set(&DataKey::NextBondId, &(id + 1));
 
         id
     }
 
-    /// Redeem bond for a period based on attested revenue.
+    /// Redeem a bond for a single period.
+    ///
+    /// The issuer must authorize this call.  Revenue is read directly from the
+    /// attestation contract — callers cannot supply an arbitrary revenue figure.
+    ///
+    /// # Security invariants enforced
+    ///
+    /// 1. Bond must be `Active`.
+    /// 2. Period must be within the bond's maturity window.
+    /// 3. No prior redemption for `(bond_id, period)` — double-spend guard.
+    /// 4. Attestation must exist and must not be revoked — revocation mid-cycle guard.
+    /// 5. `actual_redemption <= max_payment_per_period` — per-period cap.
+    /// 6. `total_redeemed + actual_redemption <= face_value` — cumulative cap.
+    /// 7. Issuer must authorize — prevents unauthorized token drain.
     ///
     /// # Arguments
-    /// * `bond_id` - Bond identifier
-    /// * `period` - Period identifier (e.g., "2026-02")
-    /// * `attested_revenue` - Revenue amount from attestation
+    /// * `bond_id` – Bond identifier.
+    /// * `period` – Period to redeem (`"YYYY-MM"`).
     ///
-    /// # Lifecycle
-    /// 1. Verify bond is active
-    /// 2. Verify attestation exists and is not revoked
-    /// 3. Check no prior redemption for this period (prevent double-spending)
-    /// 4. Calculate redemption amount based on bond structure
-    /// 5. Transfer tokens from issuer to bond owner
-    /// 6. Record redemption
-    /// 7. Update total redeemed and check if bond is fully redeemed
-    ///
-    /// # Risk Factors
-    /// - Issuer must have sufficient token balance
-    /// - Attestation must be valid and non-revoked
-    /// - Revenue volatility affects redemption amounts
-    pub fn redeem(env: Env, bond_id: u64, period: String, attested_revenue: i128) {
+    /// # Panics
+    /// Panics on any violated invariant; the entire transaction is reverted.
+    pub fn redeem(env: Env, bond_id: u64, period: String) {
         let bond: Bond = env
             .storage()
             .instance()
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
 
+        // Invariant 7: issuer must authorize every redemption.
+        bond.issuer.require_auth();
+
+        // Invariant 1: bond must be active.
         assert_eq!(bond.status, BondStatus::Active, "bond not active");
-        assert!(is_period_within_maturity(&env, &bond, period.clone()), "period exceeds maturity");
+
+        // Invariant 2: period within maturity window.
+        assert!(
+            is_period_within_maturity(&env, &bond, period.clone()),
+            "period exceeds maturity"
+        );
+
+        // Invariant 3: double-spend guard.
+        assert!(
+            env.storage()
+                .instance()
+                .get::<_, RedemptionRecord>(&DataKey::Redemption(bond_id, period.clone()))
+                .is_none(),
+            "already redeemed for period"
+        );
+
+        let client = attestation_import::AttestationContractClient::new(
+            &env,
+            &bond.attestation_contract,
+        );
+
+        // Invariant 4a: revocation mid-cycle guard (checked before reading revenue).
+        assert!(!client.is_revoked(&bond.issuer, &period), "attestation is revoked");
+
+        // Invariant 4b: attestation must exist; revenue is read from it.
+        let attestation = client
+            .get_attestation(&bond.issuer, &period)
+            .expect("attestation not found");
+        let attested_revenue: i128 = attestation.3;
         assert!(attested_revenue >= 0, "attested_revenue must be non-negative");
 
-        // Prevent double-redemption for the same period
-        let existing: Option<RedemptionRecord> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Redemption(bond_id, period.clone()));
-        assert!(existing.is_none(), "already redeemed for period");
+        // Calculate uncapped per-period amount.
+        let redemption_amount = calculate_redemption(&bond, attested_revenue);
 
-        // Verify attestation exists and is not revoked
-        let client =
-            attestation_import::AttestationContractClient::new(&env, &bond.attestation_contract);
-        assert!(
-            client.get_attestation(&bond.issuer, &period).is_some(),
-            "attestation not found"
-        );
-        assert!(
-            !client.is_revoked(&bond.issuer, &period),
-            "attestation is revoked"
-        );
-
-        // Calculate redemption amount based on bond structure
-        let redemption_amount = Self::calculate_redemption(&bond, attested_revenue);
-
-        // Check if redemption would exceed face value
+        // Invariant 6: cumulative face-value cap.
         let total_redeemed: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalRedeemed(bond_id))
             .unwrap_or(0);
+        let remaining = bond.face_value - total_redeemed;
+        assert!(remaining > 0, "bond already fully redeemed");
 
-        let actual_redemption = redemption_amount.min(bond.face_value - total_redeemed);
-        assert!(actual_redemption >= 0, "bond already fully redeemed");
+        let actual_redemption = redemption_amount.min(remaining);
 
-        // Transfer tokens from issuer to bond owner
+        // Invariant 5: per-period cap — re-assert after face-value clamp.
+        assert!(
+            actual_redemption <= bond.max_payment_per_period,
+            "redemption exceeds per-period cap"
+        );
+
+        // Transfer tokens from issuer to bond owner.
         if actual_redemption > 0 {
             let owner: Address = env
                 .storage()
                 .instance()
                 .get(&DataKey::BondOwner(bond_id))
                 .expect("owner not found");
-
-            let token_client = token::Client::new(&env, &bond.token);
-            token_client.transfer(&bond.issuer, &owner, &actual_redemption);
+            token::Client::new(&env, &bond.token).transfer(
+                &bond.issuer,
+                &owner,
+                &actual_redemption,
+            );
         }
 
-        // Record redemption
-        let redemption = RedemptionRecord {
-            bond_id,
-            period: period.clone(),
-            attested_revenue,
-            redemption_amount: actual_redemption,
-            redeemed_at: env.ledger().timestamp(),
-        };
+        // Write redemption record (Soroban reverts the whole tx on panic,
+        // so this write and the transfer above are effectively atomic).
+        env.storage().instance().set(
+            &DataKey::Redemption(bond_id, period.clone()),
+            &RedemptionRecord {
+                bond_id,
+                period,
+                attested_revenue,
+                redemption_amount: actual_redemption,
+                redeemed_at: env.ledger().timestamp(),
+            },
+        );
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Redemption(bond_id, period), &redemption);
-
-        // Update total redeemed
         let new_total = total_redeemed + actual_redemption;
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalRedeemed(bond_id), &new_total);
+        env.storage().instance().set(&DataKey::TotalRedeemed(bond_id), &new_total);
 
-        // Check if bond is fully redeemed
         if new_total >= bond.face_value {
             let mut updated_bond = bond;
             updated_bond.status = BondStatus::FullyRedeemed;
-            env.storage()
-                .instance()
-                .set(&DataKey::Bond(bond_id), &updated_bond);
-        }
-    }
-
-    /// Calculate redemption amount based on bond structure and revenue.
-    fn calculate_redemption(bond: &Bond, attested_revenue: i128) -> i128 {
-        match bond.structure {
-            BondStructure::Fixed => {
-                // Fixed payment per period
-                bond.min_payment_per_period
-            }
-            BondStructure::RevenueLinked => {
-                // Pure revenue share
-                let share = (attested_revenue as u128)
-                    .saturating_mul(bond.revenue_share_bps as u128)
-                    .saturating_div(10000) as i128;
-                share
-                    .max(bond.min_payment_per_period)
-                    .min(bond.max_payment_per_period)
-            }
-            BondStructure::Hybrid => {
-                // Minimum fixed + revenue share
-                let revenue_component = (attested_revenue as u128)
-                    .saturating_mul(bond.revenue_share_bps as u128)
-                    .saturating_div(10000) as i128;
-                let total = bond.min_payment_per_period + revenue_component;
-                total.min(bond.max_payment_per_period)
-            }
+            env.storage().instance().set(&DataKey::Bond(bond_id), &updated_bond);
         }
     }
 
     /// Transfer bond ownership.
     ///
-    /// # Arguments
-    /// * `bond_id` - Bond identifier
-    /// * `current_owner` - Current owner (must authorize)
-    /// * `new_owner` - New owner address
+    /// # Panics
+    /// Panics if the bond does not exist, the caller is not the owner, or
+    /// `current_owner == new_owner`.
     pub fn transfer_ownership(env: Env, bond_id: u64, current_owner: Address, new_owner: Address) {
         current_owner.require_auth();
 
@@ -419,56 +449,55 @@ impl RevenueBondContract {
         assert_eq!(current_owner, stored_owner, "not bond owner");
         assert!(!current_owner.eq(&new_owner), "cannot transfer to self");
 
-        env.storage()
-            .instance()
-            .set(&DataKey::BondOwner(bond_id), &new_owner);
+        env.storage().instance().set(&DataKey::BondOwner(bond_id), &new_owner);
     }
 
-    /// Mark bond as defaulted (admin only).
+    /// Mark a bond as defaulted (admin only).
     ///
-    /// # Arguments
-    /// * `admin` - Admin address (must authorize)
-    /// * `bond_id` - Bond identifier
+    /// Irreversible.  No further redemptions are possible after default.
     ///
-    /// # Risk Factors
-    /// - Default results in loss for bond holders
-    /// - Partial redemptions may have occurred before default
-pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
+    /// # Security
+    /// `require_auth()` is called before the equality check to prevent
+    /// callers from probing whether an address is admin without signing.
+    pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
+        admin.require_auth();
         let stored_admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .expect("not initialized");
         assert_eq!(admin, stored_admin, "unauthorized");
-        admin.require_auth();
 
         let mut bond: Bond = env
             .storage()
             .instance()
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
-
         assert!(matches!(bond.status, BondStatus::Active), "bond not active");
         bond.status = BondStatus::Defaulted;
         env.storage().instance().set(&DataKey::Bond(bond_id), &bond);
     }
 
-    /// Mark bond as matured (admin only).
+    /// Mark a bond as matured (admin only).
+    ///
+    /// Irreversible.  No further redemptions are possible after maturity.
+    ///
+    /// # Security
+    /// `require_auth()` is called before the equality check.
     pub fn mark_matured(env: Env, admin: Address, bond_id: u64) {
+        admin.require_auth();
         let stored_admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .expect("not initialized");
         assert_eq!(admin, stored_admin, "unauthorized");
-        admin.require_auth();
 
         let mut bond: Bond = env
             .storage()
             .instance()
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
-
         assert!(matches!(bond.status, BondStatus::Active), "bond not active");
         bond.status = BondStatus::Matured;
         env.storage().instance().set(&DataKey::Bond(bond_id), &bond);
@@ -479,19 +508,19 @@ pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
         env.storage().instance().get(&DataKey::Bond(bond_id))
     }
 
-    /// Get bond owner.
+    /// Get the current bond owner.
     pub fn get_owner(env: Env, bond_id: u64) -> Option<Address> {
         env.storage().instance().get(&DataKey::BondOwner(bond_id))
     }
 
-    /// Get redemption record for a period.
+    /// Get the redemption record for a specific period, if any.
     pub fn get_redemption(env: Env, bond_id: u64, period: String) -> Option<RedemptionRecord> {
         env.storage()
             .instance()
             .get(&DataKey::Redemption(bond_id, period))
     }
 
-    /// Get total amount redeemed for a bond.
+    /// Get the total amount redeemed across all periods for a bond.
     pub fn get_total_redeemed(env: Env, bond_id: u64) -> i128 {
         env.storage()
             .instance()
@@ -499,28 +528,27 @@ pub fn mark_defaulted(env: Env, admin: Address, bond_id: u64) {
             .unwrap_or(0)
     }
 
-    /// Get remaining face value to be redeemed.
-pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
+    /// Get the remaining face value yet to be redeemed.
+    ///
+    /// Returns `0` for bonds that are not `Active`.
+    pub fn get_remaining_value(env: Env, bond_id: u64) -> i128 {
         let bond: Bond = env
             .storage()
             .instance()
             .get(&DataKey::Bond(bond_id))
             .expect("bond not found");
-        
         if !matches!(bond.status, BondStatus::Active) {
             return 0;
         }
-        
         let total_redeemed: i128 = env
             .storage()
             .instance()
             .get(&DataKey::TotalRedeemed(bond_id))
             .unwrap_or(0);
-
         bond.face_value - total_redeemed
     }
 
-    /// Get admin address.
+    /// Get the contract admin address.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()

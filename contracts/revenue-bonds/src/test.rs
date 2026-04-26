@@ -2,15 +2,16 @@
 use super::*;
 use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 fn create_token_contract<'a>(env: &Env, admin: &Address) -> token::StellarAssetClient<'a> {
     token::StellarAssetClient::new(
         env,
-        &env.register_stellar_asset_contract_v2(admin.clone())
-            .address(),
+        &env.register_stellar_asset_contract_v2(admin.clone()).address(),
     )
 }
 
-fn setup_test() -> (Env, Address, Address, Address, Address, Address, Address) {
+fn setup_test() -> (Env, Address, Address, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
     env.mock_all_auths_allowing_non_root_auth();
@@ -22,29 +23,41 @@ fn setup_test() -> (Env, Address, Address, Address, Address, Address, Address) {
 
     let token_client = create_token_contract(&env, &token_admin);
     let token = token_client.address.clone();
-
-    // Mint tokens to issuer for bond payments
     token_client.mint(&issuer, &100_000_000);
 
     let attestation_contract = Address::generate(&env);
-
-    (
-        env,
-        admin,
-        issuer,
-        owner,
-        token,
-        attestation_contract,
-        token_admin,
-    )
+    (env, admin, issuer, owner, token, attestation_contract)
 }
+
+/// Set the mock revenue for a (business, period) pair in the test environment.
+fn set_mock_revenue(env: &Env, business: &Address, period: &str, revenue: i128) {
+    let p = String::from_str(env, period);
+    env.storage().temporary().set(
+        &(soroban_sdk::symbol_short!("rev"), business.clone(), p),
+        &revenue,
+    );
+}
+
+/// Mark an attestation as revoked in the test environment.
+fn set_mock_revoked(env: &Env, business: &Address, period: &str) {
+    let p = String::from_str(env, period);
+    env.storage().temporary().set(
+        &(soroban_sdk::symbol_short!("rvkd"), business.clone(), p),
+        &true,
+    );
+}
+
+fn issue_period(env: &Env) -> String {
+    String::from_str(env, "2026-01")
+}
+
+// ─── Initialization ───────────────────────────────────────────────────────────
 
 #[test]
 fn test_initialize() {
-    let (env, admin, _, _, _, _, _) = setup_test();
+    let (env, admin, _, _, _, _) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
     assert_eq!(client.get_admin(), admin);
 }
@@ -52,37 +65,26 @@ fn test_initialize() {
 #[test]
 #[should_panic(expected = "already initialized")]
 fn test_double_initialize_panics() {
-    let (env, admin, _, _, _, _, _) = setup_test();
+    let (env, admin, _, _, _, _) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
     client.initialize(&admin);
 }
 
+// ─── Bond issuance ────────────────────────────────────────────────────────────
+
 #[test]
 fn test_issue_bond_fixed_structure() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
-let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &issue_period,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
-
     assert_eq!(bond_id, 0);
     let bond = client.get_bond(&bond_id).unwrap();
     assert_eq!(bond.face_value, 10_000_000);
@@ -92,27 +94,15 @@ let issue_period = String::from_str(&env, "2026-01");
 
 #[test]
 fn test_issue_bond_revenue_linked() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
-let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &5_000_000,
-        &BondStructure::RevenueLinked,
-        &1000,
-        &100_000,
-        &1_000_000,
-        &24,
-        &issue_period,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &5_000_000, &BondStructure::RevenueLinked,
+        &1000, &100_000, &1_000_000, &24, &issue_period(&env), &attestation_contract, &token,
     );
-
     let bond = client.get_bond(&bond_id).unwrap();
     assert_eq!(bond.structure, BondStructure::RevenueLinked);
     assert_eq!(bond.revenue_share_bps, 1000);
@@ -120,27 +110,15 @@ let issue_period = String::from_str(&env, "2026-01");
 
 #[test]
 fn test_issue_bond_hybrid() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
-let issue_period = String::from_str(&env, "2026-01");
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &8_000_000,
-        &BondStructure::Hybrid,
-        &500,
-        &200_000,
-        &800_000,
-        &18,
-        &issue_period,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &8_000_000, &BondStructure::Hybrid,
+        &500, &200_000, &800_000, &18, &issue_period(&env), &attestation_contract, &token,
     );
-
     let bond = client.get_bond(&bond_id).unwrap();
     assert_eq!(bond.structure, BondStructure::Hybrid);
 }
@@ -148,380 +126,203 @@ let issue_period = String::from_str(&env, "2026-01");
 #[test]
 #[should_panic(expected = "face_value must be positive")]
 fn test_issue_bond_invalid_face_value() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
-let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
-        &issuer,
-        &owner,
-        &0,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &issue_period,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &0, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 }
 
 #[test]
 #[should_panic(expected = "revenue_share_bps must be <= 10000")]
 fn test_issue_bond_invalid_revenue_share() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
-let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::RevenueLinked,
-        &10001,
-        &100_000,
-        &1_000_000,
-        &12,
-        &issue_period,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::RevenueLinked,
+        &10001, &100_000, &1_000_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 }
 
 #[test]
 #[should_panic(expected = "max must be >= min")]
 fn test_issue_bond_invalid_payment_range() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
-let issue_period = String::from_str(&env, "2026-01");
     client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &1_000_000,
-        &500_000,
-        &12,
-        &issue_period,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &1_000_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 }
 
+
+// ─── Redemption: basic structures ────────────────────────────────────────────
+
 #[test]
 fn test_redeem_fixed_bond() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 
     let period = String::from_str(&env, "2026-02");
-    client.redeem(&bond_id, &period, &2_000_000);
+    set_mock_revenue(&env, &issuer, "2026-02", 2_000_000);
+    client.redeem(&bond_id, &period);
 
-    let redemption = client.get_redemption(&bond_id, &period).unwrap();
-    assert_eq!(redemption.redemption_amount, 500_000);
+    let rec = client.get_redemption(&bond_id, &period).unwrap();
+    assert_eq!(rec.redemption_amount, 500_000);
     assert_eq!(client.get_total_redeemed(&bond_id), 500_000);
 }
 
 #[test]
 fn test_redeem_revenue_linked_bond() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &5_000_000,
-        &BondStructure::RevenueLinked,
-        &1000,
-        &100_000,
-        &1_000_000,
-        &24,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &5_000_000, &BondStructure::RevenueLinked,
+        &1000, &100_000, &1_000_000, &24, &issue_period(&env), &attestation_contract, &token,
     );
 
+    set_mock_revenue(&env, &issuer, "2026-02", 5_000_000);
     let period = String::from_str(&env, "2026-02");
-    client.redeem(&bond_id, &period, &5_000_000);
+    client.redeem(&bond_id, &period);
 
-    let redemption = client.get_redemption(&bond_id, &period).unwrap();
-    assert_eq!(redemption.redemption_amount, 500_000);
+    // 10% of 5_000_000 = 500_000
+    assert_eq!(client.get_redemption(&bond_id, &period).unwrap().redemption_amount, 500_000);
 }
 
 #[test]
 fn test_redeem_revenue_linked_below_minimum() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &5_000_000,
-        &BondStructure::RevenueLinked,
-        &1000,
-        &100_000,
-        &1_000_000,
-        &24,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &5_000_000, &BondStructure::RevenueLinked,
+        &1000, &100_000, &1_000_000, &24, &issue_period(&env), &attestation_contract, &token,
     );
 
+    // 10% of 500_000 = 50_000 < min 100_000 → floors to min
+    set_mock_revenue(&env, &issuer, "2026-02", 500_000);
     let period = String::from_str(&env, "2026-02");
-    client.redeem(&bond_id, &period, &500_000);
-
-    let redemption = client.get_redemption(&bond_id, &period).unwrap();
-    assert_eq!(redemption.redemption_amount, 100_000);
+    client.redeem(&bond_id, &period);
+    assert_eq!(client.get_redemption(&bond_id, &period).unwrap().redemption_amount, 100_000);
 }
 
 #[test]
 fn test_redeem_revenue_linked_capped_at_max() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &5_000_000,
-        &BondStructure::RevenueLinked,
-        &1000,
-        &100_000,
-        &1_000_000,
-        &24,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &5_000_000, &BondStructure::RevenueLinked,
+        &1000, &100_000, &1_000_000, &24, &issue_period(&env), &attestation_contract, &token,
     );
 
+    // 10% of 15_000_000 = 1_500_000 > max 1_000_000 → capped
+    set_mock_revenue(&env, &issuer, "2026-02", 15_000_000);
     let period = String::from_str(&env, "2026-02");
-    client.redeem(&bond_id, &period, &15_000_000);
-
-    let redemption = client.get_redemption(&bond_id, &period).unwrap();
-    assert_eq!(redemption.redemption_amount, 1_000_000);
+    client.redeem(&bond_id, &period);
+    assert_eq!(client.get_redemption(&bond_id, &period).unwrap().redemption_amount, 1_000_000);
 }
 
 #[test]
 fn test_redeem_hybrid_bond() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &8_000_000,
-        &BondStructure::Hybrid,
-        &500,
-        &200_000,
-        &800_000,
-        &18,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &8_000_000, &BondStructure::Hybrid,
+        &500, &200_000, &800_000, &18, &issue_period(&env), &attestation_contract, &token,
     );
 
+    // min 200_000 + 5% of 10_000_000 = 200_000 + 500_000 = 700_000
+    set_mock_revenue(&env, &issuer, "2026-02", 10_000_000);
     let period = String::from_str(&env, "2026-02");
-    client.redeem(&bond_id, &period, &10_000_000);
-
-    let redemption = client.get_redemption(&bond_id, &period).unwrap();
-    assert_eq!(redemption.redemption_amount, 700_000);
+    client.redeem(&bond_id, &period);
+    assert_eq!(client.get_redemption(&bond_id, &period).unwrap().redemption_amount, 700_000);
 }
+
+// ─── Double-spend prevention ──────────────────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "already redeemed for period")]
 fn test_redeem_double_spending_prevention() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 
     let period = String::from_str(&env, "2026-02");
-    client.redeem(&bond_id, &period, &2_000_000);
-    client.redeem(&bond_id, &period, &2_000_000);
+    set_mock_revenue(&env, &issuer, "2026-02", 0);
+    client.redeem(&bond_id, &period);
+    client.redeem(&bond_id, &period); // must panic
 }
+
+// ─── Multi-period redemptions ─────────────────────────────────────────────────
 
 #[test]
 fn test_multiple_period_redemptions() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 
-    let period1 = String::from_str(&env, "2026-02");
-    let period2 = String::from_str(&env, "2026-03");
-    let period3 = String::from_str(&env, "2026-04");
-
-    client.redeem(&bond_id, &period1, &2_000_000);
-    client.redeem(&bond_id, &period2, &2_500_000);
-    client.redeem(&bond_id, &period3, &3_000_000);
+    for p in ["2026-01", "2026-02", "2026-03"] {
+        set_mock_revenue(&env, &issuer, p, 0);
+        client.redeem(&bond_id, &String::from_str(&env, p));
+    }
 
     assert_eq!(client.get_total_redeemed(&bond_id), 1_500_000);
     assert_eq!(client.get_remaining_value(&bond_id), 8_500_000);
 }
 
-/// Maturity is currently informational only. Redemptions continue if the bond
-/// is still active and has remaining face value, even when periods drift past
-/// the configured maturity window.
-#[test]
-fn test_redemption_continues_after_maturity_period_drift() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
-    let contract_id = env.register(RevenueBondContract, ());
-    let client = RevenueBondContractClient::new(&env, &contract_id);
-
-    client.initialize(&admin);
-
-    let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &2_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &2,
-        &attestation_contract,
-        &token,
-    );
-
-    let period1 = String::from_str(&env, "2026-01");
-    let period2 = String::from_str(&env, "2026-02");
-    let period3 = String::from_str(&env, "2026-03");
-
-    client.redeem(&bond_id, &period1, &1_000_000);
-    client.redeem(&bond_id, &period2, &1_000_000);
-    client.redeem(&bond_id, &period3, &1_000_000);
-
-    let bond = client.get_bond(&bond_id).unwrap();
-    let redemption3 = client.get_redemption(&bond_id, &period3).unwrap();
-
-    assert_eq!(redemption3.redemption_amount, 500_000);
-    assert_eq!(client.get_total_redeemed(&bond_id), 1_500_000);
-    assert_eq!(client.get_remaining_value(&bond_id), 500_000);
-    assert_eq!(bond.status, BondStatus::Active);
-}
-
-/// Distinct period keys are the anti-double-spend boundary; ordering is not
-/// enforced so out-of-order period redemption remains valid.
-#[test]
-fn test_redemption_allows_out_of_order_period_drift() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
-    let contract_id = env.register(RevenueBondContract, ());
-    let client = RevenueBondContractClient::new(&env, &contract_id);
-
-    client.initialize(&admin);
-
-    let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &2_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
-    );
-
-    let later_period = String::from_str(&env, "2026-03");
-    let earlier_period = String::from_str(&env, "2026-01");
-
-    client.redeem(&bond_id, &later_period, &1_000_000);
-    client.redeem(&bond_id, &earlier_period, &1_000_000);
-
-    let later_redemption = client.get_redemption(&bond_id, &later_period).unwrap();
-    let earlier_redemption = client.get_redemption(&bond_id, &earlier_period).unwrap();
-
-    assert_eq!(later_redemption.redemption_amount, 500_000);
-    assert_eq!(earlier_redemption.redemption_amount, 500_000);
-    assert_eq!(client.get_total_redeemed(&bond_id), 1_000_000);
-}
-
 #[test]
 fn test_full_redemption() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &1_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &1_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 
-    let period1 = String::from_str(&env, "2026-02");
-    let period2 = String::from_str(&env, "2026-03");
-
-    client.redeem(&bond_id, &period1, &2_000_000);
-    client.redeem(&bond_id, &period2, &2_000_000);
+    for p in ["2026-01", "2026-02"] {
+        set_mock_revenue(&env, &issuer, p, 0);
+        client.redeem(&bond_id, &String::from_str(&env, p));
+    }
 
     let bond = client.get_bond(&bond_id).unwrap();
     assert_eq!(bond.status, BondStatus::FullyRedeemed);
@@ -531,63 +332,42 @@ fn test_full_redemption() {
 
 #[test]
 fn test_partial_redemption_caps_at_face_value() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
+    // face_value=1_200_000, max_per_period=500_000 → 3 periods needed
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &1_200_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &1_200_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 
-    let period1 = String::from_str(&env, "2026-02");
-    let period2 = String::from_str(&env, "2026-03");
-    let period3 = String::from_str(&env, "2026-04");
-
-    client.redeem(&bond_id, &period1, &2_000_000);
-    client.redeem(&bond_id, &period2, &2_000_000);
-    client.redeem(&bond_id, &period3, &2_000_000);
+    for p in ["2026-01", "2026-02", "2026-03"] {
+        set_mock_revenue(&env, &issuer, p, 0);
+        client.redeem(&bond_id, &String::from_str(&env, p));
+    }
 
     let bond = client.get_bond(&bond_id).unwrap();
     assert_eq!(bond.status, BondStatus::FullyRedeemed);
     assert_eq!(client.get_total_redeemed(&bond_id), 1_200_000);
 }
 
+
+// ─── Ownership transfer ───────────────────────────────────────────────────────
+
 #[test]
 fn test_transfer_ownership() {
-    let (env, admin, issuer, owner, _, _, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let new_owner = Address::generate(&env);
-    let token = Address::generate(&env);
-    let attestation_contract = Address::generate(&env);
-
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
-
     client.transfer_ownership(&bond_id, &owner, &new_owner);
     assert_eq!(client.get_owner(&bond_id).unwrap(), new_owner);
 }
@@ -595,144 +375,242 @@ fn test_transfer_ownership() {
 #[test]
 #[should_panic(expected = "not bond owner")]
 fn test_transfer_ownership_unauthorized() {
-    let (env, admin, issuer, owner, _, _, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
-    let new_owner = Address::generate(&env);
     let fake_owner = Address::generate(&env);
-    let token = Address::generate(&env);
-    let attestation_contract = Address::generate(&env);
-
+    let new_owner = Address::generate(&env);
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
-
     client.transfer_ownership(&bond_id, &fake_owner, &new_owner);
 }
 
+// ─── Admin operations ─────────────────────────────────────────────────────────
+
 #[test]
 fn test_mark_defaulted() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
-
     client.mark_defaulted(&admin, &bond_id);
-
-    let bond = client.get_bond(&bond_id).unwrap();
-    assert_eq!(bond.status, BondStatus::Defaulted);
+    assert_eq!(client.get_bond(&bond_id).unwrap().status, BondStatus::Defaulted);
 }
 
 #[test]
 #[should_panic(expected = "unauthorized")]
 fn test_mark_defaulted_unauthorized() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
-
-    let non_admin = Address::generate(&env);
-    client.mark_defaulted(&non_admin, &bond_id);
+    client.mark_defaulted(&Address::generate(&env), &bond_id);
 }
 
 #[test]
 #[should_panic(expected = "bond not active")]
 fn test_redeem_defaulted_bond() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &10_000_000,
-        &BondStructure::Fixed,
-        &0,
-        &500_000,
-        &500_000,
-        &12,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &10_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
+    );
+    client.mark_defaulted(&admin, &bond_id);
+    set_mock_revenue(&env, &issuer, "2026-02", 0);
+    client.redeem(&bond_id, &String::from_str(&env, "2026-02"));
+}
+
+// ─── Revocation mid-cycle guard ───────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "attestation is revoked")]
+fn test_redeem_revoked_attestation_panics() {
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer, &owner, &5_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 
-    client.mark_defaulted(&admin, &bond_id);
-
-    let period = String::from_str(&env, "2026-02");
-    client.redeem(&bond_id, &period, &2_000_000);
+    // Attestation is revoked mid-cycle before redemption.
+    set_mock_revoked(&env, &issuer, "2026-03");
+    client.redeem(&bond_id, &String::from_str(&env, "2026-03"));
 }
 
 #[test]
-fn test_early_redemption_scenario() {
-    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+fn test_redeem_succeeds_for_non_revoked_period_after_other_revoked() {
+    // Revocation of one period must not block redemption of a different period.
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
     let contract_id = env.register(RevenueBondContract, ());
     let client = RevenueBondContractClient::new(&env, &contract_id);
-
     client.initialize(&admin);
 
     let bond_id = client.issue_bond(
-        &issuer,
-        &owner,
-        &4_500_000,
-        &BondStructure::RevenueLinked,
-        &2000,
-        &100_000,
-        &2_000_000,
-        &24,
-        &attestation_contract,
-        &token,
+        &issuer, &owner, &5_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
     );
 
-    let period1 = String::from_str(&env, "2026-02");
-    let period2 = String::from_str(&env, "2026-03");
-    let period3 = String::from_str(&env, "2026-04");
+    set_mock_revoked(&env, &issuer, "2026-02");
+    set_mock_revenue(&env, &issuer, "2026-03", 0);
+    // 2026-03 is not revoked — must succeed.
+    client.redeem(&bond_id, &String::from_str(&env, "2026-03"));
+    assert_eq!(client.get_total_redeemed(&bond_id), 500_000);
+}
 
-    client.redeem(&bond_id, &period1, &8_000_000);
-    client.redeem(&bond_id, &period2, &10_000_000);
-    client.redeem(&bond_id, &period3, &5_000_000);
+// ─── Per-period cap enforcement ───────────────────────────────────────────────
 
-    let bond = client.get_bond(&bond_id).unwrap();
-    assert_eq!(bond.status, BondStatus::FullyRedeemed);
+#[test]
+fn test_per_period_cap_not_exceeded_on_last_partial() {
+    // face_value=700_000, max_per_period=500_000.
+    // After period1 (500_000), remaining=200_000 < max.
+    // The per-period cap assertion must pass because 200_000 <= 500_000.
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer, &owner, &700_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
+    );
+
+    set_mock_revenue(&env, &issuer, "2026-01", 0);
+    client.redeem(&bond_id, &String::from_str(&env, "2026-01"));
+    assert_eq!(client.get_total_redeemed(&bond_id), 500_000);
+
+    set_mock_revenue(&env, &issuer, "2026-02", 0);
+    client.redeem(&bond_id, &String::from_str(&env, "2026-02"));
+    // Last partial: 200_000 transferred, bond fully redeemed.
+    assert_eq!(client.get_total_redeemed(&bond_id), 700_000);
+    assert_eq!(client.get_bond(&bond_id).unwrap().status, BondStatus::FullyRedeemed);
+}
+
+// ─── Revenue read from attestation (not caller-supplied) ─────────────────────
+
+#[test]
+fn test_revenue_is_read_from_attestation_not_caller() {
+    // The mock returns whatever is in temporary storage.
+    // We set revenue=8_000_000; 10% = 800_000, capped at max 1_000_000.
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer, &owner, &5_000_000, &BondStructure::RevenueLinked,
+        &1000, &100_000, &1_000_000, &24, &issue_period(&env), &attestation_contract, &token,
+    );
+
+    set_mock_revenue(&env, &issuer, "2026-02", 8_000_000);
+    let period = String::from_str(&env, "2026-02");
+    client.redeem(&bond_id, &period);
+
+    let rec = client.get_redemption(&bond_id, &period).unwrap();
+    // attested_revenue must be what the attestation contract returned, not a caller value.
+    assert_eq!(rec.attested_revenue, 8_000_000);
+    assert_eq!(rec.redemption_amount, 800_000);
+}
+
+// ─── Edge cases ───────────────────────────────────────────────────────────────
+
+#[test]
+fn test_early_redemption_scenario() {
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer, &owner, &4_500_000, &BondStructure::RevenueLinked,
+        &2000, &100_000, &2_000_000, &24, &issue_period(&env), &attestation_contract, &token,
+    );
+
+    // 20% of 8_000_000 = 1_600_000; 20% of 10_000_000 = 2_000_000; 20% of 5_000_000 = 1_000_000
+    for (p, rev) in [("2026-01", 8_000_000i128), ("2026-02", 10_000_000), ("2026-03", 5_000_000)] {
+        set_mock_revenue(&env, &issuer, p, rev);
+        client.redeem(&bond_id, &String::from_str(&env, p));
+    }
+
+    assert_eq!(client.get_bond(&bond_id).unwrap().status, BondStatus::FullyRedeemed);
     assert_eq!(client.get_total_redeemed(&bond_id), 4_500_000);
+}
+
+#[test]
+fn test_zero_revenue_hybrid_pays_minimum() {
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer, &owner, &3_000_000, &BondStructure::Hybrid,
+        &500, &200_000, &800_000, &12, &issue_period(&env), &attestation_contract, &token,
+    );
+
+    // revenue=0 → min + 0 = 200_000
+    set_mock_revenue(&env, &issuer, "2026-01", 0);
+    let period = String::from_str(&env, "2026-01");
+    client.redeem(&bond_id, &period);
+    assert_eq!(client.get_redemption(&bond_id, &period).unwrap().redemption_amount, 200_000);
+}
+
+#[test]
+fn test_max_i128_revenue_does_not_overflow() {
+    // saturating_mul must prevent overflow for extreme revenue values.
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer, &owner, &5_000_000, &BondStructure::RevenueLinked,
+        &1000, &0, &1_000_000, &24, &issue_period(&env), &attestation_contract, &token,
+    );
+
+    set_mock_revenue(&env, &issuer, "2026-01", i128::MAX);
+    let period = String::from_str(&env, "2026-01");
+    client.redeem(&bond_id, &period);
+    // saturating_mul caps at u128::MAX then cast to i128 → clamped to max_payment_per_period
+    assert_eq!(client.get_redemption(&bond_id, &period).unwrap().redemption_amount, 1_000_000);
+}
+
+#[test]
+fn test_out_of_order_period_redemption() {
+    let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer, &owner, &2_000_000, &BondStructure::Fixed,
+        &0, &500_000, &500_000, &12, &issue_period(&env), &attestation_contract, &token,
+    );
+
+    // Redeem a later period first, then an earlier one — both must succeed.
+    set_mock_revenue(&env, &issuer, "2026-03", 0);
+    set_mock_revenue(&env, &issuer, "2026-01", 0);
+    client.redeem(&bond_id, &String::from_str(&env, "2026-03"));
+    client.redeem(&bond_id, &String::from_str(&env, "2026-01"));
+    assert_eq!(client.get_total_redeemed(&bond_id), 1_000_000);
 }

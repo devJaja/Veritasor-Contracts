@@ -183,6 +183,7 @@ impl RevenueCurveContract {
 
         // Validate tiers are sorted and discounts are reasonable
         let mut prev_revenue: Option<i128> = None;
+        let mut prev_discount: u32 = 0;
         for tier in tiers.iter() {
             assert!(tier.min_revenue >= 0, "min_revenue cannot be negative");
             if let Some(prev) = prev_revenue {
@@ -192,7 +193,12 @@ impl RevenueCurveContract {
                 );
             }
             assert!(tier.discount_bps <= 10000, "discount cannot exceed 100%");
+            assert!(
+                tier.discount_bps >= prev_discount,
+                "tier discounts must be non-decreasing (monotonic)"
+            );
             prev_revenue = Some(tier.min_revenue);
+            prev_discount = tier.discount_bps;
         }
 
         env.storage().instance().set(&DataKey::RevenueTiers, &tiers);
