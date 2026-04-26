@@ -482,6 +482,7 @@ impl AttestationContract {
         let revoked_at = env.ledger().timestamp();
         let revocation = (caller.clone(), revoked_at, reason.clone());
         dispute::store_attestation_revocation(&env, &business, &period, &revocation);
+        extended_metadata::remove_metadata(&env, &business, &period);
         events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
     }
 
@@ -502,14 +503,10 @@ impl AttestationContract {
         is_net: bool,
         nonce: u64,
     ) {
-        access_control::require_admin(&env, &caller);
-        dispute::require_not_revoked_for_update(&env, &business, &period);
-        let key = DataKey::Attestation(business.clone(), period.clone());
-        let (_old_root, ts, old_ver, fee, proof_hash, expiry): AttestationData = env
-            .storage()
-            .instance()
-            .get(&key)
-            .expect("not found");
+        access_control::require_not_paused(&env);
+        business.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &business, NONCE_CHANNEL_BUSINESS, nonce);
+        rate_limit::check_rate_limit(&env, &business);
 
         let key = DataKey::Attestation(business.clone(), period.clone());
         if env.storage().instance().has(&key) {
@@ -522,8 +519,6 @@ impl AttestationContract {
         
         dynamic_fees::increment_business_count(&env, &business);
 
-        let proof_hash: Option<BytesN<32>> = None;
-        let expiry_timestamp: Option<u64> = None;
         let data = (
             merkle_root.clone(),
             timestamp,
