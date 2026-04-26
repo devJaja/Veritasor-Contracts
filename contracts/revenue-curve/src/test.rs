@@ -620,44 +620,38 @@ fn submit_test_attestation(
         &1u32,
         &None,
         &None,
-        &0u64,
     );
 }
 
 #[test]
+#[should_panic(expected = "risk premium per point cannot exceed 1000 bps")]
 fn test_stress_quote_risk_product_saturates_u32_max_then_clamps_to_max_apr() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, client, _, _) = setup(&env);
 
+    // risk_premium_bps_per_point = u32::MAX violates the 1000 bps cap.
+    // This test verifies the guard fires before any arithmetic is attempted.
     let mut policy = create_default_policy();
     policy.risk_premium_bps_per_point = u32::MAX;
     client.set_pricing_policy(&admin, &policy);
-
-    let out = client.get_pricing_quote(&0i128, &100u32);
-    assert_eq!(out.risk_premium_bps, u32::MAX);
-    assert_eq!(out.apr_bps, policy.max_apr_bps);
-    assert!(out.apr_bps <= policy.max_apr_bps);
-    assert!(out.apr_bps >= policy.min_apr_bps);
 }
 
 #[test]
+#[should_panic(expected = "max_apr cannot exceed 10000 bps (100%)")]
 fn test_stress_quote_base_plus_risk_saturates_before_discount() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, client, _, _) = setup(&env);
 
+    // max_apr_bps = u32::MAX violates the 10 000 bps cap.
+    // This test verifies the guard fires before any arithmetic is attempted.
     let mut policy = create_default_policy();
     policy.base_apr_bps = u32::MAX;
     policy.min_apr_bps = 300;
     policy.max_apr_bps = u32::MAX;
     policy.risk_premium_bps_per_point = 1;
     client.set_pricing_policy(&admin, &policy);
-
-    let out = client.get_pricing_quote(&0i128, &100u32);
-    assert_eq!(out.risk_premium_bps, 100);
-    // combined caps at u32::MAX; discount 0; clamp max = u32::MAX
-    assert_eq!(out.apr_bps, u32::MAX);
 }
 
 #[test]
