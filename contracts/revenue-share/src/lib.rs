@@ -19,6 +19,63 @@
 //! 5. Handles rounding residuals by allocating to the first stakeholder and asserts the final
 //!    vector sums exactly to `revenue_amount`.
 //!
+//! ## Rounding Dust Handling - Deterministic Algorithm
+//!
+//! Revenue distributions with non-exact share calculations produce rounding dust.
+//! The contract ensures deterministic, transparent dust handling via the following algorithm:
+//!
+//! **Algorithm:**
+//! 1. Calculate base share for each stakeholder: `base_i = floor(revenue × share_bps_i / 10_000)`
+//! 2. Sum all base shares: `total_base = Σ base_i`
+//! 3. Calculate residual (dust): `residual = revenue - total_base`
+//! 4. If residual > 0, add it entirely to the first stakeholder's allocation
+//! 5. Verify final distribution sums exactly to `revenue_amount` (invariant check)
+//!
+//! **Properties:**
+//! - Residual is guaranteed to be in range `[0, num_stakeholders)` (at most 1 unit per stakeholder)
+//! - First stakeholder receives: `base_amount + residual`
+//! - All other stakeholders receive: `base_amount` only (no dust)
+//! - Total distributed always equals `revenue_amount` (no loss, no overpayment)
+//! - Deterministic: identical inputs always produce identical allocations
+//! - Fair: maximizes fairness by concentrating dust with primary recipient
+//!
+//! **Why the first stakeholder?**
+//! - Deterministic selection rule (no bias based on stake size)
+//! - Simplifies operationalization and auditing
+//! - Aligns with convention used in many revenue-sharing systems
+//! - Can be rotated in future versions if needed
+//!
+//! **Example:**
+//! ```text
+//! Stakeholders: A (3333 bps), B (3333 bps), C (3334 bps)
+//! Revenue: 10_000
+//!
+//! Base calculations:
+//!   A: 10_000 * 3333 / 10_000 = 3333
+//!   B: 10_000 * 3333 / 10_000 = 3333
+//!   C: 10_000 * 3334 / 10_000 = 3334
+//!   Total base: 10_000
+//!   Residual: 0
+//!
+//! Allocations:
+//!   A: 3333, B: 3333, C: 3334 (sum = 10_000) ✓
+//!
+//! ---
+//!
+//! Stakeholders: A (3334 bps), B (3333 bps), C (3333 bps)
+//! Revenue: 10_001
+//!
+//! Base calculations:
+//!   A: 10_001 * 3334 / 10_000 = 3334
+//!   B: 10_001 * 3333 / 10_000 = 3333
+//!   C: 10_001 * 3333 / 10_000 = 3333
+//!   Total base: 10_000
+//!   Residual: 1
+//!
+//! Allocations:
+//!   A: 3334 + 1 = 3335, B: 3333, C: 3333 (sum = 10_001) ✓
+//! ```
+//!
 //! ## Share configuration
 //!
 //! - Shares are expressed in basis points (1 bps = 0.01%).
@@ -100,7 +157,25 @@ pub struct Stakeholder {
     pub share_bps: u32,
 }
 
-/// Distribution execution record
+/// Distribution execution record with deterministic rounding dust allocation.
+///
+/// # Fields
+/// - `total_amount`: Total revenue amount distributed (input to distribution)
+/// - `timestamp`: Timestamp of distribution execution
+/// - `amounts`: Individual amounts sent to each stakeholder (in order)
+///
+/// # Invariants
+/// - `sum(amounts) == total_amount` (always, even with rounding dust)
+/// - `amounts[0] >= base_share[0]` (first stakeholder gets residual)
+/// - `amounts[i] == base_share[i]` for i > 0 (others get exact base)
+/// - `amounts.len() == num_stakeholders`
+///
+/// # Rounding Dust
+/// The `amounts` vector includes all allocated rounding dust in `amounts[0]`.
+/// This ensures transparency: auditors can verify:
+/// 1. Each amount matches the calculation or includes documented residual
+/// 2. No loss or overpayment occurred
+/// 3. Allocation is deterministic across identical inputs
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct DistributionRecord {
@@ -247,6 +322,18 @@ impl RevenueShareContract {
     /// - Business token balance must be ≥ `revenue_amount` before transfers
     /// - Final per-recipient amounts sum exactly to `revenue_amount`
     ///
+    /// # Rounding Dust Handling
+    ///
+    /// Rounding dust (residual amounts that cannot be evenly distributed) is deterministically
+    /// allocated to the first stakeholder in the configuration. This ensures:
+    ///
+    /// - **No loss**: Total distributed always equals `revenue_amount` exactly
+    /// - **Determinism**: Identical inputs always produce identical allocations
+    /// - **Predictability**: First stakeholder receives all dust; others receive exact base shares
+    /// - **Auditability**: Simple, transparent allocation rule
+    ///
+    /// See the crate-level documentation for the full dust handling algorithm and examples.
+    ///
     /// # Panics
     /// - On any failed validation, failed invariant, insufficient balance, or transfer error
     pub fn distribute_revenue(
@@ -388,6 +475,18 @@ impl RevenueShareContract {
     /// Calculate the share amount for a given revenue and basis points.
     ///
     /// Formula: `amount = revenue × share_bps / 10_000` (checked; panics on overflow).
+    ///
+    /// # Rounding
+    /// Uses integer division (floor), which produces the base share amount.
+    /// Rounding dust (remainder) is calculated by [`distribute_revenue`] and allocated
+    /// deterministically to the first stakeholder. See crate-level documentation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// calculate_share(10_000, 3333) = 3333  // floor(10_000 * 3333 / 10_000)
+    /// calculate_share(10_001, 3333) = 3333  // floor(10_001 * 3333 / 10_000) = floor(3333.3333)
+    /// // Residual: 1 unit goes to first stakeholder
+    /// ```
     pub fn calculate_share(revenue: i128, share_bps: u32) -> i128 {
         revenue
             .checked_mul(share_bps as i128)

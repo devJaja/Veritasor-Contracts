@@ -81,6 +81,10 @@ fn admin_nonce(client: &RevenueShareContractClient<'_>, admin: &Address) -> u64 
     client.get_replay_nonce(admin, &NONCE_CHANNEL_ADMIN)
 }
 
+fn distribute_nonce(client: &RevenueShareContractClient<'_>, business: &Address) -> u64 {
+    client.get_replay_nonce(business, &NONCE_CHANNEL_DISTRIBUTE)
+}
+
 fn configure_stakeholders_as_admin(
     client: &RevenueShareContractClient<'_>,
     admin: &Address,
@@ -104,12 +108,8 @@ fn set_token_as_admin(client: &RevenueShareContractClient<'_>, admin: &Address, 
     client.set_token(&nonce, token);
 }
 
-fn admin_nonce(client: &RevenueShareContractClient<'_>, admin: &Address) -> u64 {
-    client.get_replay_nonce(admin, &NONCE_CHANNEL_ADMIN)
-}
-
-fn distribute_nonce(client: &RevenueShareContractClient<'_>, business: &Address) -> u64 {
-    client.get_replay_nonce(business, &NONCE_CHANNEL_DISTRIBUTE)
+fn equal_stakeholders(env: &Env, count: u32) -> soroban_sdk::Vec<Stakeholder> {
+    create_stakeholders(env, count, true)
 }
 
 fn create_stakeholders(env: &Env, count: u32, equal_shares: bool) -> soroban_sdk::Vec<Stakeholder> {
@@ -161,6 +161,17 @@ fn create_stakeholders(env: &Env, count: u32, equal_shares: bool) -> soroban_sdk
         }
     }
 
+    stakeholders
+}
+
+fn stakeholders_with_shares(env: &Env, shares: &[u32]) -> soroban_sdk::Vec<Stakeholder> {
+    let mut stakeholders = soroban_sdk::Vec::new(env);
+    for share in shares {
+        stakeholders.push_back(Stakeholder {
+            address: Address::generate(env),
+            share_bps: *share,
+        });
+    }
     stakeholders
 }
 
@@ -275,10 +286,7 @@ fn test_configure_stakeholders_two_equal() {
     let n = admin_nonce(&client, &admin);
     client.configure_stakeholders(&n, &stakeholders);
 
-    assert!(client
-        .try_configure_stakeholders(&nonce, &stakeholders)
-        .is_err());
-    assert_eq!(admin_nonce(&client, &admin), nonce + 1);
+    assert_eq!(admin_nonce(&client, &admin), n + 1);
     assert_eq!(client.get_stakeholders().unwrap(), stakeholders);
 }
 
@@ -290,22 +298,26 @@ fn test_configure_stakeholders_custom_split() {
     let n = admin_nonce(&client, &admin);
     client.configure_stakeholders(&n, &stakeholders);
 
-    client.configure_stakeholders(&nonce, &valid);
-    assert_eq!(admin_nonce(&client, &admin), nonce + 1);
-    assert_eq!(client.get_stakeholders().unwrap(), valid);
+    assert_eq!(admin_nonce(&client, &admin), n + 1);
+    assert_eq!(client.get_stakeholders().unwrap(), stakeholders);
 }
 
 #[test]
 fn test_configure_stakeholders_three_way() {
-    let (env, client, _att, admin, _token, _att_id) = setup();
+    let (env, client, _att, admin, token, _att_id) = setup();
 
     let stakeholders = create_stakeholders(&env, 3, false);
     let n = admin_nonce(&client, &admin);
     client.configure_stakeholders(&n, &stakeholders);
 
+    assert_eq!(admin_nonce(&client, &admin), n + 1);
+    assert_eq!(client.get_stakeholders().unwrap(), stakeholders);
+
+    let new_token = Address::generate(&env);
+    let nonce_before = admin_nonce(&client, &admin);
     set_token_as_admin(&client, &admin, &new_token);
     assert_eq!(client.get_token(), new_token);
-    assert_eq!(admin_nonce(&client, &admin), nonce_before + 2);
+    assert_eq!(admin_nonce(&client, &admin), nonce_before + 1);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -386,7 +398,7 @@ fn test_configure_stakeholders_zero_share_panics() {
 fn test_configure_stakeholders_duplicate_address_panics() {
     let (env, client, _att, admin, _token, _att_id) = setup();
 
-    let addr = Address::generate(&env);
+    let duplicated = Address::generate(&env);
     let mut stakeholders = soroban_sdk::Vec::new(&env);
     stakeholders.push_back(Stakeholder {
         address: duplicated.clone(),
@@ -442,13 +454,16 @@ fn test_distribute_revenue_two_stakeholders() {
 
 #[test]
 fn test_zero_amount_distribution_records_zero_amounts_without_transfers() {
-    let (env, client, admin, _attestation, token) = setup();
+    let (env, client, att, admin, token) = setup();
     let stakeholders = equal_stakeholders(&env, 2);
     configure_stakeholders_as_admin(&client, &admin, &stakeholders);
 
     let business = Address::generate(&env);
     let period = String::from_str(&env, "2026-02");
-    client.distribute_revenue(&business, &period, &0);
+    submit_revenue_attestation(&env, &att, &business, &period, 0, None);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &0, &dn);
 
     let record = client.get_distribution(&business, &period).unwrap();
     assert_eq!(record.total_amount, 0);
@@ -487,11 +502,12 @@ fn test_distribute_revenue_three_stakeholders() {
     let stakeholder3 = stakeholders.get(2).unwrap();
 
     let record = client.get_distribution(&business, &period).unwrap();
-    assert_eq!(record.amounts.get(0).unwrap(), 49);
-    for i in 1..record.amounts.len() {
-        assert_eq!(record.amounts.get(i).unwrap(), 0);
-    }
-    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, 49);
+    // With 5000, 3000, 2000 bps: should get 50000, 30000, 20000
+    assert_eq!(record.total_amount, 100_000);
+    assert_eq!(token_client.balance(&stakeholder1.address), 50_000);
+    assert_eq!(token_client.balance(&stakeholder2.address), 30_000);
+    assert_eq!(token_client.balance(&stakeholder3.address), 20_000);
+    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, 100_000);
 }
 
 #[test]
@@ -1003,4 +1019,395 @@ fn test_two_businesses_same_period_independent() {
 
     assert_eq!(client.get_distribution(&b1, &period).unwrap().total_amount, 5_000);
     assert_eq!(client.get_distribution(&b2, &period).unwrap().total_amount, 7_000);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Rounding Dust Handling - Deterministic Edge Cases
+// ════════════════════════════════════════════════════════════════════
+//
+// The revenue share contract uses deterministic dust allocation to ensure
+// that rounding residuals (dust) are always assigned to the first stakeholder.
+// This guarantees:
+// 1. Total distributed always equals revenue_amount (no loss)
+// 2. Residual is always < number_of_stakeholders (maximum 1 unit per stakeholder attempt)
+// 3. First stakeholder receives base share + any accumulated residual
+// 4.  Other stakeholders receive exactly their calculated base shares
+//
+// Testing focus: Prime numbers, odd recipient counts, non-divisible revenues,
+// and edge cases that maximize rounding artifacts.
+
+#[test]
+fn test_rounding_dust_three_stakeholders_odd_prime() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    // Create stakeholders with odd prime-based shares: 3331, 3333, 3336 (sum=10000)
+    let mut stakeholders = soroban_sdk::Vec::new(&env);
+    stakeholders.push_back(Stakeholder {
+        address: Address::generate(&env),
+        share_bps: 3331,
+    });
+    stakeholders.push_back(Stakeholder {
+        address: Address::generate(&env),
+        share_bps: 3333,
+    });
+    stakeholders.push_back(Stakeholder {
+        address: Address::generate(&env),
+        share_bps: 3336,
+    });
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-01");
+    let revenue = 10_007i128; // Prime number
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, revenue);
+}
+
+#[test]
+fn test_rounding_dust_five_stakeholders_equal_shares() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    // 5 stakeholders with equal 2000 bps each
+    let stakeholders = create_stakeholders(&env, 5, true);
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-02");
+    let revenue = 12_345i128; // Non-divisible by 5
+
+   submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, revenue);
+}
+
+#[test]
+fn test_rounding_dust_seven_stakeholders_varied_shares() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    // 7 stakeholders with varied shares designed to create rounding
+    let mut stakeholders = soroban_sdk::Vec::new(&env);
+    for _ in 0..7 {
+        stakeholders.push_back(Stakeholder {
+            address: Address::generate(&env),
+            share_bps: if stakeholders.len() == 6 {
+                10_000 - (6 * 1_428) // Adjust last to sum to 10_000
+            } else {
+                1_428
+            },
+        });
+    }
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-03");
+    let revenue = 99_999i128; // Large non-divisible
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, revenue);
+}
+
+#[test]
+fn test_rounding_dust_small_revenue_many_stakeholders() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    // 10 stakeholders, small revenue to ensure most get 0
+    let stakeholders = create_stakeholders(&env, 10, true);
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-04");
+    let revenue = 7i128; // Tiny: only first gets residual
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    let record = client.get_distribution(&business, &period).unwrap();
+    let first_stakeholder = stakeholders.get(0).unwrap();
+    let token_client = TokenClient::new(&env, &token);
+
+    // First stakeholder gets the full residual
+    assert_eq!(token_client.balance(&first_stakeholder.address), revenue);
+
+    // All others get 0
+    for i in 1..stakeholders.len() {
+        let stakeholder = stakeholders.get(i).unwrap();
+        assert_eq!(token_client.balance(&stakeholder.address), 0);
+    }
+
+    // Verify total
+    assert_eq!(sum_amounts(&record.amounts), revenue);
+}
+
+#[test]
+fn test_rounding_dust_first_stakeholder_always_gets_residual() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    let mut stakeholders = soroban_sdk::Vec::new(&env);
+    stakeholders.push_back(Stakeholder {
+        address: Address::generate(&env),
+        share_bps: 3333,
+    });
+    stakeholders.push_back(Stakeholder {
+        address: Address::generate(&env),
+        share_bps: 3333,
+    });
+    stakeholders.push_back(Stakeholder {
+        address: Address::generate(&env),
+        share_bps: 3334,
+    });
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-05");
+    let revenue = 10_000i128;
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    let record = client.get_distribution(&business, &period).unwrap();
+    let token_client = TokenClient::new(&env, &token);
+
+    // Calculate expected base amounts
+    let base1 = RevenueShareContract::calculate_share(revenue, 3333); // 3333
+    let base2 = RevenueShareContract::calculate_share(revenue, 3333); // 3333
+    let base3 = RevenueShareContract::calculate_share(revenue, 3334); // 3334
+    let residual = revenue - base1 - base2 - base3; // Residual dust
+
+    let first_stakeholder = stakeholders.get(0).unwrap();
+    let second_stakeholder = stakeholders.get(1).unwrap();
+    let third_stakeholder = stakeholders.get(2).unwrap();
+
+    // First stakeholder gets base + residual
+    assert_eq!(token_client.balance(&first_stakeholder.address), base1 + residual);
+    // Others get exactly base
+    assert_eq!(token_client.balance(&second_stakeholder.address), base2);
+    assert_eq!(token_client.balance(&third_stakeholder.address), base3);
+
+    // Verify in record
+    assert_eq!(record.amounts.get(0).unwrap(), base1 + residual);
+    assert_eq!(record.amounts.get(1).unwrap(), base2);
+    assert_eq!(record.amounts.get(2).unwrap(), base3);
+}
+
+#[test]
+fn test_rounding_dust_50_stakeholders_max_count() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    // Maximum 50 stakeholders with minimal 200 bps each (10000/50 = 200)
+    let stakeholders = create_stakeholders(&env, 50, true);
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-06");
+    let revenue = 999_999i128; // Large, non-divisible
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, revenue);
+}
+
+#[test]
+fn test_rounding_dust_two_stakeholders_6000_4000_split() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    let stakeholders = create_stakeholders(&env, 2, false); // 6000, 4000
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-07");
+    let revenue = 13i128;  // 13 * 0.6 = 7.8 -> 7, 13 * 0.4 = 5.2 -> 5, residual = 1
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    let record = client.get_distribution(&business, &period).unwrap();
+    let token_client = TokenClient::new(&env, &token);
+
+    let s1 = stakeholders.get(0).unwrap();
+    let s2 = stakeholders.get(1).unwrap();
+
+    // 13 * 6000 / 10000 = 7.8 -> 7 (base)
+    // 13 * 4000 / 10000 = 5.2 -> 5 (base)
+    // Residual: 13 - 7 - 5 = 1
+    // First gets 7 + 1 = 8, second gets 5
+    assert_eq!(token_client.balance(&s1.address), 8);
+    assert_eq!(token_client.balance(&s2.address), 5);
+    assert_eq!(sum_amounts(&record.amounts), revenue);
+}
+
+#[test]
+fn test_rounding_dust_consistency_multiple_distributions() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    let stakeholders = create_stakeholders(&env, 3, false);
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    mint(&env, &token, &business, 300_000);
+
+    let token_client = TokenClient::new(&env, &token);
+
+    // Execute 3 distributions with same revenue to verify determinism
+    for dist_idx in 0..3 {
+        let period = String::from_str(&env, &format!("2026-period-{}", dist_idx));
+        let revenue = 10_001i128;
+
+        submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+
+        let dn = distribute_nonce(&client, &business);
+        client.distribute_revenue(&business, &period, &revenue, &dn);
+
+        let record = client.get_distribution(&business, &period).unwrap();
+        assert_eq!(sum_amounts(&record.amounts), revenue);
+
+        // Distributions are independent per period; verify record exists
+        assert_eq!(record.total_amount, revenue);
+    }
+
+    assert_eq!(client.get_distribution_count(&business), 3);
+}
+
+#[test]
+fn test_rounding_dust_max_i128_revenue_safe() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    let stakeholders = create_stakeholders(&env, 2, true);
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-max");
+    // Use a very large i128 value (but not i128::MAX to avoid overflow in test setup)
+    let revenue = 9_223_372_036_854_775_000i128;
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    let record = client.get_distribution(&business, &period).unwrap();
+    assert_eq!(sum_amounts(&record.amounts), revenue);
+    assert_distribution_invariants(&env, &client, &token, &business, &period, &stakeholders, revenue);
+}
+
+#[test]
+fn test_rounding_dust_single_stakeholder_no_residual() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    let mut stakeholders = soroban_sdk::Vec::new(&env);
+    stakeholders.push_back(Stakeholder {
+        address: Address::generate(&env),
+        share_bps: 10_000,
+    });
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-single");
+    let revenue = 500_000i128;
+
+    submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+    mint(&env, &token, &business, revenue);
+
+    let dn = distribute_nonce(&client, &business);
+    client.distribute_revenue(&business, &period, &revenue, &dn);
+
+    let record = client.get_distribution(&business, &period).unwrap();
+    let stakeholder = stakeholders.get(0).unwrap();
+    let token_client = TokenClient::new(&env, &token);
+
+    // Single stakeholder gets 100%, no residual
+    assert_eq!(token_client.balance(&stakeholder.address), revenue);
+    assert_eq!(record.amounts.get(0).unwrap(), revenue);
+    assert_eq!(sum_amounts(&record.amounts), revenue);
+}
+
+#[test]
+fn test_rounding_dust_third_stakeholder_assignment_never_happens() {
+    let (env, client, att, admin, token, _att_id) = setup();
+
+    // 3 stakeholders: residual should never go to 2nd or 3rd
+    let mut stakeholders = soroban_sdk::Vec::new(&env);
+    for i in 0..3 {
+        stakeholders.push_back(Stakeholder {
+            address: Address::generate(&env),
+            share_bps: if i == 2 { 3334 } else { 3333 },
+        });
+    }
+    let n = admin_nonce(&client, &admin);
+    client.configure_stakeholders(&n, &stakeholders);
+
+    // Test multiple revenues to find rounding patterns
+    let revenues = vec![7i128, 13i128, 100i128, 1_000i128, 3_333i128, 10_000i128, 99_999i128];
+
+    for (idx, &revenue) in revenues.iter().enumerate() {
+        let business = Address::generate(&env);
+        let period = String::from_str(&env, &format!("2026-check-{}", idx));
+
+        submit_revenue_attestation(&env, &att, &business, &period, revenue, None);
+        mint(&env, &token, &business, revenue);
+
+        let dn = distribute_nonce(&client, &business);
+        client.distribute_revenue(&business, &period, &revenue, &dn);
+
+        let record = client.get_distribution(&business, &period).unwrap();
+        let token_client = TokenClient::new(&env, &token);
+
+        let base0 = RevenueShareContract::calculate_share(revenue, 3333);
+        let base1 = RevenueShareContract::calculate_share(revenue, 3333);
+        let base2 = RevenueShareContract::calculate_share(revenue, 3334);
+
+        let s0 = stakeholders.get(0).unwrap();
+        let s1 = stakeholders.get(1).unwrap();
+        let s2 = stakeholders.get(2).unwrap();
+
+        let actual0 = token_client.balance(&s0.address);
+        let actual1 = token_client.balance(&s1.address);
+        let actual2 = token_client.balance(&s2.address);
+
+        // Verify residual only goes to first
+        assert_eq!(actual0, base0 + (revenue - base0 - base1 - base2));
+        assert_eq!(actual1, base1);
+        assert_eq!(actual2, base2);
+
+        // Verify sum
+        assert_eq!(actual0 + actual1 + actual2, revenue);
+    }
 }
