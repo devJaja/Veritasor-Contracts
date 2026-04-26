@@ -898,3 +898,54 @@ fn test_stress_calculate_pricing_matches_quote_when_attestation_ok() {
     assert_eq!(c.tier_discount_bps, q.tier_discount_bps);
     assert_eq!(c.tier_level, q.tier_level);
 }
+
+#[test]
+#[should_panic(expected = "tier discounts must be non-decreasing (monotonic)")]
+fn test_non_monotonic_discounts_fail() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+
+    // Tier 2 has a lower discount than tier 1 — non-monotonic, must panic
+    let tiers = vec![
+        &env,
+        RevenueTier {
+            min_revenue: 100_000,
+            discount_bps: 200,
+        },
+        RevenueTier {
+            min_revenue: 500_000,
+            discount_bps: 100, // Lower than previous — violates monotonicity
+        },
+    ];
+
+    client.set_revenue_tiers(&admin, &tiers);
+}
+
+#[test]
+fn test_equal_discounts_across_tiers_allowed() {
+    // Equal discounts are non-decreasing, so they're allowed.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _, _) = setup(&env);
+
+    let tiers = vec![
+        &env,
+        RevenueTier {
+            min_revenue: 100_000,
+            discount_bps: 150,
+        },
+        RevenueTier {
+            min_revenue: 500_000,
+            discount_bps: 150, // Equal is OK
+        },
+        RevenueTier {
+            min_revenue: 1_000_000,
+            discount_bps: 200, // Increasing is OK
+        },
+    ];
+
+    client.set_revenue_tiers(&admin, &tiers);
+    let stored = client.get_revenue_tiers().unwrap();
+    assert_eq!(stored.len(), 3);
+}

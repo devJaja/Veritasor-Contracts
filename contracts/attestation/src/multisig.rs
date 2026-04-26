@@ -2,29 +2,6 @@
 //!
 //! This module implements a multisignature mechanism for managing sensitive
 //! protocol parameters and emergency actions in the attestation contract.
-//!
-//! ## Design
-//!
-//! The multisig system uses a proposal-and-approval model:
-//! 1. Any owner can propose an action
-//! 2. Other owners approve or reject the proposal
-//! 3. Once threshold approvals are reached, the action can be executed
-//! 4. Proposals expire after a configurable time window
-//!
-//! ## Actions
-//!
-//! Multisig-controlled actions include:
-//! - Emergency pause/unpause
-//! - Owner management (add/remove owners, change threshold)
-//! - Fee configuration changes
-//! - Role management for critical roles
-//!
-//! ## Security Properties
-//!
-//! - No single owner can execute critical actions alone
-//! - Proposals have expiration to prevent stale executions
-//! - Executed proposals are marked to prevent replay
-//! - Owner list and threshold are protected by multisig itself
 
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
@@ -46,8 +23,6 @@ pub enum MultisigKey {
     Approvals(u64),
     /// Next proposal ID counter
     NextProposalId,
-    /// Proposal expiration time in ledger sequence
-    ProposalExpiry(u64),
 }
 
 /// Types of actions that can be proposed
@@ -68,12 +43,10 @@ pub enum ProposalAction {
     GrantRole(Address, u32),
     /// Revoke a role from an address
     RevokeRole(Address, u32),
-    /// Update fee configuration
-    UpdateFeeConfig(Address, Address, i128, bool), // (token, collector, base_fee, enabled)
+    /// Update fee configuration: (token, collector, base_fee, enabled)
+    UpdateFeeConfig(Address, Address, i128, bool), 
     /// Emergency admin key rotation (bypasses timelock)
     EmergencyRotateAdmin(Address), // new_admin
-    UpdateFeeConfig(Address, Address, i128, bool),
-    EmergencyRotateAdmin(Address),
 }
 
 /// Proposal state
@@ -86,8 +59,6 @@ pub enum ProposalStatus {
     Executed,
     /// Proposal was rejected
     Rejected,
-    /// Proposal expired without execution
-    Expired,
 }
 
 /// Full proposal data
@@ -102,28 +73,11 @@ pub struct Proposal {
     pub proposer: Address,
     /// Current status
     pub status: ProposalStatus,
-    /// Ledger sequence when proposal was created
-    pub created_at: u32,
 }
-
-// ════════════════════════════════════════════════════════════════════
-//  Configuration
-// ════════════════════════════════════════════════════════════════════
-
-/// Default proposal expiration (in ledger sequences, ~1 week at 5s/ledger)
-pub const DEFAULT_PROPOSAL_EXPIRY: u32 = 120_960;
-
-/// Minimum number of owners required
-pub const MIN_OWNERS: u32 = 1;
-
-/// Maximum number of owners allowed
-pub const MAX_OWNERS: u32 = 10;
 
 // ════════════════════════════════════════════════════════════════════
 //  Owner Management
 // ════════════════════════════════════════════════════════════════════
-
-/// Get the list of multisig owners.
 
 pub fn get_owners(env: &Env) -> Vec<Address> {
     env.storage()
@@ -148,22 +102,21 @@ pub fn get_threshold(env: &Env) -> u32 {
         .unwrap_or(1)
 }
 
-pub fn rotate_threshold(env: &Env, new_threshold: u32) {
-    let owners = get_owners(env);
-    assert!(
-        new_threshold > 0 && new_threshold <= owners.len(),
-        "new threshold cannot exceed number of owners"
-    );
-    env.storage()
-        .instance()
-        .set(&MultisigKey::Threshold, &new_threshold);
-}
-
-pub fn initialize_multisig(env: &Env, owners: &Vec<Address>, threshold: u32) {
+pub fn initialize_multisig(env: &Env, owners: &Vec<Address>, threshold: u32, _nonce: u64) {
+    if env.storage().instance().has(&MultisigKey::Owners) {
+        panic!("multisig already initialized");
+    }
+    assert!(!owners.is_empty(), "must provide at least one owner");
+    assert!(threshold > 0 && threshold <= owners.len(), "invalid threshold");
+    
     set_owners(env, owners);
     env.storage()
         .instance()
         .set(&MultisigKey::Threshold, &threshold);
+}
+
+pub fn is_multisig_initialized(env: &Env) -> bool {
+    env.storage().instance().has(&MultisigKey::Owners)
 }
 
 pub fn create_proposal(env: &Env, proposer: &Address, action: ProposalAction) -> u64 {
@@ -179,15 +132,23 @@ pub fn create_proposal(env: &Env, proposer: &Address, action: ProposalAction) ->
         .instance()
         .set(&MultisigKey::NextProposalId, &(id + 1));
 
+    let created_at = env.ledger().sequence();
     let proposal = Proposal {
         id,
         action,
         proposer: proposer.clone(),
         status: ProposalStatus::Pending,
+        created_at,
     };
     env.storage()
         .instance()
         .set(&MultisigKey::Proposal(id), &proposal);
+
+    // Set expiry
+    let expiry = created_at + DEFAULT_PROPOSAL_EXPIRY;
+    env.storage()
+        .instance()
+        .set(&MultisigKey::ProposalExpiry(id), &expiry);
 
     let mut approvals = Vec::new(env);
     approvals.push_back(proposer.clone());
@@ -208,9 +169,23 @@ pub fn get_approvals(env: &Env, id: u64) -> Vec<Address> {
         .unwrap_or_else(|| Vec::new(env))
 }
 
+pub fn is_proposal_expired(env: &Env, id: u64) -> bool {
+    if let Some(expiry) = env.storage().instance().get::<_, u32>(&MultisigKey::ProposalExpiry(id)) {
+        return env.ledger().sequence() > expiry;
+    }
+    false
+}
+
 pub fn approve_proposal(env: &Env, approver: &Address, id: u64) {
     approver.require_auth();
-    let proposal = get_proposal(env, id).expect("proposal not found");
+    let mut proposal = get_proposal(env, id).expect("proposal not found");
+    
+    if is_proposal_expired(env, id) {
+        proposal.status = ProposalStatus::Expired;
+        env.storage().instance().set(&MultisigKey::Proposal(id), &proposal);
+        panic!("proposal has expired");
+    }
+
     assert!(
         proposal.status == ProposalStatus::Pending,
         "proposal is not pending"
@@ -240,15 +215,22 @@ pub fn reject_proposal(env: &Env, rejecter: &Address, id: u64) {
 }
 
 pub fn is_proposal_approved(env: &Env, id: u64) -> bool {
-    get_approvals(env, id).len() >= get_threshold(env)
+    get_approvals(env, id).len() as u32 >= get_threshold(env)
 }
 
 pub fn get_approval_count(env: &Env, id: u64) -> u32 {
-    get_approvals(env, id).len()
+    get_approvals(env, id).len() as u32
 }
 
 pub fn mark_executed(env: &Env, id: u64) {
     let mut proposal = get_proposal(env, id).expect("proposal not found");
+    
+    if is_proposal_expired(env, id) {
+        proposal.status = ProposalStatus::Expired;
+        env.storage().instance().set(&MultisigKey::Proposal(id), &proposal);
+        panic!("proposal has expired");
+    }
+
     assert!(
         proposal.status == ProposalStatus::Pending,
         "proposal is not pending"
@@ -259,41 +241,8 @@ pub fn mark_executed(env: &Env, id: u64) {
         .instance()
         .set(&MultisigKey::Proposal(id), &proposal);
 }
-/// Initialize the multisig with initial owners and threshold.
-pub fn initialize_multisig(env: &Env, owners: &Vec<Address>, threshold: u32) {
-    assert!(
-        !env.storage().instance().has(&MultisigKey::Owners),
-        "multisig already initialized"
-    );
-    assert!(!owners.is_empty(), "must provide at least one owner");
-    assert!(threshold > 0, "threshold must be at least 1");
-    assert!(
-        threshold <= owners.len(),
-        "threshold cannot exceed number of owners"
-    );
 
-    set_owners(env, owners);
-    env.storage()
-        .instance()
-        .set(&MultisigKey::Threshold, &threshold);
-}
-
-/// Check if multisig is initialized.
-pub fn is_multisig_initialized(env: &Env) -> bool {
-    env.storage().instance().has(&MultisigKey::Owners)
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  Require Multisig Approval
-// ════════════════════════════════════════════════════════════════════
-
-/// Require that the caller is an owner with proper authorization.
 pub fn require_owner(env: &Env, caller: &Address) {
     caller.require_auth();
     assert!(is_owner(env, caller), "caller is not a multisig owner");
-}
-
-/// Get the approval count for a proposal.
-pub fn get_approval_count(env: &Env, id: u64) -> u32 {
-    get_approvals(env, id).len()
 }

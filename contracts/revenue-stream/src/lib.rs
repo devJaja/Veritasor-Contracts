@@ -2,7 +2,10 @@
 //!
 //! Releases payments to beneficiaries when referenced attestation data exists
 //! and is not revoked. Streams are funded at creation; release is gated by
-//! attestation check via cross-contract call.
+//! an attestation check via cross-contract call. Supports **lump** (single
+//! payout) and **linear** accrual schedules, plus an admin **pause** that
+//! stops claims and **freezes** the effective schedule time; **resume** remaps
+//! ledger so pauses are not counted toward accrual (O(1), stream rows unchanged).
 
 #![allow(clippy::too_many_arguments)]
 #![no_std]
@@ -12,7 +15,7 @@ use soroban_sdk::{
 use veritasor_attestation::AttestationContractClient;
 use veritasor_common::replay_protection;
 
-/// Nonce channels for replay protection
+/// Nonce channel for admin replay protection.
 pub const NONCE_CHANNEL_ADMIN: u32 = 1;
 
 /// Attestation client: WASM import for wasm32 (avoids duplicate symbols), crate for tests.
@@ -81,6 +84,23 @@ impl<'a> AttestationContractClient<'a> {
 mod test;
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum VestingSchedule {
+    /// One payment: zero or more i128 is vested once the optional cliff (ledger time) is reached.
+    /// Vested amount is always the full `Stream::amount` after the cliff, or immediately if
+    /// `cliff` is `None` (time does not block vesting; attestation and pause still apply at release).
+    Lump { cliff: Option<u64> },
+    /// Linear accrual: from `accrual_start` (inclusive) to `accrual_end` (exclusive of duration
+    /// endpoint in the sense that at `accrual_end` the full amount is vested). Invariants enforced at
+    /// create: `accrual_start < accrual_end` and `accrual_end - accrual_start` fits in u64; vesting
+    /// uses the interval `[accrual_start, accrual_end)`.
+    Linear {
+        accrual_start: u64,
+        accrual_end: u64,
+    },
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub enum DataKey {
     Admin,
@@ -88,6 +108,23 @@ pub enum DataKey {
     NextStreamId,
     /// Stream by id.
     Stream(u64),
+    /// When true, [`release`](RevenueStreamContract::release) reverts; schedule time is frozen.
+    Paused,
+    /// While paused: frozen `effective_vest_ledger` value (not raw ledger) so vesting is constant until resume.
+    PauseSnapshotT,
+    /// Active after at least one `resume` until overwritten; see [`VestTimeRemap`].
+    VestTimeRemap,
+}
+
+/// Maps real ledger to schedule time: `t_eff(ledger) = t_eff0 + (ledger - at_ledger)`; see
+/// [`get_effective_vest_ledger`](RevenueStreamContract::get_effective_vest_ledger).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestTimeRemap {
+    /// Effective time at the anchor ledger (frozen value after pause, before new accrual).
+    pub t_eff0: u64,
+    /// Ledger time when that `t_eff0` was fixed (end of a pause / resume call).
+    pub at_ledger: u64,
 }
 
 #[contracttype]
@@ -100,22 +137,94 @@ pub struct Stream {
     pub period: String,
     pub beneficiary: Address,
     pub token: Address,
+    /// Total funded amount for this stream.
     pub amount: i128,
-    pub cliff_timestamp: Option<u64>,
-    pub released: bool,
+    /// Schedule for how much of `amount` is time-vested at a given ledger time.
+    pub vesting: VestingSchedule,
+    /// Cumulative amount already transferred to the beneficiary (0 ..= amount).
+    pub released_amount: i128,
 }
 
 #[contract]
 pub struct RevenueStreamContract;
+
+/// Returns the schedule time for vesting, shared by all streams (pause freezes it; after resume,
+/// it advances 1:1 with ledger with an anchor that skips paused intervals).
+fn effective_vest_ledger_time(env: &Env) -> u64 {
+    let ledger = env.ledger().timestamp();
+    if env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+    {
+        return env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseSnapshotT)
+            .expect("paused without snapshot");
+    }
+    if let Some(m) = env
+        .storage()
+        .instance()
+        .get(&DataKey::VestTimeRemap)
+    {
+        return m
+            .t_eff0
+            .saturating_add(ledger.saturating_sub(m.at_ledger));
+    }
+    ledger
+}
+
+/// Time-based portion of the stream that is vested at `t_upper` (not accounting for attestation).
+fn vested_by_schedule(
+    amount: i128,
+    vesting: &VestingSchedule,
+    t_upper: u64,
+) -> i128 {
+    assert!(amount > 0, "internal: amount");
+    match vesting {
+        VestingSchedule::Lump { cliff } => {
+            if let Some(c) = cliff {
+                if t_upper < *c {
+                    return 0;
+                }
+            }
+            amount
+        }
+        VestingSchedule::Linear {
+            accrual_start,
+            accrual_end,
+        } => {
+            if t_upper <= *accrual_start {
+                return 0;
+            }
+            let end = *accrual_end;
+            if t_upper >= end {
+                return amount;
+            }
+            let duration = (end - accrual_start) as i128;
+            let elapsed = (t_upper - accrual_start) as i128;
+            (amount
+                .checked_mul(elapsed)
+                .and_then(|v| v.checked_div(duration))
+                .expect("vesting math overflow or zero duration")) as i128
+        }
+    }
+}
+
+fn is_fully_paid(s: &Stream) -> bool {
+    s.released_amount >= s.amount
+}
 
 #[contractimpl]
 #[allow(clippy::too_many_arguments)]
 impl RevenueStreamContract {
     /// Initialize the contract with an admin address.
     ///
-    /// # Replay Protection
-    /// Uses admin address and `NONCE_CHANNEL_ADMIN` channel.
-    /// First call must use nonce 0.
+    /// # Replay protection
+    /// Uses the admin address and [`NONCE_CHANNEL_ADMIN`]. The first call must use nonce 0
+    /// per channel semantics in `veritasor_common::replay_protection`.
     pub fn initialize(env: Env, admin: Address, nonce: u64) {
         admin.require_auth();
 
@@ -127,14 +236,18 @@ impl RevenueStreamContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextStreamId, &0u64);
+        env.storage().instance().set(&DataKey::Paused, &false);
     }
 
-    /// Create a stream: fund it with `amount` of `token` (transferred from caller).
-    /// Release is allowed once attestation (business, period) exists and is not revoked,
-    /// and if cliff_timestamp is set, after the current time reaches the cliff.
+    /// Create a stream: fund it with `amount` of `token` (transferred from admin).
     ///
-    /// # Replay Protection
-    /// Uses admin address and `NONCE_CHANNEL_ADMIN` channel.
+    /// # Invariants
+    /// - `amount > 0`.
+    /// - `Linear`: `accrual_start < accrual_end` and positive duration; each stream is O(1) storage.
+    /// - Tokens are moved from the admin into this contract before the stream is stored.
+    ///
+    /// # Replay protection
+    /// Same channel as other admin entrypoints ([`NONCE_CHANNEL_ADMIN`]).
     #[allow(clippy::too_many_arguments)]
     pub fn create_stream(
         env: Env,
@@ -146,7 +259,7 @@ impl RevenueStreamContract {
         beneficiary: Address,
         token: Address,
         amount: i128,
-        cliff_timestamp: Option<u64>,
+        vesting: VestingSchedule,
     ) -> u64 {
         let stored_admin: Address = env
             .storage()
@@ -159,6 +272,17 @@ impl RevenueStreamContract {
         // Verify and increment nonce for replay protection
         replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
         assert!(amount > 0, "amount must be positive");
+        if let VestingSchedule::Linear {
+            accrual_start,
+            accrual_end,
+        } = &vesting
+        {
+            assert!(
+                accrual_start < accrual_end,
+                "accrual_start must be before accrual_end"
+            );
+            let _ = accrual_end - accrual_start;
+        }
         let id: u64 = env
             .storage()
             .instance()
@@ -172,8 +296,8 @@ impl RevenueStreamContract {
             beneficiary: beneficiary.clone(),
             token: token.clone(),
             amount,
-            cliff_timestamp,
-            released: false,
+            vesting,
+            released_amount: 0,
         };
         env.storage().instance().set(&DataKey::Stream(id), &stream);
         env.storage()
@@ -185,19 +309,41 @@ impl RevenueStreamContract {
         id
     }
 
-    /// Release a stream if the referenced attestation exists and is not revoked,
-    /// and the cliff timestamp has been reached (if set).
-    /// Transfers the stream amount to the beneficiary and marks it released.
+    /// Transfers the **claimable** balance (schedule-vested minus already released) to the beneficiary
+    /// if the attestation exists, is not revoked, and the contract is not paused. Reverts with
+    /// `nothing to claim` when the schedule has not yet vested funds or the remainder is zero; with
+    /// `cliff not reached` for lump+cliff when the effective time is before the cliff.
+    ///
+    /// # Security
+    /// - Re-checks the attestation contract on every call (no trust in cached attestation state).
+    /// - Reverts when paused (accrual time is frozen; see module docs and [`VestTimeRemap`]).
+    /// - Partial payouts for `Linear` schedules; re-entrant safe by updating storage before token transfer.
     pub fn release(env: Env, stream_id: u64) {
         let mut stream: Stream = env
             .storage()
             .instance()
             .get(&DataKey::Stream(stream_id))
             .expect("stream not found");
-        assert!(!stream.released, "stream already released");
-        if let Some(cliff) = stream.cliff_timestamp {
-            assert!(env.ledger().timestamp() >= cliff, "cliff not reached");
+        if is_fully_paid(&stream) {
+            panic!("stream already released");
         }
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(!paused, "contract is paused");
+
+        let t_upper = effective_vest_ledger_time(&env);
+        if let VestingSchedule::Lump { cliff: Some(c) } = &stream.vesting {
+            if t_upper < *c {
+                panic!("cliff not reached");
+            }
+        }
+        let time_vested = vested_by_schedule(stream.amount, &stream.vesting, t_upper);
+        let pay_cap = (time_vested - stream.released_amount).min(stream.amount - stream.released_amount);
+        assert!(pay_cap > 0, "nothing to claim");
+
         let client = AttestationContractClient::new(&env, &stream.attestation_contract);
         let exists = client
             .get_attestation(&stream.business, &stream.period)
@@ -205,13 +351,102 @@ impl RevenueStreamContract {
         let revoked = client.is_revoked(&stream.business, &stream.period);
         assert!(exists, "attestation not found");
         assert!(!revoked, "attestation is revoked");
-        stream.released = true;
+        stream.released_amount = stream
+            .released_amount
+            .checked_add(pay_cap)
+            .expect("released_amount overflow");
         env.storage()
             .instance()
             .set(&DataKey::Stream(stream_id), &stream);
         let token_client = token::Client::new(&env, &stream.token);
         let self_addr = env.current_contract_address();
-        token_client.transfer(&self_addr, &stream.beneficiary, &stream.amount);
+        token_client.transfer(&self_addr, &stream.beneficiary, &pay_cap);
+    }
+
+    /// Pause: admin + replay nonce. Freezes the effective schedule time used for all streams (see
+    /// [`VestTimeRemap`]) so vesting no longer increases while paused. [`release`](Self::release) reverts.
+    /// A second `pause` while already paused reverts. Stores snapshot before setting the paused flag.
+    pub fn pause(env: Env, admin: Address, nonce: u64) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        assert_eq!(admin, stored_admin);
+        admin.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(!paused, "already paused");
+        let snapshot = effective_vest_ledger_time(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseSnapshotT, &snapshot);
+        env.storage().instance().set(&DataKey::Paused, &true);
+    }
+
+    /// Resume: anchors [`VestTimeRemap`] so that after this ledger, `t_eff(ledger) = t_snap + (ledger - now)`,
+    /// where `t_snap` is the frozen effective time at pause. No per-stream storage writes.
+    /// Reverts if not paused.
+    pub fn resume(env: Env, admin: Address, nonce: u64) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        assert_eq!(admin, stored_admin);
+        admin.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        assert!(paused, "not paused");
+        let t_snap: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseSnapshotT)
+            .expect("pause state inconsistent");
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(
+            &DataKey::VestTimeRemap,
+            &VestTimeRemap {
+                t_eff0: t_snap,
+                at_ledger: now,
+            },
+        );
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().remove(&DataKey::PauseSnapshotT);
+    }
+
+    /// Whether the contract is in the paused state (claims blocked; schedule time frozen for vesting).
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Read-only: schedule-vested amount at the current effective time, ignoring attestation.
+    /// UIs can compare with `Stream::released_amount` for time-based claimable.
+    pub fn get_vested_by_schedule(env: Env, stream_id: u64) -> i128 {
+        let stream: Stream = env
+            .storage()
+            .instance()
+            .get(&DataKey::Stream(stream_id))
+            .expect("stream not found");
+        let t = effective_vest_ledger_time(&env);
+        vested_by_schedule(stream.amount, &stream.vesting, t)
+    }
+
+    /// Global effective time used for all streams' `VestingSchedule` (same units as
+    /// `env.ledger().timestamp()` and `Stream` accrual bounds). See module docs and [`VestTimeRemap`].
+    pub fn get_effective_vest_ledger(env: Env) -> u64 {
+        effective_vest_ledger_time(&env)
     }
 
     /// Get stream by id.

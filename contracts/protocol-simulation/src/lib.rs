@@ -332,6 +332,27 @@ impl ProtocolSimulationContract {
         params.lender.require_auth();
         params.business.require_auth();
 
+        // Validate financial parameters
+        assert!(params.principal > 0, "principal must be positive");
+        assert!(
+            params.revenue_share_bps <= 10_000,
+            "revenue share basis points must be <= 10000"
+        );
+        assert!(
+            params.min_revenue_threshold >= 0,
+            "min revenue threshold must be non-negative"
+        );
+        assert!(
+            params.max_repayment_amount >= 0,
+            "max repayment amount must be non-negative"
+        );
+
+        // Validate attested revenue against thresholds
+        assert!(
+            attested_revenue >= 0,
+            "attested revenue must be non-negative"
+        );
+
         let scenario_id = Self::create_scenario(
             &env,
             String::from_str(&env, "lender_integration"),
@@ -382,6 +403,9 @@ impl ProtocolSimulationContract {
     ) -> u64 {
         params.attestor.require_auth();
 
+        // Validate staking parameters
+        assert!(params.stake_amount > 0, "stake amount must be positive");
+
         let scenario_id = Self::create_scenario(
             &env,
             String::from_str(&env, "staking_scenario"),
@@ -423,6 +447,7 @@ impl ProtocolSimulationContract {
     pub fn run_multi_period_scenario(env: Env, params: MultiPeriodParams) -> u64 {
         params.business.require_auth();
 
+        // Validate array lengths
         assert!(
             params.periods.len() == params.merkle_roots.len(),
             "periods and merkle_roots length mismatch"
@@ -431,6 +456,24 @@ impl ProtocolSimulationContract {
             params.periods.len() == params.timestamps.len(),
             "periods and timestamps length mismatch"
         );
+        assert!(
+            params.periods.len() == params.revenues.len(),
+            "periods and revenues length mismatch"
+        );
+
+        // Validate reasonable bounds to prevent gas exhaustion
+        assert!(
+            params.periods.len() <= 100,
+            "too many periods: maximum 100 allowed"
+        );
+
+        // Validate timestamp ordering
+        for i in 1..params.timestamps.len() {
+            assert!(
+                params.timestamps.get(i - 1).unwrap() < params.timestamps.get(i).unwrap(),
+                "timestamps must be in chronological order"
+            );
+        }
 
         let scenario_id = Self::create_scenario(
             &env,
@@ -731,11 +774,26 @@ impl ProtocolSimulationContract {
     }
 
     fn update_scenario_status(env: &Env, scenario_id: u64, status: u32) {
+        // Validate status range
+        assert!(status <= 3, "invalid status: must be 0-3");
+
         let mut scenario: ScenarioConfig = env
             .storage()
             .instance()
             .get(&DataKey::Scenario(scenario_id))
             .expect("scenario not found");
+
+        // Validate status transitions
+        match (scenario.status, status) {
+            (0, 1) | (1, 2) | (1, 3) | (0, 3) => {
+                // Valid transitions: pending->running, running->completed, running->failed, pending->failed
+            }
+            _ => panic!(
+                "invalid status transition from {} to {}",
+                scenario.status, status
+            ),
+        }
+
         scenario.status = status;
         env.storage()
             .instance()

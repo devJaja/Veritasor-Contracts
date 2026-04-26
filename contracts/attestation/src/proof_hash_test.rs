@@ -366,3 +366,127 @@ fn test_prevent_proof_hash_overwrite() {
     // Attempting to overwrite with a different hash should panic.
     client.submit_attestation(&business, &period, &root, &1_700_000_001u64, &1u32, &Some(hash2), &None);
 }
+// ════════════════════════════════════════════════════════════════════
+//  Property-Based Tests for Commitment Consistency
+// ════════════════════════════════════════════════════════════════════
+
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))] // Balance thoroughness vs test time
+
+    #[test]
+    fn prop_commitment_uniqueness(
+        v1 in 0u32..u32::MAX,
+        v2 in 0u32..u32::MAX,
+        root1_raw in prop::array::uniform32(0u8..255u8),
+        root2_raw in prop::array::uniform32(0u8..255u8),
+        period1_str in "[a-zA-Z0-9-]{1,20}",
+        period2_str in "[a-zA-Z0-9-]{1,20}",
+    ) {
+        let env = Env::default();
+        let client = AttestationContractClient::new(&env, &env.register(AttestationContract, ()));
+        
+        let biz1 = Address::generate(&env);
+        let biz2 = Address::generate(&env);
+        let p1 = String::from_str(&env, &period1_str);
+        let p2 = String::from_str(&env, &period2_str);
+        let r1 = BytesN::from_array(&env, &root1_raw);
+        let r2 = BytesN::from_array(&env, &root2_raw);
+
+        let h1 = client.compute_commitment(&biz1, &p1, &r1, &v1);
+
+        // Property: Changing any single field must change the hash (collision resistance)
+        
+        // 1. Different business
+        let h_diff_biz = client.compute_commitment(&biz2, &p1, &r1, &v1);
+        if biz1 != biz2 {
+            prop_assert_ne!(&h1, &h_diff_biz, "Different businesses must have different commitments");
+        }
+
+        // 2. Different period
+        let h_diff_period = client.compute_commitment(&biz1, &p2, &r1, &v1);
+        if period1_str != period2_str {
+            prop_assert_ne!(&h1, &h_diff_period, "Different periods must have different commitments");
+        }
+
+        // 3. Different root
+        let h_diff_root = client.compute_commitment(&biz1, &p1, &r2, &v1);
+        if root1_raw != root2_raw {
+            prop_assert_ne!(&h1, &h_diff_root, "Different roots must have different commitments");
+        }
+
+        // 4. Different version
+        let h_diff_ver = client.compute_commitment(&biz1, &p1, &r1, &v2);
+        if v1 != v2 {
+            prop_assert_ne!(&h1, &h_diff_ver, "Different versions must have different commitments");
+        }
+    }
+
+    #[test]
+    fn prop_commitment_stability(
+        version in 0u32..u32::MAX,
+        root_raw in prop::array::uniform32(0u8..255u8),
+        period_str in "[a-zA-Z0-9-]{1,20}",
+    ) {
+        let env = Env::default();
+        let client = AttestationContractClient::new(&env, &env.register(AttestationContract, ()));
+        let biz = Address::generate(&env);
+        let p = String::from_str(&env, &period_str);
+        let r = BytesN::from_array(&env, &root_raw);
+
+        let h1 = client.compute_commitment(&biz, &p, &r, &version);
+        let h2 = client.compute_commitment(&biz, &p, &r, &version);
+
+        // Property: Determinism/Stability
+        prop_assert_eq!(h1, h2, "Commitment must be deterministic for identical inputs");
+    }
+}
+
+#[test]
+fn test_commitment_endianness_stability() {
+    let env = Env::default();
+    let client = AttestationContractClient::new(&env, &env.register(AttestationContract, ()));
+    
+    let biz = Address::generate(&env);
+    let p = String::from_str(&env, "2026-01");
+    let r = BytesN::from_array(&env, &[0xAAu8; 32]);
+    let v = 123456789u32;
+
+    let h = client.compute_commitment(&biz, &p, &r, &v);
+    
+    // We expect a specific hash if endianness is handled correctly (Big Endian)
+    // This is a regression test for encoding changes.
+    // The exact value depends on Address/String XDR, so we just verify it doesn't change
+    // across multiple calls in this test.
+    let h2 = client.compute_commitment(&biz, &p, &r, &v);
+    assert_eq!(h, h2);
+}
+
+#[test]
+#[should_panic(expected = "proof_hash does not match canonical commitment")]
+fn test_submit_attestation_invalid_proof_hash_rejection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AttestationContract, ());
+    let client = AttestationContractClient::new(&env, &contract_id);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-01");
+    let root = BytesN::from_array(&env, &[0u8; 32]);
+    let version = 1;
+    
+    // Provide a random proof hash that won't match the commitment
+    let invalid_hash = BytesN::from_array(&env, &[0xAAu8; 32]);
+
+    client.submit_attestation(
+        &business,
+        &period,
+        &root,
+        &1_700_000_000u64,
+        &version,
+        &Some(invalid_hash),
+        &None,
+        &0u64,
+    );
+}

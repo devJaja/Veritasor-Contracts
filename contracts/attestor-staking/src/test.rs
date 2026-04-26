@@ -194,3 +194,96 @@ fn test_request_unstake_locked_funds() {
 
     client.request_unstake(&attestor, &3000);
 }
+
+#[test]
+#[should_panic(expected = "min_stake must be positive")]
+fn test_initialize_zero_min_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &0,
+        &Address::generate(&env),
+        &0,
+    );
+}
+
+#[test]
+#[should_panic(expected = "unbonding period too long")]
+fn test_initialize_extreme_unbonding() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &1000,
+        &Address::generate(&env),
+        &(31_536_000 + 1), // 1 year + 1 second
+    );
+}
+
+#[test]
+#[should_panic(expected = "admin and treasury must be distinct")]
+fn test_initialize_duplicate_roles_admin_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    let same_addr = Address::generate(&env);
+    client.initialize(
+        &same_addr,
+        &Address::generate(&env),
+        &same_addr,
+        &1000,
+        &Address::generate(&env),
+        &0,
+    );
+}
+
+#[test]
+#[should_panic(expected = "token and treasury must be distinct")]
+fn test_initialize_duplicate_roles_token_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    let same_addr = Address::generate(&env);
+    client.initialize(
+        &Address::generate(&env),
+        &same_addr,
+        &same_addr,
+        &1000,
+        &Address::generate(&env),
+        &0,
+    );
+}
+
+#[test]
+#[should_panic(expected = "token cannot be self")]
+fn test_initialize_circular_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AttestorStakingContract, ());
+    let client = AttestorStakingContractClient::new(&env, &contract_id);
+
+    client.initialize(
+        &Address::generate(&env),
+        &contract_id,
+        &Address::generate(&env),
+        &1000,
+        &Address::generate(&env),
+        &0,
+    );
+}
+

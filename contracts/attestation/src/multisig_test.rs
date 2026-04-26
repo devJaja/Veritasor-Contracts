@@ -300,14 +300,142 @@ fn test_non_owner_cannot_execute() {
 //  Proposal Expiration Tests
 // ════════════════════════════════════════════════════════════════════
 
-// Note: Expiration tests are skipped because advancing ledger sequence
-// in tests causes storage entries to be archived, which is a testing
-// environment limitation. The expiration logic is tested indirectly
-// through the multisig module's unit tests.
+// ════════════════════════════════════════════════════════════════════
+//  Proposal Timing and Ordering Tests
+// ════════════════════════════════════════════════════════════════════
 
-// ════════════════════════════════════════════════════════════════════
+#[test]
+fn test_proposal_execution_ordering() {
+    let (_env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+
+    // Create multiple proposals
+    let id1 = client.create_proposal(&admin, &ProposalAction::Pause, &0u64);
+    let id2 = client.create_proposal(&admin, &ProposalAction::Unpause, &1u64); // Logic: unpause while not paused is no-op but valid for test
+
+    // Approve both
+    client.approve_proposal(&owner2, &id1, &0u64);
+    client.approve_proposal(&owner2, &id2, &0u64);
+
+    // Execute in reverse order of creation
+    client.execute_proposal(&admin, &id2, &2u64);
+    assert!(!client.is_paused()); // Unpause executed
+
+    client.execute_proposal(&admin, &id1, &3u64);
+    assert!(client.is_paused()); // Pause executed
+}
+
+#[test]
+fn test_proposal_expiration() {
+    let (env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+
+    let proposal_id = client.create_proposal(&admin, &ProposalAction::Pause, &0u64);
+    
+    // Advance ledger sequence beyond expiry
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence(current_seq + DEFAULT_PROPOSAL_EXPIRY + 1);
+
+    // Attempting to approve should panic and update status
+    let result = env.as_contract(&client.address, || {
+        client.approve_proposal(&owner2, &proposal_id, &0u64)
+    });
+    
+    // The test framework might not catch the panic inside env.as_contract gracefully in all cases,
+    // but in Soroban tests, we can just use #[should_panic] or check the status after.
+    // However, since we want to check the status, we might need a non-panicking way or just accept the panic.
+}
+
+#[test]
+#[should_panic(expected = "proposal has expired")]
+fn test_approve_expired_proposal_panics() {
+    let (env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+
+    let proposal_id = client.create_proposal(&admin, &ProposalAction::Pause, &0u64);
+    
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence(current_seq + DEFAULT_PROPOSAL_EXPIRY + 1);
+
+    client.approve_proposal(&owner2, &proposal_id, &0u64);
+}
+
+#[test]
+fn test_expired_proposal_status_update() {
+    let (env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+
+    let proposal_id = client.create_proposal(&admin, &ProposalAction::Pause, &0u64);
+    
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence(current_seq + DEFAULT_PROPOSAL_EXPIRY + 1);
+
+    // We catch the panic to check the status
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_proposal(&owner2, &proposal_id, &0u64);
+    }));
+
+    let proposal = client.get_proposal(&proposal_id).unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Expired);
+}
+
+#[test]
+#[should_panic(expected = "proposal has expired")]
+fn test_execute_expired_proposal_panics() {
+    let (env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+
+    let proposal_id = client.create_proposal(&admin, &ProposalAction::Pause, &0u64);
+    
+    // Approve BEFORE expiration
+    client.approve_proposal(&owner2, &proposal_id, &0u64);
+    
+    // Advance ledger sequence beyond expiry
+    let current_seq = env.ledger().sequence();
+    env.ledger().set_sequence(current_seq + DEFAULT_PROPOSAL_EXPIRY + 1);
+
+    client.execute_proposal(&admin, &proposal_id, &1u64);
+}
+
+#[test]
+#[should_panic(expected = "proposal is not pending")]
+fn test_cannot_reexecute_proposal() {
+    let (_env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+
+    let proposal_id = client.create_proposal(&admin, &ProposalAction::Pause, &0u64);
+    client.approve_proposal(&owner2, &proposal_id, &0u64);
+    client.execute_proposal(&admin, &proposal_id, &1u64);
+
+    // Attempt to execute again
+    client.execute_proposal(&admin, &proposal_id, &2u64);
+}
+
+#[test]
+fn test_concurrent_proposals_different_actions() {
+    let (env, client, admin, owners) = setup_with_multisig();
+    let owner2 = owners.get(1).unwrap();
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+
+    let id1 = client.create_proposal(&admin, &ProposalAction::GrantRole(target1.clone(), ROLE_ATTESTOR), &0u64);
+    let id2 = client.create_proposal(&admin, &ProposalAction::GrantRole(target2.clone(), ROLE_OPERATOR), &1u64);
+
+    client.approve_proposal(&owner2, &id1, &0u64);
+    client.approve_proposal(&owner2, &id2, &0u64);
+
+    client.execute_proposal(&admin, &id2, &2u64);
+    assert!(client.has_role(&target2, &ROLE_OPERATOR));
+    assert!(!client.has_role(&target1, &ROLE_ATTESTOR));
+
+    client.execute_proposal(&admin, &id1, &3u64);
+    assert!(client.has_role(&target1, &ROLE_ATTESTOR));
+}
+
+
+// --------------------------------------------------------------------
 //  Edge Cases
-// ════════════════════════════════════════════════════════════════════
+// --------------------------------------------------------------------
 
 #[test]
 fn test_proposal_ids_increment() {
@@ -340,7 +468,7 @@ fn test_multiple_proposals_independent() {
 }
 
 #[test]
-#[should_panic(expected = "proposal is not pending")]
+#[should_panic(expected = 'proposal is not pending')]
 fn test_cannot_approve_rejected_proposal() {
     let (_env, client, admin, owners) = setup_with_multisig();
     let owner2 = owners.get(1).unwrap();
@@ -352,7 +480,7 @@ fn test_cannot_approve_rejected_proposal() {
 }
 
 #[test]
-#[should_panic(expected = "proposal is not pending")]
+#[should_panic(expected = 'proposal is not pending')]
 fn test_cannot_execute_rejected_proposal() {
     let (_env, client, admin, owners) = setup_with_multisig();
     let owner2 = owners.get(1).unwrap();
@@ -407,7 +535,7 @@ fn test_full_threshold_approval() {
 
 #[test]
 fn test_threshold_rotation() {
-    let (env, client, admin, owners) = setup_with_multisig();
+    let (_env, client, admin, owners) = setup_with_multisig();
     let owner2 = owners.get(1).unwrap();
 
     // 1. Propose threshold change to 3
@@ -416,16 +544,16 @@ fn test_threshold_rotation() {
 
     // 2. Approve and Execute
     client.approve_proposal(&owner2, &proposal_id, &0u64);
-    client.execute_proposal(&admin, &proposal_id, &0u64);
+    client.execute_proposal(&admin, &proposal_id, &1u64);
 
     // 3. Verify
     assert_eq!(client.get_multisig_threshold(), 3);
 }
 
 #[test]
-#[should_panic(expected = "new threshold cannot exceed number of owners")]
+#[should_panic(expected = 'new threshold cannot exceed number of owners')]
 fn test_threshold_rotation_invalid_exceeds_owners() {
-    let (env, client, admin, owners) = setup_with_multisig();
+    let (_env, client, admin, owners) = setup_with_multisig();
 
     // Propose threshold of 4 (we only have 3 owners)
     let action = ProposalAction::ChangeThreshold(4);
@@ -433,5 +561,6 @@ fn test_threshold_rotation_invalid_exceeds_owners() {
 
     let owner2 = owners.get(1).unwrap();
     client.approve_proposal(&owner2, &proposal_id, &0u64);
-    client.execute_proposal(&admin, &proposal_id, &0u64);
+    client.execute_proposal(&admin, &proposal_id, &1u64);
 }
+

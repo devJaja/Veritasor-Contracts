@@ -69,6 +69,10 @@ fn submit_attestation(
     );
 }
 
+fn period_of_len(env: &Env, len: usize) -> String {
+    String::from_str(env, &"a".repeat(len))
+}
+
 // ── Initialization ───────────────────────────────────────────────────
 
 #[test]
@@ -88,6 +92,14 @@ fn test_initialize_with_attestation_contract() {
     let admin = Address::generate(&env);
     client.initialize(&admin, &Some(att_id.clone()));
     assert_eq!(client.get_attestation_contract(), Some(att_id));
+}
+
+#[test]
+fn test_get_limits() {
+    let (_env, client, _admin) = setup_snapshot_only();
+    assert_eq!(client.get_max_period_bytes(), MAX_PERIOD_BYTES);
+    assert_eq!(client.get_max_business_periods(), MAX_BUSINESS_PERIODS);
+    assert_eq!(client.get_max_epoch_businesses(), MAX_EPOCH_BUSINESSES);
 }
 
 #[test]
@@ -161,6 +173,15 @@ fn test_record_unauthorized_panics() {
     client.record_snapshot(&other, &business, &period, &100_000i128, &0u32, &0u64);
 }
 
+#[test]
+#[should_panic(expected = "period exceeds max bytes")]
+fn test_record_rejects_period_over_limit() {
+    let (env, client, admin) = setup_snapshot_only();
+    let business = Address::generate(&env);
+    let period = period_of_len(&env, (MAX_PERIOD_BYTES + 1) as usize);
+    client.record_snapshot(&admin, &business, &period, &100_000i128, &0u32, &1u64);
+}
+
 // ── Recording with attestation contract (validation) ─────────────────
 
 #[test]
@@ -181,6 +202,35 @@ fn test_record_with_attestation_required_panics_when_no_attestation() {
     let (env, snap_client, _att_client, admin, business) = setup_with_attestation();
     let period = String::from_str(&env, "2026-02");
     snap_client.record_snapshot(&admin, &business, &period, &100_000i128, &0u32, &0u64);
+}
+
+#[test]
+#[should_panic(expected = "attestation must not be revoked")]
+fn test_record_with_attestation_required_panics_when_revoked() {
+    let (env, snap_client, att_client, admin, business) = setup_with_attestation();
+    let period = String::from_str(&env, "2026-02");
+
+    submit_attestation(&env, &att_client, &business, &period);
+    att_client.revoke_attestation(
+        &admin,
+        &business,
+        &period,
+        &String::from_str(&env, "operator rollback"),
+        &1u64,
+    );
+
+    snap_client.record_snapshot(&admin, &business, &period, &100_000i128, &0u32, &1u64);
+}
+
+#[test]
+fn test_record_succeeds_after_attestation_validation_disabled() {
+    let (env, snap_client, _att_client, admin, business) = setup_with_attestation();
+    let period = String::from_str(&env, "2026-02");
+
+    snap_client.set_attestation_contract(&admin, &None::<Address>);
+    snap_client.record_snapshot(&admin, &business, &period, &100_000i128, &0u32, &1u64);
+
+    assert!(snap_client.get_snapshot(&business, &period).is_some());
 }
 
 #[test]
@@ -313,6 +363,14 @@ fn test_finalize_empty_epoch_panics() {
 }
 
 #[test]
+#[should_panic(expected = "period exceeds max bytes")]
+fn test_finalize_rejects_epoch_over_limit() {
+    let (env, client, admin) = setup_snapshot_only();
+    let epoch = period_of_len(&env, (MAX_PERIOD_BYTES + 1) as usize);
+    client.finalize_epoch(&admin, &epoch);
+}
+
+#[test]
 #[should_panic(expected = "epoch already finalized")]
 fn test_finalize_epoch_twice_panics() {
     let (env, client, admin) = setup_snapshot_only();
@@ -384,6 +442,50 @@ fn test_writer_cannot_record_after_admin_finalizes_epoch() {
     client.record_snapshot(&writer, &business, &epoch, &100_000i128, &0u32, &1u64);
     client.finalize_epoch(&admin, &epoch);
     client.record_snapshot(&writer, &business, &epoch, &200_000i128, &1u32, &2u64);
+}
+
+#[test]
+#[should_panic(expected = "business period index limit reached")]
+fn test_business_period_index_limit_enforced() {
+    let (env, client, admin) = setup_snapshot_only();
+    let business = Address::generate(&env);
+
+    for i in 0..MAX_BUSINESS_PERIODS {
+        let period = String::from_str(&env, &format!("2026-{:03}", i));
+        client.record_snapshot(&admin, &business, &period, &100_000i128, &0u32, &1u64);
+    }
+
+    let overflow_period = String::from_str(&env, "2027-overflow");
+    client.record_snapshot(
+        &admin,
+        &business,
+        &overflow_period,
+        &100_000i128,
+        &0u32,
+        &1u64,
+    );
+}
+
+#[test]
+#[should_panic(expected = "epoch business index limit reached")]
+fn test_epoch_business_index_limit_enforced() {
+    let (env, client, admin) = setup_snapshot_only();
+    let epoch = String::from_str(&env, "2026-02");
+
+    for _ in 0..MAX_EPOCH_BUSINESSES {
+        let business = Address::generate(&env);
+        client.record_snapshot(&admin, &business, &epoch, &100_000i128, &0u32, &1u64);
+    }
+
+    let overflow_business = Address::generate(&env);
+    client.record_snapshot(
+        &admin,
+        &overflow_business,
+        &epoch,
+        &100_000i128,
+        &0u32,
+        &1u64,
+    );
 }
 
 // ── Query edge cases ─────────────────────────────────────────────────

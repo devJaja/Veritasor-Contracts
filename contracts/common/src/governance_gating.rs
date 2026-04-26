@@ -9,6 +9,8 @@
 //!   granting privileged roles or rotating administrative control.
 //! - Default role escalation checks to **direct token balance only** so
 //!   delegated voting power cannot silently bootstrap privileged access.
+//! - Provide emergency pause and override capabilities for critical situations.
+//! - Include role drift protection to track and validate role assignments.
 
 use soroban_sdk::{contracttype, token, Address, Env};
 
@@ -36,6 +38,12 @@ pub enum GovernanceKey {
     RoleEscalationThreshold,
     /// Whether delegated voting power counts toward role escalation checks.
     RoleEscalationUseDelegatedPower,
+    /// Emergency pause flag - when true, all protocol interactions are blocked.
+    EmergencyPaused,
+    /// Emergency override admin - can bypass governance checks in emergency.
+    EmergencyOverrideAdmin,
+    /// Role drift protection: tracks last role assignment timestamp.
+    LastRoleAssignment(Address),
 }
 
 /// Governance configuration for ordinary threshold-gated actions.
@@ -65,6 +73,18 @@ pub struct RoleEscalationConfig {
     pub allow_delegated_power: bool,
 }
 
+/// Emergency controls for protocol-wide pause and override capabilities.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmergencyConfig {
+    /// Whether the protocol is in emergency pause mode.
+    /// When paused, all non-emergency operations are blocked.
+    pub paused: bool,
+    /// Emergency override admin address that can bypass governance checks.
+    /// Only set during declared emergencies.
+    pub override_admin: Option<Address>,
+}
+
 // ════════════════════════════════════════════════════════════════════
 //  Configuration
 // ════════════════════════════════════════════════════════════════════
@@ -74,6 +94,9 @@ pub struct RoleEscalationConfig {
 /// Role escalation controls are initialized alongside the base governance
 /// threshold. By default, privileged role escalation requires at least the
 /// same threshold as ordinary governance and ignores delegated voting power.
+///
+/// Emergency controls are initialized in a safe state: protocol not paused
+/// and no emergency override admin set.
 ///
 /// # Parameters
 /// - `token`: Governance token contract address.
@@ -108,6 +131,10 @@ pub fn initialize_governance(env: &Env, token: &Address, threshold: i128, enable
     env.storage()
         .instance()
         .set(&GovernanceKey::RoleEscalationUseDelegatedPower, &false);
+    // Initialize emergency controls in safe state
+    env.storage()
+        .instance()
+        .set(&GovernanceKey::EmergencyPaused, &false);
 }
 
 /// Get the current governance configuration.
@@ -156,6 +183,29 @@ pub fn get_role_escalation_config(env: &Env) -> Option<RoleEscalationConfig> {
     Some(RoleEscalationConfig {
         threshold,
         allow_delegated_power,
+    })
+}
+
+/// Get the emergency configuration.
+///
+/// Returns the current emergency pause state and override admin.
+/// For backwards compatibility, missing emergency keys default to safe state.
+pub fn get_emergency_config(env: &Env) -> Option<EmergencyConfig> {
+    let _governance = get_governance_config(env)?;
+
+    let paused = env
+        .storage()
+        .instance()
+        .get(&GovernanceKey::EmergencyPaused)
+        .unwrap_or(false);
+    let override_admin = env
+        .storage()
+        .instance()
+        .get(&GovernanceKey::EmergencyOverrideAdmin);
+
+    Some(EmergencyConfig {
+        paused,
+        override_admin,
     })
 }
 
@@ -225,6 +275,82 @@ pub fn set_role_escalation_use_delegated_power(env: &Env, enabled: bool) {
     env.storage()
         .instance()
         .set(&GovernanceKey::RoleEscalationUseDelegatedPower, &enabled);
+}
+
+/// Set emergency pause state.
+///
+/// When paused, all protocol interactions are blocked except emergency overrides.
+/// Requires role escalation threshold to activate/deactivate.
+///
+/// # Parameters
+/// - `caller`: The address requesting the pause change.
+/// - `paused`: Whether to pause the protocol.
+///
+/// # Panics
+/// - If governance is not initialized.
+/// - If caller lacks role escalation power (when activating pause).
+pub fn set_emergency_pause(env: &Env, caller: &Address, paused: bool) {
+    require_governance_initialized(env);
+    caller.require_auth();
+    
+    // Emergency pause requires role escalation power to prevent abuse
+    if paused {
+        require_role_escalation_threshold(env, caller);
+    }
+
+    env.storage()
+        .instance()
+        .set(&GovernanceKey::EmergencyPaused, &paused);
+}
+
+/// Set emergency override admin.
+///
+/// Allows a designated admin to bypass governance checks during emergencies.
+/// Requires role escalation threshold and should only be used in extreme cases.
+///
+/// # Parameters
+/// - `caller`: The address requesting the override admin change.
+/// - `admin`: The emergency override admin address, or None to clear.
+///
+/// # Panics
+/// - If governance is not initialized.
+/// - If caller lacks role escalation power.
+pub fn set_emergency_override_admin(env: &Env, caller: &Address, admin: Option<Address>) {
+    require_governance_initialized(env);
+    caller.require_auth();
+    require_role_escalation_threshold(env, caller);
+
+    match &admin {
+        Some(addr) => env.storage()
+            .instance()
+            .set(&GovernanceKey::EmergencyOverrideAdmin, addr),
+        None => env.storage()
+            .instance()
+            .remove(&GovernanceKey::EmergencyOverrideAdmin),
+    }
+}
+
+/// Record a role assignment for drift protection.
+///
+/// Tracks the timestamp of role assignments to detect potential role drift
+/// or unauthorized changes.
+///
+/// # Parameters
+/// - `role_address`: The address that was assigned a role.
+/// - `timestamp`: The timestamp of the assignment.
+pub fn record_role_assignment(env: &Env, role_address: &Address, timestamp: u64) {
+    env.storage()
+        .instance()
+        .set(&GovernanceKey::LastRoleAssignment(role_address.clone()), &timestamp);
+}
+
+/// Get the last role assignment timestamp for drift protection.
+///
+/// Returns None if no assignment has been recorded.
+pub fn get_last_role_assignment(env: &Env, role_address: &Address) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&GovernanceKey::LastRoleAssignment(role_address.clone()))
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -431,9 +557,23 @@ pub fn has_governance_power(env: &Env, address: &Address) -> bool {
 /// operations while selectively opting into stricter role escalation checks.
 ///
 /// # Panics
+/// - If protocol is in emergency pause and caller is not emergency override admin.
 /// - If governance is enabled and address does not have sufficient voting power.
 pub fn require_governance_threshold(env: &Env, address: &Address) {
     address.require_auth();
+
+    // Check emergency pause first
+    if let Some(emergency) = get_emergency_config(env) {
+        if emergency.paused {
+            if let Some(override_admin) = emergency.override_admin {
+                if *address != override_admin {
+                    panic!("protocol emergency paused - operation blocked");
+                }
+            } else {
+                panic!("protocol emergency paused - operation blocked");
+            }
+        }
+    }
 
     let config = match get_governance_config(env) {
         Some(c) => c,
@@ -475,12 +615,26 @@ pub fn has_role_escalation_power(env: &Env, address: &Address) -> bool {
 /// # Panics
 /// - If governance is not initialized.
 /// - If governance is disabled.
+/// - If protocol is in emergency pause and caller is not emergency override admin.
 /// - If address lacks sufficient role escalation voting power.
 pub fn require_role_escalation_threshold(env: &Env, address: &Address) {
     address.require_auth();
 
     let governance = get_governance_config(env).expect("governance not initialized");
     assert!(governance.enabled, "governance disabled");
+
+    // Check emergency pause
+    if let Some(emergency) = get_emergency_config(env) {
+        if emergency.paused {
+            if let Some(override_admin) = emergency.override_admin {
+                if *address != override_admin {
+                    panic!("protocol emergency paused - operation blocked");
+                }
+            } else {
+                panic!("protocol emergency paused - operation blocked");
+            }
+        }
+    }
 
     let escalation = get_role_escalation_config(env).expect("governance not initialized");
     let power = get_role_escalation_power(env, address);
@@ -496,6 +650,21 @@ pub fn require_role_escalation_threshold(env: &Env, address: &Address) {
 pub fn is_governance_enabled(env: &Env) -> bool {
     get_governance_config(env)
         .map(|config| config.enabled)
+        .unwrap_or(false)
+}
+
+/// Check if the protocol is in emergency pause mode.
+pub fn is_emergency_paused(env: &Env) -> bool {
+    get_emergency_config(env)
+        .map(|config| config.paused)
+        .unwrap_or(false)
+}
+
+/// Check if an address is the emergency override admin.
+pub fn is_emergency_override_admin(env: &Env, address: &Address) -> bool {
+    get_emergency_config(env)
+        .and_then(|config| config.override_admin)
+        .map(|admin| admin == *address)
         .unwrap_or(false)
 }
 

@@ -105,6 +105,35 @@ cargo test
 
 130+ tests covering core attestation logic, fee calculation arithmetic, tier/volume discounts, combined discounts, fee toggling, access control, input validation, off-chain proof hash correlation, expiry handling, rate limiting, gas benchmarks, and a full economic simulation.
 
+### Coverage
+
+We enforce **≥ 95 % line coverage** on every critical crate individually, using `cargo-llvm-cov`:
+
+| Crate | Why it matters |
+|-------|----------------|
+| `veritasor-attestation` | Core trust primitive — revenue Merkle roots. |
+| `veritasor-attestation-registry` | Upgrade and rollback safety. |
+| `veritasor-attestor-staking` | Economic security (slashing / eligibility). |
+| `veritasor-common` | Shared security utilities (replay protection, Merkle, key rotation). |
+| `veritasor-audit-log` | Tamper-evident audit trail. |
+
+**Quick start**
+
+```bash
+# One-time install
+cargo install cargo-llvm-cov
+
+# Run gates + generate HTML report
+./scripts/coverage.sh
+
+# Gates only (faster)
+./scripts/coverage.sh --quick
+```
+
+On Windows PowerShell use `.\scripts\coverage.ps1` instead.
+
+See [docs/coverage-reporting.md](docs/coverage-reporting.md) for full details, CI setup, and troubleshooting.
+
 ### Gas Benchmarks
 
 The contract includes comprehensive gas and cost benchmarks to track resource consumption and detect regressions:

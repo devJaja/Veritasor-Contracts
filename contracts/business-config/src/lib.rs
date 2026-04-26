@@ -17,7 +17,11 @@
 //! - Readable by attestation and lender contracts
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
-
+const BUSINESS_CONFIG_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_ANOMALY_ALERT_THRESHOLD: u32 = 70;
+const DEFAULT_ANOMALY_BLOCK_THRESHOLD: u32 = 90;
+const DEFAULT_EXPIRY_SECONDS: u64 = 31_536_000; // 1 year
+const DEFAULT_GRACE_PERIOD_SECONDS: u64 = 2_592_000; // 30 days
 // ════════════════════════════════════════════════════════════════════
 //  Storage Keys
 // ════════════════════════════════════════════════════════════════════
@@ -128,6 +132,8 @@ pub struct AnchorConfig {
 pub struct BusinessConfig {
     /// Business address this config applies to
     pub business: Address,
+    /// Schema version for compatibility and migration tracking
+    pub schema_version: u32,
     /// Anomaly detection policy
     pub anomaly_policy: AnomalyPolicy,
     /// Integration requirements
@@ -138,7 +144,7 @@ pub struct BusinessConfig {
     pub custom_fees: CustomFeeConfig,
     /// Compliance requirements
     pub compliance: ComplianceConfig,
-    /// Configuration version for migration tracking
+    /// Configuration instance version for update tracking
     pub version: u32,
     /// Timestamp when config was created
     pub created_at: u64,
@@ -211,6 +217,11 @@ impl BusinessConfigContract {
     /// - `business`: Business address to configure
     /// - `config`: Complete configuration to apply
     ///
+    /// # Behavior
+    /// - Preserves `created_at` for existing configs
+    /// - Increments `version` on every update
+    /// - Rejects an existing config if it contains an unsupported `schema_version`
+    ///
     /// # Panics
     /// - If caller is not admin
     /// - If configuration values are invalid
@@ -261,6 +272,11 @@ impl BusinessConfigContract {
 
         let (version, created_at) = match existing {
             Some(old) => {
+                assert!(
+                    old.schema_version <= BUSINESS_CONFIG_SCHEMA_VERSION,
+                    "unsupported business config schema version"
+                );
+
                 env.events().publish(
                     (TOPIC_CONFIG_UPDATED, business.clone()),
                     ConfigUpdatedEvent {
@@ -287,6 +303,7 @@ impl BusinessConfigContract {
 
         let config = BusinessConfig {
             business: business.clone(),
+            schema_version: BUSINESS_CONFIG_SCHEMA_VERSION,
             anomaly_policy,
             integrations,
             expiry,
@@ -444,6 +461,7 @@ impl BusinessConfigContract {
         // Use caller address as placeholder for global defaults
         let defaults = BusinessConfig {
             business: caller.clone(),
+            schema_version: BUSINESS_CONFIG_SCHEMA_VERSION,
             anomaly_policy,
             integrations,
             expiry,
@@ -506,6 +524,8 @@ impl BusinessConfigContract {
     }
 
     /// Get global default configuration.
+    ///
+    /// If global defaults have not been set, returns a runtime safe default config.
     pub fn get_global_defaults(env: Env) -> BusinessConfig {
         env.storage()
             .instance()
@@ -596,10 +616,18 @@ impl BusinessConfigContract {
         env.storage()
             .instance()
             .get::<ConfigKey, BusinessConfig>(&ConfigKey::BusinessConfig(business.clone()))
+            .map(|config| {
+                Self::validate_schema_version(&config);
+                config
+            })
             .unwrap_or_else(|| {
                 env.storage()
                     .instance()
-                    .get(&ConfigKey::GlobalDefaults)
+                    .get::<ConfigKey, BusinessConfig>(&ConfigKey::GlobalDefaults)
+                    .map(|config| {
+                        Self::validate_schema_version(&config);
+                        config
+                    })
                     .unwrap_or_else(|| Self::create_default_config(env))
             })
     }
@@ -610,9 +638,10 @@ impl BusinessConfigContract {
 
         BusinessConfig {
             business: contract_address,
+            schema_version: BUSINESS_CONFIG_SCHEMA_VERSION,
             anomaly_policy: AnomalyPolicy {
-                alert_threshold: 70,
-                block_threshold: 90,
+                alert_threshold: DEFAULT_ANOMALY_ALERT_THRESHOLD,
+                block_threshold: DEFAULT_ANOMALY_BLOCK_THRESHOLD,
                 required: false,
                 auto_revoke: false,
             },
@@ -622,9 +651,9 @@ impl BusinessConfigContract {
                 external_validation_required: false,
             },
             expiry: ExpiryConfig {
-                default_expiry_seconds: 31536000, // 1 year
+                default_expiry_seconds: DEFAULT_EXPIRY_SECONDS,
                 enforce_expiry: false,
-                grace_period_seconds: 2592000, // 30 days
+                grace_period_seconds: DEFAULT_GRACE_PERIOD_SECONDS,
             },
             custom_fees: CustomFeeConfig {
                 base_fee_override: None,
@@ -638,9 +667,14 @@ impl BusinessConfigContract {
                 metadata_required: false,
             },
             version: 0,
-            created_at: 0,
-            updated_at: 0,
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
         }
+    }
+
+    /// Returns the current contract schema version for business config objects.
+    pub fn get_schema_version(_env: Env) -> u32 {
+        BUSINESS_CONFIG_SCHEMA_VERSION
     }
 
     fn validate_anomaly_policy(policy: &AnomalyPolicy) {
@@ -665,6 +699,13 @@ impl BusinessConfigContract {
         if let Some(fee) = fees.base_fee_override {
             assert!(fee >= 0, "base fee cannot be negative");
         }
+    }
+
+    fn validate_schema_version(config: &BusinessConfig) {
+        assert!(
+            config.schema_version <= BUSINESS_CONFIG_SCHEMA_VERSION,
+            "unsupported business config schema version"
+        );
     }
 }
 

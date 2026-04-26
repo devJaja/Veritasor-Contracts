@@ -20,6 +20,7 @@
 //! - Rate-limit burst parameters are captured in the event payload.
 
 extern crate alloc;
+extern crate std;
 
 use super::*;
 use crate::access_control::ROLE_ADMIN;
@@ -161,8 +162,8 @@ fn test_attestation_submitted_schema_snapshot_full_fields() {
 
     // --- Topics ---
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_ATTESTATION_SUBMITTED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_ATTESTATION_SUBMITTED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), business);
 
     // --- Data ---
     let ev = AttestationSubmittedEvent::try_from_val(&env, &data).unwrap();
@@ -217,8 +218,8 @@ fn test_attestation_revoked_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_ATTESTATION_REVOKED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_ATTESTATION_REVOKED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), business);
 
     let ev = AttestationRevokedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.business, business);
@@ -249,8 +250,8 @@ fn test_attestation_migrated_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_ATTESTATION_MIGRATED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_ATTESTATION_MIGRATED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), business);
 
     let ev = AttestationMigratedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.business, business);
@@ -278,8 +279,8 @@ fn test_role_granted_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_ROLE_GRANTED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), account.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_ROLE_GRANTED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), account);
 
     let ev = RoleChangedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.account, account);
@@ -299,8 +300,8 @@ fn test_role_revoked_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_ROLE_REVOKED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), account.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_ROLE_REVOKED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), account);
 
     let ev = RoleChangedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.account, account);
@@ -322,7 +323,7 @@ fn test_pause_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_PAUSED.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_PAUSED);
 
     let ev = PauseChangedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.changed_by, changed_by);
@@ -338,7 +339,7 @@ fn test_unpause_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_UNPAUSED.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_UNPAUSED);
 
     let ev = PauseChangedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.changed_by, changed_by);
@@ -362,7 +363,7 @@ fn test_fee_config_changed_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_FEE_CONFIG.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_FEE_CONFIG);
 
     let ev = FeeConfigChangedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.token, token);
@@ -408,7 +409,7 @@ fn test_rate_limit_config_changed_schema_snapshot_all_fields() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_RATE_LIMIT.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_RATE_LIMIT);
 
     let ev = RateLimitConfigChangedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.max_submissions, max_sub);
@@ -449,7 +450,7 @@ fn test_key_rotation_proposed_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_KEY_ROTATION_PROPOSED.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_KEY_ROTATION_PROPOSED);
 
     let ev = KeyRotationProposedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.old_admin, old_admin);
@@ -469,7 +470,7 @@ fn test_key_rotation_confirmed_schema_snapshot_normal() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_KEY_ROTATION_CONFIRMED.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_KEY_ROTATION_CONFIRMED);
 
     let ev = KeyRotationConfirmedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.old_admin, old_admin);
@@ -501,7 +502,7 @@ fn test_key_rotation_cancelled_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_KEY_ROTATION_CANCELLED.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_KEY_ROTATION_CANCELLED);
 
     let ev = KeyRotationCancelledEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.cancelled_by, cancelled_by);
@@ -519,7 +520,7 @@ fn test_key_rotation_emergency_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_KEY_ROTATION_EMERGENCY.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_KEY_ROTATION_EMERGENCY);
 
     let ev = KeyRotationEmergencyEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.old_admin, old_admin);
@@ -540,8 +541,8 @@ fn test_business_registered_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_BIZ_REGISTERED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_BIZ_REGISTERED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), business);
 
     let ev = BusinessRegisteredEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.business, business);
@@ -558,8 +559,8 @@ fn test_business_approved_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_BIZ_APPROVED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_BIZ_APPROVED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), business);
 
     let ev = BusinessApprovedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.business, business);
@@ -578,8 +579,8 @@ fn test_business_suspended_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_BIZ_SUSPENDED.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_BIZ_SUSPENDED);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), business);
 
     let ev = BusinessSuspendedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.business, business);
@@ -598,8 +599,8 @@ fn test_business_reactivated_schema_snapshot() {
     let (_cid, topics, data) = env.events().all().last().unwrap();
 
     assert_eq!(topics.len(), 2);
-    assert_eq!(topics.get(0).unwrap(), TOPIC_BIZ_REACTIVATE.into_val(&env));
-    assert_eq!(topics.get(1).unwrap(), business.into_val(&env));
+    assert_eq!(soroban_sdk::Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(), TOPIC_BIZ_REACTIVATE);
+    assert_eq!(soroban_sdk::Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), business);
 
     let ev = BusinessReactivatedEvent::try_from_val(&env, &data).unwrap();
     assert_eq!(ev.business, business);

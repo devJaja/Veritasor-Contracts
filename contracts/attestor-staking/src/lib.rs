@@ -44,20 +44,35 @@ enum DataKey {
     Slashed(u64),
 }
 
+const MAX_UNBONDING_PERIOD: u64 = 31_536_000; // 1 year in seconds
+
 #[contract]
 pub struct AttestorStakingContract;
 
 #[contractimpl]
 impl AttestorStakingContract {
-    /// Initialize the staking contract
+    /// Initialize the staking contract.
+    ///
+    /// This function sets the initial configuration and can only be called once.
+    /// It validates that the minimum stake is positive, the unbonding period
+    /// is within reasonable bounds, and that the provided addresses do not
+    /// create circular dependencies.
     ///
     /// # Arguments
-    /// * `admin` - Contract administrator
-    /// * `token` - Token contract address for staking
-    /// * `treasury` - Address to receive slashed funds
-    /// * `min_stake` - Minimum stake required for attestors
-    /// * `dispute_contract` - Dispute resolution contract address
-    /// * `unbonding_period_seconds` - Time lock before unstake withdrawal is available
+    /// * `admin` - Contract administrator with permissions to update configuration.
+    /// * `token` - The contract address of the token used for staking.
+    /// * `treasury` - The address where slashed funds are sent.
+    /// * `min_stake` - The minimum amount an attestor must stake to be eligible.
+    /// * `dispute_contract` - The address authorized to trigger slashing.
+    /// * `unbonding_period_seconds` - The duration (in seconds) that funds are locked
+    ///   after a withdrawal request. Max is 1 year.
+    ///
+    /// # Panics
+    /// * If the contract is already initialized.
+    /// * If `min_stake` is not strictly positive.
+    /// * If `unbonding_period_seconds` exceeds 1 year.
+    /// * If `token`, `treasury`, or `dispute_contract` matches the contract's own address.
+    /// * If roles are duplicated in a way that suggests misconfiguration (e.g., `token == admin`).
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -71,7 +86,24 @@ impl AttestorStakingContract {
             panic!("already initialized");
         }
         admin.require_auth();
+
+        // Parameter Validation
         assert!(min_stake > 0, "min_stake must be positive");
+        assert!(
+            unbonding_period_seconds <= MAX_UNBONDING_PERIOD,
+            "unbonding period too long"
+        );
+
+        // Address Safety Checks
+        let self_addr = env.current_contract_address();
+        assert!(token != self_addr, "token cannot be self");
+        assert!(treasury != self_addr, "treasury cannot be self");
+        assert!(dispute_contract != self_addr, "dispute_contract cannot be self");
+
+        // Role Distinctness Checks
+        assert!(admin != treasury, "admin and treasury must be distinct");
+        assert!(token != treasury, "token and treasury must be distinct");
+        assert!(dispute_contract != treasury, "dispute and treasury must be distinct");
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
@@ -84,6 +116,7 @@ impl AttestorStakingContract {
             .instance()
             .set(&DataKey::UnbondingPeriod, &unbonding_period_seconds);
     }
+
 
     /// Stake tokens as an attestor
     ///

@@ -47,7 +47,7 @@ fn submit_with_future_expiry_succeeds() {
         &1_050u64,
         &1u32,
         &None,
-        &Some(expiry_ts),
+        &Some(2_000u64),
     );
 
     let stored = client.get_attestation(&business, &period).unwrap();
@@ -68,7 +68,7 @@ fn submit_with_past_expiry_panics() {
     client.submit_attestation(
         &business,
         &period,
-        &root,
+        &merkle_root,
         &1_500u64,
         &1u32,
         &None,
@@ -92,7 +92,7 @@ fn submit_with_expiry_equal_to_ledger_time_panics() {
         &1_800u64,
         &1u32,
         &None,
-        &Some(expiry_ts),
+        &Some(2_000u64),
     );
 }
 
@@ -112,7 +112,7 @@ fn submit_with_expiry_before_attestation_timestamp_panics() {
         &2_000u64,
         &1u32,
         &None,
-        &Some(expiry_ts),
+        &Some(1_500u64),
     );
 }
 
@@ -131,7 +131,7 @@ fn is_expired_boundary_behavior_is_enforced() {
         &1_050u64,
         &1u32,
         &None,
-        &Some(expiry_ts),
+        &Some(1_500u64),
     );
 
     env.ledger().set_timestamp(1_499);
@@ -156,7 +156,7 @@ fn verify_attestation_fails_after_expiry() {
         &550u64,
         &1u32,
         &None,
-        &Some(expiry_ts),
+        &Some(1_000u64),
     );
 
     env.ledger().set_timestamp(900);
@@ -181,7 +181,7 @@ fn expired_attestation_remains_queryable() {
         &11u64,
         &1u32,
         &None,
-        &Some(expiry_ts),
+        &Some(20u64),
     );
 
     env.ledger().set_timestamp(25);
