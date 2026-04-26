@@ -1,9 +1,62 @@
 #![cfg(test)]
 
 use crate::events::TOPIC_ATTESTATION_REVOKED;
-use crate::test::TestEnv;
+use crate::{AttestationContract, AttestationContractClient};
+use soroban_sdk::Env;
+
+pub struct TestEnv {
+    pub env: Env,
+    pub client: AttestationContractClient<'static>,
+    pub admin: Address,
+}
+
+impl TestEnv {
+    pub fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
+        let contract_id = env.register(AttestationContract, ());
+        let client = AttestationContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &0u64);
+        Self { env, client, admin }
+    }
+    
+    pub fn submit_attestation(&self, business: Address, period: String, root: BytesN<32>, timestamp: u64, version: u32) {
+        self.client.submit_attestation(&business, &period, &root, &timestamp, &version, &None, &None, &0u64);
+    }
+    
+    pub fn revoke_attestation(&self, caller: Address, business: Address, period: String, reason: String) {
+        self.client.revoke_attestation(&caller, &business, &period, &reason, &0u64);
+    }
+    
+    pub fn is_revoked(&self, business: Address, period: String) -> bool {
+        self.client.is_revoked(&business, &period)
+    }
+    
+    pub fn verify_attestation(&self, business: Address, period: String, root: BytesN<32>) -> bool {
+        self.client.verify_attestation(&business, &period, &root)
+    }
+    
+    pub fn get_revocation_info(&self, business: Address, period: String) -> Option<(Address, u64, String)> {
+        self.client.get_revocation_info(&business, &period)
+    }
+    
+    pub fn get_attestation(&self, business: Address, period: String) -> Option<(BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>)> {
+        self.client.get_attestation(&business, &period)
+    }
+    
+    pub fn get_business_attestations(&self, business: Address, periods: soroban_sdk::Vec<String>) -> soroban_sdk::Vec<(String, Option<(BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>)>, Option<(Address, u64, String)>)> {
+        self.client.get_business_attestations(&business, &periods)
+    }
+
+    pub fn pause(&self, admin: Address) {
+        self.client.pause(&admin, &0u64);
+    }
+}
 use soroban_sdk::testutils::{Address as _, Events};
 use soroban_sdk::{vec, Address, BytesN, IntoVal, String};
+use crate::{DisputeOutcome, DisputeStatus, DisputeType, OptionalResolution};
 
 #[test]
 fn test_revocation_by_admin() {
@@ -429,7 +482,7 @@ fn setup_dispute_env() -> (Env, AttestationContractClient<'static>, Address) {
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    client.initialize(&admin);
+    client.initialize(&admin, &0u64);
     (env, client, admin)
 }
 
@@ -441,15 +494,10 @@ fn test_dispute_on_revoked_attestation_fails() {
     let root = BytesN::from_array(&env, &[20; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Revoke it
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Revocation before dispute"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Revocation before dispute"), );
 
     // Attempt to open dispute on revoked attestation - should fail
     let challenger = Address::generate(&env);
@@ -473,7 +521,7 @@ fn test_revocation_with_open_dispute() {
     let root = BytesN::from_array(&env, &[21; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Open dispute
     let challenger = Address::generate(&env);
@@ -490,12 +538,7 @@ fn test_revocation_with_open_dispute() {
     assert_eq!(dispute.status, DisputeStatus::Open);
 
     // Admin revokes attestation while dispute is open
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Revocation with active dispute"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Revocation with active dispute"), );
 
     // Verify attestation is revoked
     assert!(client.is_revoked(&business, &period));
@@ -514,7 +557,7 @@ fn test_revocation_with_resolved_dispute() {
     let root = BytesN::from_array(&env, &[22; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Open and resolve dispute
     let challenger = Address::generate(&env);
@@ -540,12 +583,7 @@ fn test_revocation_with_resolved_dispute() {
     assert_eq!(dispute.status, DisputeStatus::Resolved);
 
     // Revoke attestation after dispute resolution
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Post-dispute revocation"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Post-dispute revocation"), );
 
     // Verify both states
     assert!(client.is_revoked(&business, &period));
@@ -561,7 +599,7 @@ fn test_dispute_lifecycle_then_revocation() {
     let root = BytesN::from_array(&env, &[23; 32]);
 
     // Step 1: Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
     assert!(!client.is_revoked(&business, &period));
 
     // Step 2: Open dispute
@@ -593,12 +631,7 @@ fn test_dispute_lifecycle_then_revocation() {
     assert_eq!(dispute.status, DisputeStatus::Closed);
 
     // Step 5: Revoke attestation after complete dispute lifecycle
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Revocation after dispute upheld"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Revocation after dispute upheld"), );
 
     // Final verification
     assert!(client.is_revoked(&business, &period));
@@ -614,7 +647,7 @@ fn test_multiple_challengers_then_revocation() {
     let root = BytesN::from_array(&env, &[24; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Multiple challengers open disputes
     let challenger1 = Address::generate(&env);
@@ -643,12 +676,7 @@ fn test_multiple_challengers_then_revocation() {
     assert!(disputes.contains(dispute_id2));
 
     // Revoke attestation with multiple open disputes
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Multiple disputes revocation"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Multiple disputes revocation"), );
 
     // Verify revocation and disputes preserved
     assert!(client.is_revoked(&business, &period));
@@ -671,7 +699,7 @@ fn test_dispute_resolution_after_revocation() {
     let root = BytesN::from_array(&env, &[25; 32]);
 
     // Submit attestation and open dispute
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     let challenger = Address::generate(&env);
     let dispute_id = client.open_dispute(
@@ -683,12 +711,7 @@ fn test_dispute_resolution_after_revocation() {
     );
 
     // Revoke attestation
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Revocation before resolution"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Revocation before resolution"), );
 
     // Resolve dispute after revocation - should still work
     let resolver = Address::generate(&env);
@@ -718,7 +741,7 @@ fn test_revocation_preserves_dispute_history() {
     let root = BytesN::from_array(&env, &[26; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Create and close a dispute
     let challenger = Address::generate(&env);
@@ -745,12 +768,7 @@ fn test_revocation_preserves_dispute_history() {
     let attestation_disputes_before = client.get_disputes_by_attestation(&business, &period);
 
     // Revoke attestation
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Post-history revocation"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Post-history revocation"), );
 
     // Verify dispute history is preserved after revocation
     let dispute_after = client.get_dispute(&dispute_id).unwrap();
@@ -773,7 +791,7 @@ fn test_state_consistency_across_operations() {
     let root = BytesN::from_array(&env, &[27; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Initial state assertions
     assert!(!client.is_revoked(&business, &period));
@@ -799,12 +817,7 @@ fn test_state_consistency_across_operations() {
     assert_eq!(client.get_dispute(&dispute_id).unwrap().status, DisputeStatus::Open);
 
     // Revoke attestation
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "State transition"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "State transition"), );
 
     // State after revocation
     assert!(client.is_revoked(&business, &period));
@@ -841,8 +854,8 @@ fn test_revocation_different_periods_independent() {
     let root2 = BytesN::from_array(&env, &[29; 32]);
 
     // Submit two attestations
-    client.submit_attestation(&business, &period1, &root1, &1700000000u64, &1u32, &None, &0u64);
-    client.submit_attestation(&business, &period2, &root2, &1700000001u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period1, &root1, &1700000000u64, &1u32, &None, &None, &0u64);
+    client.submit_attestation(&business, &period2, &root2, &1700000001u64, &1u32, &None, &None, &0u64);
 
     // Open dispute on period1
     let challenger = Address::generate(&env);
@@ -855,12 +868,7 @@ fn test_revocation_different_periods_independent() {
     );
 
     // Revoke period2 (different from disputed period)
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period2,
-        &String::from_str(&env, "Period 2 revocation"),
-    );
+    client.revoke_attestation(&business, &business, &period2, &String::from_str(&env, "Period 2 revocation"), );
 
     // Verify states are independent
     assert!(!client.is_revoked(&business, &period1));
@@ -883,7 +891,7 @@ fn test_dispute_outcome_upheld_then_revoke() {
     let root = BytesN::from_array(&env, &[30; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Open dispute
     let challenger = Address::generate(&env);
@@ -912,12 +920,7 @@ fn test_dispute_outcome_upheld_then_revoke() {
     }
 
     // Business revokes attestation following upheld dispute
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Revoked after dispute upheld"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Revoked after dispute upheld"), );
 
     // Final state: both revoked and dispute upheld
     assert!(client.is_revoked(&business, &period));
@@ -933,7 +936,7 @@ fn test_closed_dispute_no_reopen_after_revoke() {
     let root = BytesN::from_array(&env, &[31; 32]);
 
     // Submit attestation
-    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &0u64);
+    client.submit_attestation(&business, &period, &root, &1700000000u64, &1u32, &None, &None, &0u64);
 
     // Complete dispute lifecycle
     let challenger = Address::generate(&env);
@@ -955,12 +958,7 @@ fn test_closed_dispute_no_reopen_after_revoke() {
     client.close_dispute(&dispute_id);
 
     // Revoke attestation
-    client.revoke_attestation(
-        &business,
-        &business,
-        &period,
-        &String::from_str(&env, "Post-dispute revocation"),
-    );
+    client.revoke_attestation(&business, &business, &period, &String::from_str(&env, "Post-dispute revocation"), );
 
     // Same challenger cannot open new dispute on revoked attestation
     let result = client.try_open_dispute(

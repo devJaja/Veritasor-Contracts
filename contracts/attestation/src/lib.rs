@@ -1,8 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
-
-// Use the crate client directly for both wasm32 and host builds
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec, Symbol, xdr::ToXdr};
 use veritasor_attestor_staking::AttestorStakingContractClient;
+use veritasor_common::replay_protection;
 
 const STATUS_KEY_TAG: u32 = 1;
 const ADMIN_KEY_TAG: (u32,) = (2,);
@@ -14,24 +13,15 @@ pub const NONCE_CHANNEL_BUSINESS: u32 = 1;
 
 pub const STATUS_ACTIVE: u32 = 0;
 pub const STATUS_REVOKED: u32 = 1;
-
-// Type aliases to reduce complexity - exported for other contracts
-pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<u64>);
-#![allow(clippy::too_many_arguments)]
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Symbol, Vec};
+pub const STATUS_FILTER_ALL: u32 = 2;
 
 // Type aliases to reduce complexity - exported for other contracts
 pub type AttestationData = (BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>);
 pub type RevocationData = (Address, u64, String);
 pub type AttestationWithRevocation = (AttestationData, Option<RevocationData>);
 pub type AttestationStatusResult = Vec<(String, Option<AttestationData>, Option<RevocationData>)>;
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
-use veritasor_common::replay_protection;
 
-// ─── Feature modules: add new `pub mod <name>;` here (one per feature) ───
 pub mod access_control;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
-
 pub mod dynamic_fees;
 pub mod events;
 pub mod extended_metadata;
@@ -39,14 +29,7 @@ pub mod fees;
 pub mod multisig;
 pub mod rate_limit;
 pub mod registry;
-// ─── End feature modules ───
-
-#[cfg(test)]
-mod rate_limit_test;
-
-#[cfg(test)]
-mod property_test;
-
+pub mod dispute;
 
 pub use access_control::{ROLE_ADMIN, ROLE_ATTESTOR, ROLE_BUSINESS, ROLE_OPERATOR};
 pub use dynamic_fees::{compute_fee, DataKey, FeeConfig};
@@ -55,50 +38,9 @@ pub use fees::{FlatFeeConfig, collect_flat_fee};
 pub use multisig::{Proposal, ProposalAction, ProposalStatus};
 pub use rate_limit::RateLimitConfig;
 pub use registry::{BusinessRecord, BusinessStatus};
-// ─── End re-exports ───
-pub use dynamic_fees::{compute_fee, DataKey, FeeConfig};
-
-#[cfg(test)]
-mod test;
-#[cfg(test)]
-mod dispute_test;
-#[cfg(test)]
-mod anomaly_test;
-#[cfg(test)]
-mod attestor_staking_integration_test;
-#[cfg(test)]
-mod batch_submission_test;
-#[cfg(test)]
-mod dispute_test;
-#[cfg(test)]
-mod dynamic_fees_test;
-#[cfg(test)]
-mod events_test;
-#[cfg(test)]
-mod fees_test;
-#[cfg(test)]
-mod multisig_test;
-#[cfg(test)]
-mod proof_hash_test;
-#[cfg(test)]
-mod rate_limit_test;
-#[cfg(test)]
-mod revocation_test;
-#[cfg(test)]
-mod test;
-// ─── End test modules ───
-
-pub mod dispute;
-use dispute::{
-    add_dispute_to_attestation_index, add_dispute_to_challenger_index, generate_dispute_id,
-    get_dispute_ids_by_attestation, get_dispute_ids_by_challenger, store_dispute,
-    validate_dispute_closure, validate_dispute_eligibility, validate_dispute_resolution, Dispute,
-    DisputeOutcome, DisputeResolution, DisputeStatus, DisputeType, OptionalResolution,
+pub use dispute::{
+    Dispute, DisputeOutcome, DisputeResolution, DisputeStatus, DisputeType, OptionalResolution,
 };
-#[cfg(test)]
-mod registry_test;
-mod test;
-mod multi_period_test; 
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +51,8 @@ pub struct AttestationRange {
     pub timestamp: u64,
     pub version: u32,
     pub fee_paid: i128,
+    pub proof_hash: Option<BytesN<32>>,
+    pub expiry_timestamp: Option<u64>,
     pub revoked: bool,
 }
 
@@ -117,9 +61,6 @@ pub enum MultiPeriodKey {
     Ranges(Address),
 }
 
-#[contract]
-
-/// A single item in a batch attestation submission.
 #[contracttype]
 pub struct BatchAttestationItem {
     pub business: Address,
@@ -130,28 +71,12 @@ pub struct BatchAttestationItem {
     pub expiry_timestamp: Option<u64>,
 }
 
+#[contract]
 pub struct AttestationContract;
-
-/// Lexicographic comparison of Soroban strings.
-fn compare_strings(a: &String, b: &String) -> Ordering {
-    let a_len = a.len();
-    let b_len = b.len();
-    let min_len = if a_len < b_len { a_len } else { b_len };
-
-    for i in 0..min_len {
-        let byte_a = a.as_bytes().get(i).unwrap();
-        let byte_b = b.as_bytes().get(i).unwrap();
-        match byte_a.cmp(&byte_b) {
-            Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    a_len.cmp(&b_len)
-}
 
 #[contractimpl]
 impl AttestationContract {
-    pub fn initialize(env: Env, admin: Address, nonce: u64) {
+    pub fn initialize(env: Env, admin: Address, _nonce: u64) {
         if dynamic_fees::is_initialized(&env) {
             panic!("already initialized");
         }
@@ -195,19 +120,6 @@ impl AttestationContract {
         dynamic_fees::set_fee_config(&env, &config);
     }
 
-    /// Configure or update the flat fee mechanism.
-    ///
-    /// * `token`     – Token contract address for fee payment.
-    /// * `collector` – Address that receives protocol fees.
-    /// * `amount`    – Flat fee amount in token smallest units.
-    /// * `enabled`   – Master switch — when `false`, flat fees are disabled.
-    ///
-    /// # Arguments
-    ///
-    /// * `token` - The address of the token to be used for fees.
-    /// * `collector` - The address that will receive the fees.
-    /// * `amount` - The flat fee amount.
-    /// * `enabled` - Whether the fee is enabled.
     pub fn configure_flat_fee(
         env: Env,
         token: Address,
@@ -236,19 +148,11 @@ impl AttestationContract {
         );
     }
 
-
-    /// Set the Protocol DAO contract address for flat fee overrides.
     pub fn set_flat_fee_dao(env: Env, dao: Address) {
         dynamic_fees::require_admin(&env);
         fees::set_dao(&env, &dao);
     }
 
-
-    // ── Attestor staking integration ───────────────────────────────
-
-    /// Set the attestor staking contract address.
-    ///
-    /// Only ADMIN may call.
     pub fn set_attestor_staking_contract(env: Env, caller: Address, staking_contract: Address) {
         access_control::require_admin(&env, &caller);
         env.storage()
@@ -256,42 +160,26 @@ impl AttestationContract {
             .set(&DataKey::AttestorStakingContract, &staking_contract);
     }
 
-    /// Get the configured attestor staking contract address (if set).
     pub fn get_attestor_staking_contract(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::AttestorStakingContract)
     }
 
-    // ── Role-Based Access Control ───────────────────────────────────
-
-    /// Grant a role to an address.
-    ///
-    /// Only addresses with ADMIN role can grant roles.
-    pub fn grant_role(env: Env, caller: Address, account: Address, role: u32) {
+    pub fn grant_role(env: Env, caller: Address, account: Address, role: u32, _nonce: u64) {
         access_control::require_admin(&env, &caller);
         access_control::grant_role(&env, &account, role);
         events::emit_role_granted(&env, &account, role, &caller);
     }
 
-    /// Revoke a role from an address.
-    ///
-    /// Only addresses with ADMIN role can revoke roles.
-    pub fn revoke_role(env: Env, caller: Address, account: Address, role: u32) {
+    pub fn revoke_role(env: Env, caller: Address, account: Address, role: u32, _nonce: u64) {
         access_control::require_admin(&env, &caller);
         access_control::revoke_role(&env, &account, role);
         events::emit_role_revoked(&env, &account, role, &caller);
     }
 
-    /// Check if an address has a specific role.
     pub fn has_role(env: Env, account: Address, role: u32) -> bool {
         access_control::has_role(&env, &account, role)
     }
 
-    /// Submits a single-period attestation.
-    ///
-    /// Expiry enforcement:
-    /// - `expiry_timestamp`, when set, must be strictly greater than both `timestamp`
-    ///   and the current ledger timestamp.
-    /// - Expired-on-arrival attestations are rejected.
     pub fn submit_attestation(
         env: Env,
         business: Address,
@@ -314,12 +202,24 @@ impl AttestationContract {
         }
         Self::validate_expiry(&env, timestamp, expiry_timestamp);
 
-        // Collect fees.
+        // Security: If a proof_hash is provided, it MUST match the canonical commitment.
+        if let Some(ref provided_hash) = proof_hash {
+            let expected_hash = Self::compute_commitment(
+                env.clone(),
+                business.clone(),
+                period.clone(),
+                merkle_root.clone(),
+                version,
+            );
+            if provided_hash != &expected_hash {
+                panic!("proof_hash does not match canonical commitment");
+            }
+        }
+
         let dynamic_fee = dynamic_fees::collect_fee(&env, &business);
         let flat_fee = fees::collect_flat_fee(&env, &business);
         let total_fee = dynamic_fee + flat_fee;
 
-        // Track volume for future discount calculations.
         dynamic_fees::increment_business_count(&env, &business);
 
         let data: AttestationData = (
@@ -332,7 +232,6 @@ impl AttestationContract {
         );
         env.storage().instance().set(&key, &data);
 
-        // Emit event
         events::emit_attestation_submitted(
             &env,
             &business,
@@ -345,14 +244,9 @@ impl AttestationContract {
             expiry_timestamp,
         );
 
-
         rate_limit::record_submission(&env, &business);
     }
 
-    /// Submit a revenue attestation as an attestor.
-    ///
-    /// The caller must hold `ROLE_ATTESTOR` and meet the minimum stake requirement
-    /// in the configured attestor staking contract.
     pub fn submit_attestation_as_attestor(
         env: Env,
         attestor: Address,
@@ -361,121 +255,91 @@ impl AttestationContract {
         merkle_root: BytesN<32>,
         timestamp: u64,
         version: u32,
-        expiry_timestamp: Option<u64>,
+        proof_hash: Option<BytesN<32>>,
     ) {
+        attestor.require_auth();
         access_control::require_not_paused(&env);
-        access_control::require_attestor(&env, &attestor);
-
-    /// Returns true when an attestation exists and has passed its expiry timestamp.
-    ///
-    /// If the attestation has no expiry or does not exist, returns false.
-    pub fn is_expired(env: Env, business: Address, period: String) -> bool {
-        if let Some(data) = Self::get_attestation(env.clone(), business, period) {
-            return Self::attestation_expired(&env, &data);
+        
+        if !access_control::has_role(&env, &attestor, ROLE_ATTESTOR) {
+            panic!("caller is not an authorized attestor");
         }
-        false
-    }
 
-    /// Verifies attestation integrity and freshness for downstream consumers.
-    ///
-    /// Returns true only when:
-    /// - the attestation exists,
-    /// - the attestation is not revoked,
-    /// - the attestation is not expired, and
-    /// - the stored Merkle root matches `merkle_root`.
-    pub fn verify_attestation(
-        env: Env,
-        business: Address,
-        period: String,
-        merkle_root: BytesN<32>,
-    ) -> bool {
-        if let Some(data) = Self::get_attestation(env.clone(), business.clone(), period.clone()) {
-            if Self::attestation_expired(&env, &data) {
-                return false;
+        if let Some(staking_addr) = Self::get_attestor_staking_contract(env.clone()) {
+            let staking_client = AttestorStakingContractClient::new(&env, &staking_addr);
+            if !staking_client.is_eligible(&attestor) {
+                panic!("attestor not eligible (insufficient stake)");
             }
-            if Self::is_revoked(env, business, period) {
-                return false;
-            }
-            return data.0 == merkle_root;
-        }
-        false
-    }
-
-    pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
-        dispute::is_attestation_revoked(&env, &business, &period)
-    }
-
-    /// Returns revocation metadata for an attestation, if it has been revoked.
-    pub fn get_revocation_info(
-        env: Env,
-        business: Address,
-        period: String,
-    ) -> Option<RevocationData> {
-        dispute::get_attestation_revocation(&env, &business, &period)
-    }
-
-    /// Returns attestation data together with optional revocation metadata.
-    pub fn get_attestation_with_status(
-        env: Env,
-        business: Address,
-        period: String,
-    ) -> Option<AttestationWithRevocation> {
-        let attestation = Self::get_attestation(env.clone(), business.clone(), period.clone())?;
-        let revocation = Self::get_revocation_info(env, business, period);
-        Some((attestation, revocation))
-    }
-
-    /// Verifies an attestation against the expected root and revocation status.
-    pub fn verify_attestation(
-        env: Env,
-        business: Address,
-        period: String,
-        merkle_root: BytesN<32>,
-    ) -> bool {
-        match Self::get_attestation(env.clone(), business.clone(), period.clone()) {
-            Some((stored_root, _, _, _, _, _)) => {
-                stored_root == merkle_root && !Self::is_revoked(env, business, period)
-            }
-            None => false,
-        }
-    }
-
-    /// Batch-queries attestation and revocation state for the requested periods.
-    pub fn get_business_attestations(
-        env: Env,
-        business: Address,
-        periods: Vec<String>,
-    ) -> AttestationStatusResult {
-        let mut results = Vec::new(&env);
-        for period in periods.iter() {
-            let attestation = Self::get_attestation(env.clone(), business.clone(), period.clone());
-            let revocation = Self::get_revocation_info(env.clone(), business.clone(), period.clone());
-            results.push_back((period, attestation, revocation));
-        }
-        results
-    }
-
-    /// Verify that an attestation exists and matches the provided merkle root.
-    /// This does NOT check expiry - use is_expired() separately for that.
-    pub fn verify_attestation(
-        env: Env,
-        business: Address,
-        period: String,
-        merkle_root: BytesN<32>,
-    ) -> bool {
-        if let Some((stored_root, _, _, _, _, _)) = Self::get_attestation(env, business, period) {
-            stored_root == merkle_root
         } else {
-            false
+            panic!("attestor staking contract not configured");
+        }
+
+        // Security: Commitment enforcement
+        if let Some(ref provided_hash) = proof_hash {
+            let expected_hash = Self::compute_commitment(
+                env.clone(),
+                business.clone(),
+                period.clone(),
+                merkle_root.clone(),
+                version,
+            );
+            if provided_hash != &expected_hash {
+                panic!("proof_hash does not match canonical commitment");
+            }
+        }
+
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        if env.storage().instance().has(&key) {
+            panic!("attestation already exists");
+        }
+
+        let data: AttestationData = (
+            merkle_root.clone(),
+            timestamp,
+            version,
+            0,
+            proof_hash,
+            None,
+        );
+        env.storage().instance().set(&key, &data);
+    }
+
+    pub fn submit_attestations_batch(env: Env, items: Vec<BatchAttestationItem>) {
+        if items.is_empty() {
+            panic!("batch cannot be empty");
+        }
+        for item in items.iter() {
+            let key = DataKey::Attestation(item.business.clone(), item.period.clone());
+            if env.storage().instance().has(&key) {
+                panic!("attestation already exists");
+            }
+            
+            let data: AttestationData = (
+                item.merkle_root,
+                item.timestamp,
+                item.version,
+                0,
+                None,
+                item.expiry_timestamp,
+            );
+            env.storage().instance().set(&key, &data);
         }
     }
 
-    pub fn revoke_attestation(
+    pub fn submit_batch_as_attestor(env: Env, attestor: Address, items: Vec<BatchAttestationItem>) {
+        attestor.require_auth();
+        if !access_control::has_role(&env, &attestor, ROLE_ATTESTOR) {
+            panic!("not authorized");
+        }
+        Self::submit_attestations_batch(env, items);
+    }
+
+    pub fn migrate_attestation(
         env: Env,
-        caller: Address,
+        admin: Address,
         business: Address,
         period: String,
-        reason: String,
+        new_merkle_root: BytesN<32>,
+        new_version: u32,
         _nonce: u64,
     ) {
         dispute::require_revocation_authorized(&env, &caller, &business, &period);
@@ -509,15 +373,11 @@ impl AttestationContract {
         rate_limit::check_rate_limit(&env, &business);
 
         let key = DataKey::Attestation(business.clone(), period.clone());
-        if env.storage().instance().has(&key) {
-            panic!("attestation already exists for this business and period");
-        }
+        let (old_root, ts, old_version, fee, ph, exp) = env.storage().instance().get::<_, AttestationData>(&key).expect("attestation not found");
 
-        let dynamic_fee = dynamic_fees::collect_fee(&env, &business);
-        let flat_fee = fees::collect_flat_fee(&env, &business);
-        let total_fee = dynamic_fee + flat_fee;
-        
-        dynamic_fees::increment_business_count(&env, &business);
+        if new_version <= old_version {
+            panic!("new version must be greater than old version");
+        }
 
         let data = (
             merkle_root.clone(),
@@ -528,63 +388,10 @@ impl AttestationContract {
             expiry_timestamp,
         );
         env.storage().instance().set(&key, &data);
-        
-        // Extended metadata
-        extended_metadata::set_metadata(&env, &business, &period, &currency_code, is_net);
+
+        events::emit_attestation_migrated(&env, &business, &period, &old_root, &new_merkle_root, old_version, new_version, &admin);
     }
 
-
-    /// Pauses state-changing administrative flows.
-    pub fn pause(env: Env, caller: Address) {
-        caller.require_auth();
-        let caller_is_admin = caller == dynamic_fees::get_admin(&env)
-            || access_control::has_role(&env, &caller, ROLE_ADMIN)
-            || access_control::has_role(&env, &caller, ROLE_OPERATOR);
-        assert!(caller_is_admin, "caller must have ADMIN or OPERATOR role");
-        access_control::set_paused(&env, true);
-        events::emit_paused(&env, &caller);
-    }
-
-    /// Restores state-changing administrative flows.
-    pub fn unpause(env: Env, caller: Address) {
-        caller.require_auth();
-        let caller_is_admin = caller == dynamic_fees::get_admin(&env)
-            || access_control::has_role(&env, &caller, ROLE_ADMIN)
-            || access_control::has_role(&env, &caller, ROLE_OPERATOR);
-        assert!(caller_is_admin, "caller must have ADMIN or OPERATOR role");
-        access_control::set_paused(&env, false);
-        events::emit_unpaused(&env, &caller);
-    }
-
-        // Keep status key in sync for pagination/filtering.
-        let status_key = (STATUS_KEY_TAG, business.clone(), period.clone());
-        env.storage().instance().set(&status_key, &STATUS_REVOKED);
-
-        events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
-    }
-
-    /// Migrate an attestation to a new version.
-    pub fn verify_attestation(env: Env, business: Address, period: String, merkle_root: BytesN<32>) -> bool {
-        if let Some((stored_root, _ts, _ver, _fee)) = Self::get_attestation(env.clone(), business, period) {
-            stored_root == merkle_root
-        } else {
-            false
-        }
-    }
-
-    /// Migrate an attestation to a new version.
-    ///
-    /// Only ADMIN role can migrate attestations. This updates the merkle root
-    /// and version while preserving the audit trail. The existing proof hash
-    /// is preserved — proof hashes cannot be modified without explicit migration.
-    pub fn migrate_attestation(
-    // ── New: Multi-Period Attestation Methods ───────────────────────
-
-    /// Submit a multi-period revenue attestation.
-    /// 
-    /// Stores the attestation covering `start_period` to `end_period` (inclusive).
-    /// Enforces a strict non-overlap policy: panics if the new range intersects
-    /// with any existing, unrevoked range for the business.
     pub fn submit_multi_period_attestation(
         env: Env,
         business: Address,
@@ -593,6 +400,8 @@ impl AttestationContract {
         merkle_root: BytesN<32>,
         timestamp: u64,
         version: u32,
+        proof_hash: Option<BytesN<32>>,
+        expiry_timestamp: Option<u64>,
     ) {
         business.require_auth();
 
@@ -600,15 +409,20 @@ impl AttestationContract {
             panic!("start_period must be <= end_period");
         }
 
-        let key = DataKey::Attestation(business.clone(), period.clone());
-        let (old_merkle_root, timestamp, old_version, fee_paid, proof_hash, expiry_timestamp): (
-            BytesN<32>,
-            u64,
-            u32,
-            i128,
-            Option<BytesN<32>>,
-            Option<u64>,
-        ) = env
+        if let Some(ref provided_hash) = proof_hash {
+            let period_str = String::from_str(&env, "MULTI:");
+            let expected_hash = Self::compute_commitment(
+                env.clone(),
+                business.clone(),
+                period_str,
+                merkle_root.clone(),
+                version,
+            );
+            if provided_hash != &expected_hash {
+                panic!("proof_hash does not match canonical commitment");
+            }
+        }
+
         let key = MultiPeriodKey::Ranges(business.clone());
         let mut ranges: Vec<AttestationRange> = env
             .storage()
@@ -636,59 +450,61 @@ impl AttestationContract {
             fee_paid,
             proof_hash,
             expiry_timestamp,
-        );
-        env.storage().instance().set(&key, &data);
             revoked: false,
         });
 
         env.storage().instance().set(&key, &ranges);
 
-        // Create a topic tuple to categorize the event
-        let topics = (soroban_sdk::Symbol::new(&env, "attestation"), soroban_sdk::Symbol::new(&env, "multi_period_issued"), business.clone());
-        // Publish the event with the range and root
+        let topics = (Symbol::new(&env, "attestation"), Symbol::new(&env, "multi_period_issued"), business.clone());
         env.events().publish(topics, (start_period, end_period, merkle_root));
-
     }
 
-    
+    pub fn revoke_multi_period_attestation(
+        env: Env,
+        business: Address,
+        merkle_root: BytesN<32>,
+    ) {
+        business.require_auth();
 
-    /// Return stored attestation for (business, period), if any.
-    ///
-    /// Returns `(merkle_root, timestamp, version, fee_paid, proof_hash, expiry_timestamp)`.
-    /// - `proof_hash` is an optional SHA-256 hash pointing to the full off-chain proof bundle.
-    /// - `expiry_timestamp` is `None` if no expiry was set.
-    #[allow(clippy::type_complexity)]
+        let key = MultiPeriodKey::Ranges(business.clone());
+        let ranges: Vec<AttestationRange> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no multi-period attestations found"));
+
+        let mut found = false;
+        let mut updated_ranges = Vec::new(&env);
+
+        for mut range in ranges.iter() {
+            if range.merkle_root == merkle_root {
+                range.revoked = true;
+                found = true;
+            }
+            updated_ranges.push_back(range);
+        }
+
+        if !found {
+            panic!("attestation root not found");
+        }
+
+        env.storage().instance().set(&key, &updated_ranges);
+    }
+
     pub fn get_attestation(
         env: Env,
         business: Address,
         period: String,
-    ) -> Option<(BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>)> {
+    ) -> Option<AttestationData> {
         let key = DataKey::Attestation(business, period);
         env.storage().instance().get(&key)
     }
 
-    /// Return the off-chain proof hash for an attestation, if set.
-    ///
-    /// The proof hash is a content-addressable SHA-256 hash (32 bytes)
-    /// that points to the full off-chain revenue dataset or proof bundle
-    /// associated with this attestation. Returns `None` if no attestation
-    /// exists or if no proof hash was provided at submission time.
-    #[allow(clippy::type_complexity)]
     pub fn get_proof_hash(env: Env, business: Address, period: String) -> Option<BytesN<32>> {
-        let key = DataKey::Attestation(business, period);
-        let record: Option<(BytesN<32>, u64, u32, i128, Option<BytesN<32>>, Option<u64>)> =
-            env.storage().instance().get(&key);
+        let record = Self::get_attestation(env, business, period);
         record.and_then(|(_, _, _, _, ph, _)| ph)
     }
 
-    /// Check if an attestation has expired.
-    ///
-    /// Returns `true` if:
-    /// - The attestation exists
-    /// - It has an expiry timestamp set
-    /// - Current ledger time >= expiry timestamp
-    ///
-    /// Returns `false` if attestation doesn't exist or has no expiry.
     pub fn is_expired(env: Env, business: Address, period: String) -> bool {
         if let Some((_root, _ts, _ver, _fee, _proof_hash, Some(expiry_ts))) =
             Self::get_attestation(env.clone(), business, period)
@@ -734,9 +550,7 @@ impl AttestationContract {
         }
     }
 
-    /// One-time setup of the admin address. Admin is the single authorized updater of the
-    /// authorized-analytics set. Anomaly data is stored under a separate instance key and
-    /// never modifies attestation (merkle root, timestamp, version) storage.
+
     pub fn init(env: Env, admin: Address) {
         admin.require_auth();
         if env.storage().instance().has(&ADMIN_KEY_TAG) {
@@ -745,7 +559,6 @@ impl AttestationContract {
         env.storage().instance().set(&ADMIN_KEY_TAG, &admin);
     }
 
-    /// Adds an address to the set of authorized updaters (analytics/oracle). Caller must be admin.
     pub fn add_authorized_analytics(env: Env, caller: Address, analytics: Address) {
         caller.require_auth();
         let admin: Address = env
@@ -760,7 +573,6 @@ impl AttestationContract {
         env.storage().instance().set(&key, &());
     }
 
-    /// Removes an address from the set of authorized updaters. Caller must be admin.
     pub fn remove_authorized_analytics(env: Env, caller: Address, analytics: Address) {
         caller.require_auth();
         let admin: Address = env
@@ -775,30 +587,6 @@ impl AttestationContract {
         env.storage().instance().remove(&key);
     }
 
-    /// Compute a business-level anomaly escalation level from flags and score.
-    /// Returns 0..3 where 0 = none, 1 = elevated, 2 = high, 3 = critical.
-    fn calculate_escalation_level(flags: u32, score: u32) -> u32 {
-        if score >= ESCALATION_THRESHOLD_CRITICAL {
-            ESCALATION_LEVEL_CRITICAL
-        } else if score >= ESCALATION_THRESHOLD_HIGH {
-            ESCALATION_LEVEL_HIGH
-        } else if score >= ESCALATION_THRESHOLD_ELEVATED {
-            ESCALATION_LEVEL_ELEVATED
-        } else if flags & 0x8000_0000 != 0 {
-            // Highest bit in flags reserved for immediate critical escalation.
-            ESCALATION_LEVEL_CRITICAL
-        } else if flags & 0x3 == 0x3 {
-            // Combined core anomaly bits 0+1 indicate high suspicion even at low score.
-            ESCALATION_LEVEL_HIGH
-        } else {
-            ESCALATION_LEVEL_NONE
-        }
-    }
-
-    /// Stores anomaly flags and risk score for an existing attestation. Only addresses in the
-    /// authorized-analytics set (added by admin) may call this; updater must pass their address
-    /// and authorize. flags: bitmask for anomaly conditions (semantics defined off-chain).
-    /// score: risk score in [0, 100]; higher means higher risk. Panics if attestation missing or score > 100.
     pub fn set_anomaly(
         env: Env,
         updater: Address,
@@ -821,98 +609,173 @@ impl AttestationContract {
         }
         let anomaly_key = (ANOMALY_KEY_TAG, business.clone(), period.clone());
         env.storage().instance().set(&anomaly_key, &(flags, score));
-
-        // Anomaly escalation can only increase over time to avoid downgrade path risks.
-        let new_level = Self::calculate_escalation_level(flags, score);
-        let escalation_key = (ESCALATION_KEY_TAG, business.clone());
-        let current_level: Option<u32> = env.storage().instance().get(&escalation_key);
-        let updated_level = match current_level {
-            Some(existing) => if existing > new_level { existing } else { new_level },
-            None => new_level,
-        };
-        if updated_level != ESCALATION_LEVEL_NONE {
-            env.storage().instance().set(&escalation_key, &updated_level);
-        } else {
-            // If no escalation, we clear the record to reduce storage footprint for clean state.
-            env.storage().instance().remove(&escalation_key);
-        }
+        dispute::update_anomaly_escalation(&env, &business, score);
     }
 
-    /// Returns anomaly flags and risk score for (business, period) if set. For use by lenders.
     pub fn get_anomaly(env: Env, business: Address, period: String) -> Option<(u32, u32)> {
         let key = (ANOMALY_KEY_TAG, business.clone(), period);
         env.storage().instance().get(&key)
     }
 
-    /// Returns a business-level escalation level (0 - none, 1 - elevated, 2 - high, 3 - critical).
     pub fn get_anomaly_escalation(env: Env, business: Address) -> Option<u32> {
-        let key = (ESCALATION_KEY_TAG, business);
-        env.storage().instance().get(&key)
+        dispute::get_anomaly_escalation(&env, &business)
     }
 
-    /// Clear business-level escalation. Only ADMIN can call. Used to reset after manual review.
     pub fn clear_anomaly_escalation(env: Env, caller: Address, business: Address) {
-        access_control::require_admin(&env, &caller);
-        let key = (ESCALATION_KEY_TAG, business);
-        env.storage().instance().remove(&key);
-    }
-
-    /// Get all attestations for a business with their revocation status.
-    ///
-    /// This method is useful for audit and reporting purposes.
-    /// Note: This requires the business to maintain a list of their periods
-    /// as the contract does not store a global index of attestations.
-    ///
-    /// # Arguments
-    /// * `business` - Business address to query attestations for
-    /// * `periods` - List of period identifiers to retrieve
-    ///
-    /// # Returns
-    /// Vector of tuples containing (period, attestation_data, revocation_info)
-    pub fn get_business_attestations(
-    pub fn revoke_multi_period_attestation(
-        env: Env,
-        business: Address,
-        merkle_root: BytesN<32>,
-    ) {
-        business.require_auth();
-
-        let key = MultiPeriodKey::Ranges(business.clone());
-        let ranges: Vec<AttestationRange> = env
+        caller.require_auth();
+        let admin: Address = env
             .storage()
             .instance()
-            .get(&key)
-            .unwrap_or_else(|| panic!("no multi-period attestations found"));
+            .get(&ADMIN_KEY_TAG)
+            .expect("admin not set");
+        if caller != admin {
+            panic!("caller is not admin");
+        }
+        dispute::clear_anomaly_escalation(&env, &business);
+    }
 
-        let mut found = false;
-        let mut updated_ranges = Vec::new(&env);
+    // --- Registry Methods ---
+    pub fn register_business(
+        env: Env,
+        business: Address,
+        name_hash: BytesN<32>,
+        jurisdiction: Symbol,
+        tags: Vec<Symbol>,
+    ) {
+        registry::register_business(&env, &business, name_hash, jurisdiction, tags);
+    }
 
-        // Rebuild the vector, updates the revoked status of the target root
-        for mut range in ranges.iter() {
-            if range.merkle_root == merkle_root {
-                range.revoked = true;
-                found = true;
+    pub fn approve_business(env: Env, caller: Address, business: Address) {
+        registry::approve_business(&env, &caller, &business);
+    }
+
+    pub fn suspend_business(env: Env, caller: Address, business: Address, reason: Symbol) {
+        registry::suspend_business(&env, &caller, &business, reason);
+    }
+
+    pub fn reactivate_business(env: Env, caller: Address, business: Address) {
+        registry::reactivate_business(&env, &caller, &business);
+    }
+
+    pub fn update_tags(env: Env, caller: Address, business: Address, tags: Vec<Symbol>) {
+        registry::update_tags(&env, &caller, &business, tags);
+    }
+
+    pub fn is_business_active(env: Env, business: Address) -> bool {
+        registry::is_active(&env, &business)
+    }
+
+    pub fn get_business(env: Env, business: Address) -> Option<BusinessRecord> {
+        registry::get_business(&env, &business)
+    }
+
+    // --- Extended Metadata Methods ---
+    pub fn get_attestation_metadata(
+        env: Env,
+        business: Address,
+        period: String,
+    ) -> Option<extended_metadata::AttestationMetadata> {
+        extended_metadata::get_metadata(&env, &business, &period)
+    }
+
+    pub fn submit_attestation_with_metadata(
+        env: Env,
+        business: Address,
+        period: String,
+        merkle_root: BytesN<32>,
+        timestamp: u64,
+        version: u32,
+        currency_code: String,
+        is_net: bool,
+        nonce: u64,
+    ) {
+        Self::submit_attestation(
+            env.clone(),
+            business.clone(),
+            period.clone(),
+            merkle_root,
+            timestamp,
+            version,
+            None,
+            None,
+            nonce,
+        );
+        let meta = extended_metadata::validate_metadata(&env, &currency_code, is_net);
+        extended_metadata::set_metadata(&env, &business, &period, &meta);
+    }
+
+    pub fn get_business_attestations(
+        env: Env,
+        business: Address,
+        periods: Vec<String>,
+    ) -> AttestationStatusResult {
+        let mut results = Vec::new(&env);
+        for period in periods.iter() {
+            let attestation = Self::get_attestation(env.clone(), business.clone(), period.clone());
+            let revocation = dispute::get_attestation_revocation(&env, &business, &period);
+            results.push_back((period, attestation, revocation));
+        }
+        results
+    }
+
+    pub fn get_attestations_page(
+        env: Env,
+        business: Address,
+        periods: Vec<String>,
+        start_period: Option<String>,
+        end_period: Option<String>,
+        status_filter: u32,
+        version_filter: Option<u32>,
+        limit: u32,
+        cursor: u32,
+    ) -> (Vec<(String, BytesN<32>, u64, u32, u32)>, u32) {
+        let mut results = Vec::new(&env);
+        let mut current_cursor = cursor;
+        let mut count = 0;
+        let max_limit = 30;
+        let actual_limit = if limit > max_limit { max_limit } else { limit };
+
+        while current_cursor < periods.len() && count < actual_limit {
+            let period = periods.get(current_cursor).unwrap();
+            
+            if let Some(ref start) = start_period {
+                if period < *start {
+                    current_cursor += 1;
+                    continue;
+                }
             }
-            updated_ranges.push_back(range);
+            if let Some(ref end) = end_period {
+                if period > *end {
+                    current_cursor += 1;
+                    continue;
+                }
+            }
+
+            if let Some((root, ts, ver, _fee, _ph, _exp)) = Self::get_attestation(env.clone(), business.clone(), period.clone()) {
+                if let Some(v_filter) = version_filter {
+                    if ver != v_filter {
+                        current_cursor += 1;
+                        continue;
+                    }
+                }
+
+                let revocation = dispute::get_attestation_revocation(&env, &business, &period);
+                let status = if revocation.is_some() { STATUS_REVOKED } else { STATUS_ACTIVE };
+                
+                if status_filter != STATUS_FILTER_ALL && status != status_filter {
+                    current_cursor += 1;
+                    continue;
+                }
+
+                results.push_back((period, root, ts, ver, status));
+                count += 1;
+            }
+            current_cursor += 1;
         }
 
-        if !found {
-            panic!("attestation root not found");
-        }
+        (results, current_cursor)
+    }
 
-    /// Calculate a canonical commitment hash for an attestation.
-    ///
-    /// This commitment binds the business, period, merkle root, and version
-    /// into a single SHA-256 hash. Off-chain systems should use this hash
-    /// to ensure that a proof bundle is uniquely tied to a specific on-chain
-    /// attestation record, preventing forgery or reuse across periods.
-    ///
-    /// # Arguments
-    ///
-    /// * `business`    – The business address.
-    /// * `period`      – The attestation period string.
-    /// * `merkle_root` – The 32-byte Merkle root hash.
-    /// * `version`     – The schema version.
     pub fn compute_commitment(
         env: Env,
         business: Address,
@@ -921,236 +784,548 @@ impl AttestationContract {
         version: u32,
     ) -> BytesN<32> {
         let mut buf = soroban_sdk::Bytes::new(&env);
-        
-        // Canonical encoding: [Business XDR] | [Period XDR] | [Root Bytes] | [Version BE]
         buf.append(&business.to_xdr(&env));
         buf.append(&period.to_xdr(&env));
         buf.append(&merkle_root.to_xdr(&env));
         
-        // Use big-endian for version to ensure stability across architectures
         let mut ver_buf = [0u8; 4];
         for (i, byte) in version.to_be_bytes().iter().enumerate() {
             ver_buf[i] = *byte;
         }
         buf.append(&soroban_sdk::Bytes::from_array(&env, &ver_buf));
 
-        env.crypto().sha256(&buf)
+        env.crypto().sha256(&buf).into()
     }
-
-    /// Return the current flat fee configuration, or None if not set.
 
     pub fn get_flat_fee_config(env: Env) -> Option<FlatFeeConfig> {
         fees::get_flat_fee_config(&env)
     }
 
-    /// Return the effective flat fee configuration (including DAO overrides).
-    pub fn get_effective_flat_fee_config(env: Env) -> Option<FlatFeeConfig> {
-        fees::get_effective_flat_fee_config(&env)
-    }
-
-
-    /// Calculate the fee a business would pay for its next attestation.
-    pub fn get_fee_quote(env: Env, business: Address) -> i128 {
-        dynamic_fees::calculate_fee(&env, &business)
-        env.storage().instance().set(&key, &updated_ranges);
-    }
-
-
-    /// Return the contract admin address.
     pub fn get_admin(env: Env) -> Address {
         dynamic_fees::get_admin(&env)
     }
 
-    // ── Rate-limit queries ──────────────────────────────────────────
-
-    /// Return the current rate limit configuration, or None if not set.
-    pub fn get_rate_limit_config(env: Env) -> Option<RateLimitConfig> {
-        rate_limit::get_rate_limit_config(&env)
+    pub fn pause(env: Env, caller: Address, _nonce: u64) {
+        caller.require_auth();
+        access_control::set_paused(&env, true);
+        events::emit_paused(&env, &caller);
     }
 
-    /// Return how many submissions a business has in the current window.
-    ///
-    /// Returns 0 when rate limiting is not configured or disabled.
-    pub fn get_submission_window_count(env: Env, business: Address) -> u32 {
-        rate_limit::get_submission_count(&env, &business)
+    pub fn unpause(env: Env, caller: Address, _nonce: u64) {
+        caller.require_auth();
+        access_control::set_paused(&env, false);
+        events::emit_unpaused(&env, &caller);
     }
 
-    // ── Key Rotation ────────────────────────────────────────────────
+    pub fn is_paused(env: Env) -> bool {
+        access_control::is_paused(&env)
+    }
 
-    /// Configure the key rotation timelock and cooldown parameters.
-    ///
-    /// Only the admin can update rotation configuration.
-    /// * `timelock_ledgers` – Ledger sequences to wait before confirming (≥ 1).
-    /// * `confirmation_window_ledgers` – Window during which confirmation is valid (≥ 1).
-    /// * `cooldown_ledgers` – Minimum ledgers between successive rotations.
+    fn validate_expiry(env: &Env, timestamp: u64, expiry_timestamp: Option<u64>) {
+        if let Some(expiry) = expiry_timestamp {
+            if expiry <= timestamp {
+                panic!("expiry_timestamp must be greater than timestamp");
+            }
+            if expiry <= env.ledger().timestamp() {
+                panic!("attestation expired on arrival");
+            }
+        }
+    }
+
+    pub fn get_fee_quote(env: Env, business: Address) -> i128 {
+        dynamic_fees::compute_fee(&env, &business)
+    }
+
+    pub fn get_business_count(env: Env, business: Address) -> u64 {
+        dynamic_fees::get_business_count(&env, &business)
+    }
+
+    pub fn get_business_tier(env: Env, business: Address) -> u32 {
+        dynamic_fees::get_business_tier(&env, &business)
+    }
+
+    pub fn get_replay_nonce(env: Env, business: Address, channel: u32) -> u64 {
+        replay_protection::get_nonce(&env, &business, channel)
+    }
+
+    pub fn open_dispute(
+        env: Env,
+        challenger: Address,
+        business: Address,
+        period: String,
+        dispute_type: DisputeType,
+        evidence: String,
+    ) -> u64 {
+        challenger.require_auth();
+        dispute::validate_dispute_eligibility(&env, &challenger, &business, &period).unwrap();
+
+        let id = dispute::generate_dispute_id(&env);
+        let dispute_record = Dispute {
+            id,
+            challenger: challenger.clone(),
+            business: business.clone(),
+            period: period.clone(),
+            status: DisputeStatus::Open,
+            dispute_type,
+            evidence,
+            timestamp: env.ledger().timestamp(),
+            resolution: OptionalResolution::None,
+        };
+
+        dispute::store_dispute(&env, &dispute_record);
+        dispute::add_dispute_to_attestation_index(&env, &business, &period, id);
+        dispute::add_dispute_to_challenger_index(&env, &challenger, id);
+
+        id
+    }
+
+    pub fn resolve_dispute(
+        env: Env,
+        dispute_id: u64,
+        resolver: Address,
+        outcome: DisputeOutcome,
+        notes: String,
+    ) {
+        resolver.require_auth();
+        let mut dispute_record = dispute::validate_dispute_resolution(&env, dispute_id, &resolver).unwrap();
+
+        let resolution = DisputeResolution {
+            resolver: resolver.clone(),
+            outcome,
+            timestamp: env.ledger().timestamp(),
+            notes,
+        };
+
+        dispute_record.status = DisputeStatus::Resolved;
+        dispute_record.resolution = OptionalResolution::Some(resolution.clone());
+
+        dispute::store_dispute(&env, &dispute_record);
+        dispute::store_dispute_resolution(&env, dispute_id, &resolution);
+    }
+
+    pub fn close_dispute(env: Env, dispute_id: u64) {
+        let mut dispute_record = dispute::validate_dispute_closure(&env, dispute_id).unwrap();
+
+        dispute_record.status = DisputeStatus::Closed;
+        dispute::store_dispute(&env, &dispute_record);
+    }
+
+    pub fn get_dispute(env: Env, dispute_id: u64) -> Option<Dispute> {
+        dispute::get_dispute(&env, dispute_id)
+    }
+
+    pub fn get_disputes_by_attestation(env: Env, business: Address, period: String) -> Vec<u64> {
+        dispute::get_dispute_ids_by_attestation(&env, &business, &period)
+    }
+
+    pub fn get_disputes_by_challenger(env: Env, challenger: Address) -> Vec<u64> {
+        dispute::get_dispute_ids_by_challenger(&env, &challenger)
+    }
+
+    pub fn initialize_multisig(env: Env, owners: Vec<Address>, threshold: u32, _nonce: u64) {
+        multisig::initialize_multisig(&env, &owners, threshold, _nonce);
+    }
+
+    pub fn get_multisig_owners(env: Env) -> Vec<Address> {
+        multisig::get_owners(&env)
+    }
+
+    pub fn get_multisig_threshold(env: Env) -> u32 {
+        multisig::get_threshold(&env)
+    }
+
+    pub fn is_multisig_owner(env: Env, address: Address) -> bool {
+        multisig::is_owner(&env, &address)
+    }
+
+    pub fn create_proposal(
+        env: Env,
+        proposer: Address,
+        action: ProposalAction,
+        _nonce: u64,
+    ) -> u64 {
+        multisig::create_proposal(&env, &proposer, action)
+    }
+
+    pub fn get_proposal(env: Env, id: u64) -> Option<Proposal> {
+        multisig::get_proposal(&env, id)
+    }
+
+    pub fn approve_proposal(env: Env, approver: Address, id: u64, _nonce: u64) {
+        multisig::approve_proposal(&env, &approver, id)
+    }
+
+    pub fn reject_proposal(env: Env, rejecter: Address, id: u64, _nonce: u64) {
+        multisig::reject_proposal(&env, &rejecter, id)
+    }
+
+    pub fn is_proposal_approved(env: Env, id: u64) -> bool {
+        multisig::is_proposal_approved(&env, id)
+    }
+
+    pub fn get_approval_count(env: Env, id: u64) -> u32 {
+        multisig::get_approval_count(&env, id)
+    }
+
+    pub fn execute_proposal(env: Env, executor: Address, proposal_id: u64, _nonce: u64) {
+        multisig::require_owner(&env, &executor);
+        let proposal = multisig::get_proposal(&env, proposal_id).expect("proposal not found");
+        multisig::mark_executed(&env, proposal_id);
+
+        match proposal.action {
+            ProposalAction::Pause => {
+                access_control::set_paused(&env, true);
+                events::emit_paused(&env, &executor);
+            }
+            ProposalAction::Unpause => {
+                access_control::set_paused(&env, false);
+                events::emit_unpaused(&env, &executor);
+            }
+            ProposalAction::AddOwner(new_owner) => {
+                let mut owners = multisig::get_owners(&env);
+                if !owners.contains(&new_owner) {
+                    owners.push_back(new_owner);
+                    multisig::set_owners(&env, &owners);
+                }
+            }
+            ProposalAction::RemoveOwner(owner_to_remove) => {
+                let mut owners = multisig::get_owners(&env);
+                if let Some(index) = owners.first_index_of(&owner_to_remove) {
+                    owners.remove(index);
+                    multisig::set_owners(&env, &owners);
+                }
+            }
+            ProposalAction::ChangeThreshold(new_threshold) => {
+                let owners_len = multisig::get_owners(&env).len();
+                assert!(new_threshold > 0 && new_threshold <= owners_len, "invalid threshold");
+                env.storage().instance().set(&multisig::MultisigKey::Threshold, &new_threshold);
+            }
+            ProposalAction::GrantRole(account, role) => {
+                access_control::grant_role(&env, &account, role);
+                events::emit_role_granted(&env, &account, role, &executor);
+            }
+            ProposalAction::RevokeRole(account, role) => {
+                access_control::revoke_role(&env, &account, role);
+                events::emit_role_revoked(&env, &account, role, &executor);
+            }
+            ProposalAction::UpdateFeeConfig(token, collector, base_fee, enabled) => {
+                let config = dynamic_fees::FeeConfig { token, collector, base_fee, enabled };
+                dynamic_fees::set_fee_config(&env, &config);
+            }
+            ProposalAction::EmergencyRotateAdmin(new_admin) => {
+                let old_admin = dynamic_fees::get_admin(&env);
+                dynamic_fees::set_admin(&env, &new_admin);
+                // Grant admin role to new admin and revoke from old admin
+                access_control::grant_role(&env, &new_admin, ROLE_ADMIN);
+                let old_roles = access_control::get_roles(&env, &old_admin);
+                access_control::set_roles(&env, &old_admin, old_roles & !ROLE_ADMIN);
+                // Clear any pending planned rotation
+                env.storage().instance().remove(&KeyRotationStorageKey::Pending);
+                // Record history
+                let seq = env.ledger().sequence();
+                let entry = KeyRotationHistoryEntry {
+                    old_admin: old_admin.clone(),
+                    new_admin: new_admin.clone(),
+                    sequence: seq,
+                    is_emergency: true,
+                };
+                let mut history: Vec<KeyRotationHistoryEntry> = env
+                    .storage()
+                    .instance()
+                    .get(&KeyRotationStorageKey::History)
+                    .unwrap_or_else(|| Vec::new(&env));
+                history.push_back(entry);
+                env.storage().instance().set(&KeyRotationStorageKey::History, &history);
+                events::emit_key_rotation_confirmed(&env, &old_admin, &new_admin, true);
+            }
+        }
+    }
+
+    pub fn revoke_attestation(
+        env: Env,
+        caller: Address,
+        business: Address,
+        period: String,
+        reason: String,
+        _nonce: u64,
+    ) {
+        caller.require_auth();
+        access_control::require_not_paused(&env);
+
+        let is_business = caller == business;
+        let is_admin = access_control::has_role(&env, &caller, ROLE_ADMIN);
+        
+        if !is_business && !is_admin {
+            panic!("caller must be the business or an admin");
+        }
+
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        if !env.storage().instance().has(&key) {
+            panic!("attestation not found");
+        }
+
+        let rev_key = DataKey::Revoked(business.clone(), period.clone());
+        if env.storage().instance().has(&rev_key) {
+            panic!("attestation already revoked");
+        }
+
+        let revocation_data: (Address, u64, String) = (caller.clone(), env.ledger().timestamp(), reason.clone());
+        env.storage().instance().set(&rev_key, &revocation_data);
+
+        events::emit_attestation_revoked(&env, &business, &period, &reason, &caller);
+    }
+
+    pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
+        let rev_key = DataKey::Revoked(business, period);
+        env.storage().instance().has(&rev_key)
+    }
+
+    pub fn get_revocation_info(env: Env, business: Address, period: String) -> Option<(Address, u64, String)> {
+        let rev_key = DataKey::Revoked(business, period);
+        env.storage().instance().get(&rev_key)
+    }
+
+    pub fn is_expired(env: Env, business: Address, period: String) -> bool {
+        let key = DataKey::Attestation(business, period);
+        if let Some(att) = env.storage().instance().get::<_, AttestationData>(&key) {
+            if let Some(expiry) = att.5 {
+                return env.ledger().timestamp() >= expiry;
+            }
+        }
+        false
+    }
+
+    pub fn verify_attestation(env: Env, business: Address, period: String, root: BytesN<32>) -> bool {
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        if let Some(att) = env.storage().instance().get::<_, AttestationData>(&key) {
+            if att.0 != root {
+                return false;
+            }
+            if Self::is_revoked(env.clone(), business.clone(), period.clone()) {
+                return false;
+            }
+            if Self::is_expired(env.clone(), business, period) {
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  Key Rotation (planned + emergency via multisig)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Proposed key-rotation record stored in instance storage.
     pub fn configure_key_rotation(
         env: Env,
         timelock_ledgers: u32,
         confirmation_window_ledgers: u32,
         cooldown_ledgers: u32,
-        grace_period_ledgers: u32,
+        max_rotations: u32,
     ) {
         dynamic_fees::require_admin(&env);
-        let config = veritasor_common::key_rotation::RotationConfig {
+        let config = KeyRotationConfig {
             timelock_ledgers,
             confirmation_window_ledgers,
             cooldown_ledgers,
-            grace_period_ledgers,
+            max_rotations,
         };
-        veritasor_common::key_rotation::set_rotation_config(&env, &config);
+        env.storage().instance().set(&KeyRotationStorageKey::Config, &config);
     }
 
-    /// Propose an admin key rotation to a new address.
-    ///
-    /// Only the current admin can propose. Starts a timelock period after
-    /// which the new admin must confirm. Both parties must act for the
-    /// rotation to complete.
+    pub fn get_key_rotation_config(env: Env) -> KeyRotationConfig {
+        env.storage()
+            .instance()
+            .get(&KeyRotationStorageKey::Config)
+            .unwrap_or(KeyRotationConfig {
+                timelock_ledgers: 17_280,
+                confirmation_window_ledgers: 34_560,
+                cooldown_ledgers: 8_640,
+                max_rotations: u32::MAX,
+            })
+    }
+
     pub fn propose_key_rotation(env: Env, new_admin: Address) {
-        let current_admin = dynamic_fees::require_admin(&env);
-        let request =
-            veritasor_common::key_rotation::propose_rotation(&env, &current_admin, &new_admin);
+        let old_admin = dynamic_fees::get_admin(&env);
+        old_admin.require_auth();
+        let config = Self::get_key_rotation_config(env.clone());
+        let current_seq = env.ledger().sequence();
+        let pending = PendingKeyRotation {
+            old_admin: old_admin.clone(),
+            new_admin: new_admin.clone(),
+            timelock_until: current_seq + config.timelock_ledgers,
+            expires_at: current_seq + config.timelock_ledgers + config.confirmation_window_ledgers,
+        };
+        env.storage().instance().set(&KeyRotationStorageKey::Pending, &pending);
         events::emit_key_rotation_proposed(
             &env,
-            &current_admin,
+            &old_admin,
             &new_admin,
-            request.timelock_until,
-            request.expires_at,
+            pending.timelock_until,
+            pending.expires_at,
         );
     }
 
-    /// Confirm a pending admin key rotation.
-    ///
-    /// Only the proposed new admin can confirm. The timelock must have
-    /// elapsed and the confirmation window must not have expired.
-    /// On success, admin privileges transfer to the new address.
-    pub fn confirm_key_rotation(env: Env, caller: Address) {
-        let old_admin = dynamic_fees::get_admin(&env);
-        let pending = veritasor_common::key_rotation::get_pending_rotation(&env)
-            .expect("no pending rotation");
-        let new_admin = pending.new_admin.clone();
+    pub fn confirm_key_rotation(env: Env, new_admin: Address) {
+        let pending: PendingKeyRotation = env
+            .storage()
+            .instance()
+            .get(&KeyRotationStorageKey::Pending)
+            .expect("no pending key rotation");
+        assert_eq!(pending.new_admin, new_admin, "new_admin mismatch");
+        new_admin.require_auth();
+        let seq = env.ledger().sequence();
+        assert!(seq >= pending.timelock_until, "timelock has not elapsed");
+        assert!(seq <= pending.expires_at, "rotation window expired");
 
-        // New admin must authorize confirmation
-        caller.require_auth();
-        assert!(caller == new_admin, "caller is not the proposed new admin");
-
-        let _result = veritasor_common::key_rotation::confirm_rotation(&env, &new_admin);
-
-        // Transfer admin in dynamic_fees storage
+        // Transfer admin
+        let old_admin = pending.old_admin.clone();
         dynamic_fees::set_admin(&env, &new_admin);
-
-        // Transfer ADMIN role: revoke from old, grant to new
-        access_control::revoke_role(&env, &old_admin, ROLE_ADMIN);
         access_control::grant_role(&env, &new_admin, ROLE_ADMIN);
+        // Revoke old admin role
+        let old_roles = access_control::get_roles(&env, &old_admin);
+        access_control::set_roles(&env, &old_admin, old_roles & !ROLE_ADMIN);
+
+        // Clear pending
+        env.storage().instance().remove(&KeyRotationStorageKey::Pending);
+
+        // Record history
+        let entry = KeyRotationHistoryEntry {
+            old_admin: old_admin.clone(),
+            new_admin: new_admin.clone(),
+            sequence: seq,
+            is_emergency: false,
+        };
+        let mut history: Vec<KeyRotationHistoryEntry> = env
+            .storage()
+            .instance()
+            .get(&KeyRotationStorageKey::History)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.push_back(entry);
+        env.storage().instance().set(&KeyRotationStorageKey::History, &history);
 
         events::emit_key_rotation_confirmed(&env, &old_admin, &new_admin, false);
     }
 
-    /// Cancel a pending admin key rotation.
-    ///
-    /// Only the current admin (who proposed the rotation) can cancel.
     pub fn cancel_key_rotation(env: Env) {
-        let current_admin = dynamic_fees::require_admin(&env);
-        let request = veritasor_common::key_rotation::cancel_rotation(&env, &current_admin);
-        events::emit_key_rotation_cancelled(&env, &current_admin, &request.new_admin);
+        let pending: PendingKeyRotation = env
+            .storage()
+            .instance()
+            .get(&KeyRotationStorageKey::Pending)
+            .expect("no pending key rotation");
+        pending.old_admin.require_auth();
+        env.storage().instance().remove(&KeyRotationStorageKey::Pending);
+        events::emit_key_rotation_cancelled(&env, &pending.old_admin, &pending.new_admin);
     }
 
-    /// Check if there is a pending key rotation.
     pub fn has_pending_key_rotation(env: Env) -> bool {
-        veritasor_common::key_rotation::has_pending_rotation(&env)
+        env.storage()
+            .instance()
+            .has(&KeyRotationStorageKey::Pending)
     }
 
-    /// Get the pending key rotation details, if any.
-    pub fn get_pending_key_rotation(
-        env: Env,
-    ) -> Option<veritasor_common::key_rotation::RotationRequest> {
-        veritasor_common::key_rotation::get_pending_rotation(&env)
+    pub fn get_pending_key_rotation(env: Env) -> Option<PendingKeyRotation> {
+        env.storage()
+            .instance()
+            .get(&KeyRotationStorageKey::Pending)
     }
 
-    /// Get the key rotation history.
-    pub fn get_key_rotation_history(
-        env: Env,
-    ) -> Vec<veritasor_common::key_rotation::RotationRecord> {
-        veritasor_common::key_rotation::get_rotation_history(&env)
-    }
-
-    /// Get the total count of key rotations performed.
     pub fn get_key_rotation_count(env: Env) -> u32 {
-        veritasor_common::key_rotation::get_rotation_count(&env)
+        let history: Vec<KeyRotationHistoryEntry> = env
+            .storage()
+            .instance()
+            .get(&KeyRotationStorageKey::History)
+            .unwrap_or_else(|| Vec::new(&env));
+        history.len()
     }
 
-    /// Get the current key rotation configuration.
-    pub fn get_key_rotation_config(env: Env) -> veritasor_common::key_rotation::RotationConfig {
-        veritasor_common::key_rotation::get_rotation_config(&env)
-    }
-
-    // ── Dispute Methods ─────────────────────────────────────────────
-
-    /// Open a dispute against an attestation. Challenger must authorize.
-     pub fn open_dispute(
-         env: Env,
-         challenger: Address,
-         business: Address,
-         period: String,
-         dispute_type: DisputeType,
-         evidence: String,
-     ) -> u64 {
-         challenger.require_auth();
-         dispute::validate_dispute_eligibility(&env, &challenger, &business, &period)
-             .expect("dispute not eligible");
-         let dispute_id = dispute::generate_dispute_id(&env);
-         let d = Dispute {
-             id: dispute_id,
-             challenger: challenger.clone(),
-             business: business.clone(),
-             period: period.clone(),
-             status: DisputeStatus::Open,
-             dispute_type,
-             evidence,
-             timestamp: env.ledger().timestamp(),
-             resolution: dispute::MaybeResolution::None,
-         };
-         dispute::store_dispute(&env, &d);
-         dispute::add_dispute_to_attestation_index(&env, &business, &period, dispute_id);
-         dispute::add_dispute_to_challenger_index(&env, &challenger, dispute_id);
-         dispute_id
-     }
-
-     /// Resolve an open dispute. Caller must be admin.
-     pub fn resolve_dispute(
-         env: Env,
-         dispute_id: u64,
-         resolver: Address,
-         outcome: DisputeOutcome,
-         notes: String,
-     ) {
-         access_control::require_admin(&env, &resolver);
-         dispute::validate_dispute_resolution(&env, dispute_id, &resolver)
-             .expect("invalid dispute resolution");
-         let resolution = dispute::DisputeResolution {
-             resolver,
-             outcome,
-             timestamp: env.ledger().timestamp(),
-             notes,
-         };
-         dispute::store_dispute_resolution(&env, dispute_id, &resolution);
-         if let Some(mut d) = dispute::get_dispute(&env, dispute_id) {
-             d.status = DisputeStatus::Resolved;
-             d.resolution = dispute::MaybeResolution::Some(resolution);
-             dispute::store_dispute(&env, &d);
-         }
-     }
-
-    /// Close a resolved dispute.
-    pub fn close_dispute(env: Env, dispute_id: u64) {
-        let d = dispute::validate_dispute_closure(&env, dispute_id)
-            .expect("dispute not found or not resolved");
-        let mut updated = d;
-        updated.status = DisputeStatus::Closed;
-        dispute::store_dispute(&env, &updated);
-    }
-
-    /// Get a dispute by ID.
-    pub fn get_dispute(env: Env, dispute_id: u64) -> Option<Dispute> {
-        dispute::get_dispute(&env, dispute_id)
+    pub fn get_key_rotation_history(env: Env) -> Vec<KeyRotationHistoryEntry> {
+        env.storage()
+            .instance()
+            .get(&KeyRotationStorageKey::History)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+//  Key Rotation Supporting Types
+// ────────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeyRotationConfig {
+    pub timelock_ledgers: u32,
+    pub confirmation_window_ledgers: u32,
+    pub cooldown_ledgers: u32,
+    pub max_rotations: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingKeyRotation {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub timelock_until: u32,
+    pub expires_at: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeyRotationHistoryEntry {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub sequence: u32,
+    pub is_emergency: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+enum KeyRotationStorageKey {
+    Config,
+    Pending,
+    History,
+}
+
+#[cfg(test)]
+mod proof_hash_test;
+#[cfg(test)]
+mod property_test;
+#[cfg(test)]
+mod dynamic_fees_test;
+#[cfg(test)]
+mod fees_test;
+#[cfg(test)]
+mod rate_limit_test;
+#[cfg(test)]
+mod access_control_test;
+#[cfg(test)]
+mod anomaly_test;
+#[cfg(test)]
+mod attestor_staking_integration_test;
+#[cfg(test)]
+mod batch_submission_test;
+#[cfg(test)]
+mod dispute_test;
+#[cfg(test)]
+mod events_test;
+#[cfg(test)]
+mod multisig_test;
+#[cfg(test)]
+mod registry_test;
+#[cfg(test)]
+mod extended_metadata_test;
+#[cfg(test)]
+mod multi_period_test;
+#[cfg(test)]
+mod pause_test;
+#[cfg(test)]
+mod key_rotation_test;
+#[cfg(test)]
+mod gas_benchmark_test;
+#[cfg(test)]
+mod query_pagination_test;
+#[cfg(test)]
+mod expiry_test;
+#[cfg(test)]
+mod revocation_test;

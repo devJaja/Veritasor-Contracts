@@ -462,3 +462,31 @@ fn test_commitment_endianness_stability() {
     let h2 = client.compute_commitment(&biz, &p, &r, &v);
     assert_eq!(h, h2);
 }
+
+#[test]
+#[should_panic(expected = "proof_hash does not match canonical commitment")]
+fn test_submit_attestation_invalid_proof_hash_rejection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AttestationContract, ());
+    let client = AttestationContractClient::new(&env, &contract_id);
+
+    let business = Address::generate(&env);
+    let period = String::from_str(&env, "2026-01");
+    let root = BytesN::from_array(&env, &[0u8; 32]);
+    let version = 1;
+    
+    // Provide a random proof hash that won't match the commitment
+    let invalid_hash = BytesN::from_array(&env, &[0xAAu8; 32]);
+
+    client.submit_attestation(
+        &business,
+        &period,
+        &root,
+        &1_700_000_000u64,
+        &version,
+        &Some(invalid_hash),
+        &None,
+        &0u64,
+    );
+}

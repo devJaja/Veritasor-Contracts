@@ -22,7 +22,7 @@ fn setup() -> (Env, AttestationContractClient<'static>) {
     env.mock_all_auths();
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
-    client.initialize(&Address::generate(&env));
+    client.initialize(&Address::generate(&env), &0u64);
     (env, client)
 }
 
@@ -48,7 +48,7 @@ fn setup_with_fees(base_fee: i128) -> TestSetupWithFees<'static> {
 
     let contract_id = env.register(AttestationContract, ());
     let client = AttestationContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
+    client.initialize(&admin, &0u64);
     client.configure_fees(&token_addr, &collector, &base_fee, &true);
 
     TestSetupWithFees {
