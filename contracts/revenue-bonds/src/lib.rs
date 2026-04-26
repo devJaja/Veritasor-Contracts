@@ -143,7 +143,6 @@ pub struct Bond {
     pub token: Address,
     pub status: BondStatus,
     pub issued_at: u64,
-    pub issue_period: String,
 }
 
 /// Immutable record of a single period's redemption.
@@ -270,7 +269,6 @@ impl RevenueBondContract {
         min_payment_per_period: i128,
         max_payment_per_period: i128,
         maturity_periods: u32,
-        issue_period: String,
         attestation_contract: Address,
         token: Address,
     ) -> u64 {
@@ -281,7 +279,6 @@ impl RevenueBondContract {
         assert!(min_payment_per_period >= 0, "min_payment_per_period must be non-negative");
         assert!(max_payment_per_period > 0, "max_payment_per_period must be positive");
         assert!(max_payment_per_period >= min_payment_per_period, "max must be >= min");
-        parse_period(&env, issue_period.clone());
         assert!(maturity_periods > 0, "maturity_periods must be positive");
         assert!(!issuer.eq(&initial_owner), "issuer and owner must differ");
 

@@ -266,6 +266,32 @@ fn test_redeem_hybrid_bond() {
 // ─── Double-spend prevention ──────────────────────────────────────────────────
 
 #[test]
+#[should_panic(expected = "attested_revenue must be non-negative")]
+fn test_redeem_rejects_negative_attested_revenue() {
+    let (env, admin, issuer, owner, token, attestation_contract, _) = setup_test();
+    let contract_id = env.register(RevenueBondContract, ());
+    let client = RevenueBondContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+
+    let bond_id = client.issue_bond(
+        &issuer,
+        &owner,
+        &10_000_000,
+        &BondStructure::Fixed,
+        &0,
+        &500_000,
+        &500_000,
+        &12,
+        &attestation_contract,
+        &token,
+    );
+
+    let period = String::from_str(&env, "2026-02");
+    client.redeem(&bond_id, &period, &-1);
+}
+
+#[test]
 #[should_panic(expected = "already redeemed for period")]
 fn test_redeem_double_spending_prevention() {
     let (env, admin, issuer, owner, token, attestation_contract) = setup_test();
