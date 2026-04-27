@@ -429,11 +429,18 @@ impl RevenueBondContract {
         }
     }
 
-    /// Transfer bond ownership.
+    /// Transfer bond ownership to a new address.
+    ///
+    /// # Security Invariants
+    /// 1. The `current_owner` must authorize the transfer.
+    /// 2. The `current_owner` must match the stored owner of the bond.
+    /// 3. Cannot transfer to self (`current_owner == new_owner`).
+    /// 4. Cannot transfer to the bond issuer (prevents bypassing issuer restrictions).
+    /// 5. Cannot transfer to the contract itself (zero-address/placeholder guard).
+    /// 6. The bond must be in `Active` status.
     ///
     /// # Panics
-    /// Panics if the bond does not exist, the caller is not the owner, or
-    /// `current_owner == new_owner`.
+    /// Panics if any invariant is violated or if the bond is not found.
     pub fn transfer_ownership(env: Env, bond_id: u64, current_owner: Address, new_owner: Address) {
         current_owner.require_auth();
 
@@ -445,6 +452,16 @@ impl RevenueBondContract {
 
         assert_eq!(current_owner, stored_owner, "not bond owner");
         assert!(!current_owner.eq(&new_owner), "cannot transfer to self");
+
+        let bond: Bond = env
+            .storage()
+            .instance()
+            .get(&DataKey::Bond(bond_id))
+            .expect("bond not found");
+
+        assert_eq!(bond.status, BondStatus::Active, "bond not active");
+        assert!(!bond.issuer.eq(&new_owner), "cannot transfer to issuer");
+        assert!(!env.current_contract_address().eq(&new_owner), "cannot transfer to contract itself");
 
         env.storage().instance().set(&DataKey::BondOwner(bond_id), &new_owner);
     }
