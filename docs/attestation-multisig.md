@@ -13,7 +13,6 @@ It covers:
 
 This system is designed for operator-controlled governance actions under strict authorization and bounded state execution (Soroban / no_std patterns).
 
----
 
 ## 2. Core Design Principles
 
@@ -25,7 +24,6 @@ The multisig system follows these principles:
 - Protection against replay and stale proposals
 - Strict separation between proposal creation, voting, and execution
 
----
 
 ## 3. Proposal Creation
 
@@ -48,7 +46,6 @@ A proposal is created by an authorized operator.
 - Proposal ID must be unique
 - Payload must be validated before storage
 
----
 
 ## 4. Voting Process
 
@@ -64,7 +61,6 @@ Once created, a proposal enters a voting window.
 - Voting must occur within defined window
 - Votes cannot be modified after submission
 
----
 
 ## 5. Voting Window Rules
 
@@ -73,7 +69,6 @@ Once created, a proposal enters a voting window.
   - no additional votes are accepted
   - proposal becomes eligible for execution or rejection
 
----
 
 ## 6. Execution
 
@@ -94,7 +89,6 @@ A proposal is executed only if:
 - No partial state changes allowed
 - Reentrancy must be prevented via contract guards
 
----
 
 ## 7. Cancellation
 
@@ -108,7 +102,6 @@ Cancellation sets status to:
 
 No further voting or execution is allowed.
 
----
 
 ## 8. Security Assumptions
 
@@ -119,7 +112,6 @@ This system assumes:
 - Storage keys are isolated per proposal
 - No unauthorized state mutation paths exist
 
----
 
 ## 9. Threat Considerations
 
@@ -135,7 +127,6 @@ This system assumes:
 ### Unauthorized Voting
 - Blocked via explicit signer validation
 
----
 
 ## 10. Cross-Contract Safety
 
@@ -145,7 +136,6 @@ This module must not break:
 - Staking logic consistency
 - Revenue module accounting
 
----
 
 ## 11. Test Coverage References
 
@@ -159,7 +149,13 @@ Covers:
 - cancellation logic
 - invalid transitions
 
----
+Invariants
+- A proposal is immutable after execution
+- Only owners can modify proposal state
+- Approval is idempotent (but rejected on double vote)
+- Threshold must be reached before execution
+- Expired proposals cannot be executed
+
 
 ## 12. Summary
 
