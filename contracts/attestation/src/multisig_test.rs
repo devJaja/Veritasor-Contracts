@@ -468,7 +468,7 @@ fn test_multiple_proposals_independent() {
 }
 
 #[test]
-#[should_panic(expected = 'proposal is not pending')]
+#[should_panic(expected = "proposal is not pending")]
 fn test_cannot_approve_rejected_proposal() {
     let (_env, client, admin, owners) = setup_with_multisig();
     let owner2 = owners.get(1).unwrap();
@@ -480,7 +480,7 @@ fn test_cannot_approve_rejected_proposal() {
 }
 
 #[test]
-#[should_panic(expected = 'proposal is not pending')]
+#[should_panic(expected = "proposal is not pending")]
 fn test_cannot_execute_rejected_proposal() {
     let (_env, client, admin, owners) = setup_with_multisig();
     let owner2 = owners.get(1).unwrap();
@@ -551,7 +551,7 @@ fn test_threshold_rotation() {
 }
 
 #[test]
-#[should_panic(expected = 'new threshold cannot exceed number of owners')]
+#[should_panic(expected = "new threshold cannot exceed number of owners")]
 fn test_threshold_rotation_invalid_exceeds_owners() {
     let (_env, client, admin, owners) = setup_with_multisig();
 
