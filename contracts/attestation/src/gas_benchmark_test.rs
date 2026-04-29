@@ -794,7 +794,7 @@ mod wasm_size_edge_cases {
     /// Not recommended: opt-level = "z" vs "s" - "z" is smaller
     #[test]
     fn release_profile_size_optimization() {
-        std::println!("Release profile should use opt-level = \\"z\\" for size");
+        std::println!("Release profile should use opt-level = \"z\" for size");
         std::println!("Check: Cargo.toml [profile.release] section");
     }
 
@@ -804,7 +804,7 @@ mod wasm_size_edge_cases {
     /// strip = "symbols" explicitly removes them from the binary.
     #[test]
     fn release_profile_strip_symbols() {
-        std::println!("Release profile should have strip = \\"symbols\\"");
+        std::println!("Release profile should have strip = \"symbols\"");
         std::println!("Check: Cargo.toml [profile.release] section");
     }
 
@@ -872,7 +872,7 @@ fn fee_operation_bounded_storage() {
     for i in 0..5 {
         let period = String::from_str(&env, &std::format!("2026-{:02}", i + 1));
         let root = BytesN::from_array(&env, &[i as u8; 32]);
-        client.submit_attestation(&business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
+        client.submit_attestation(&business, &period, &root, &1_700_000_000u64, &1u32, &None, &None, &0u64);
     }
 
     // Fee storage should not grow unbounded
@@ -898,7 +898,7 @@ fn batch_submission_linear_scaling() {
         for i in 0..size {
             let period = String::from_str(&env, &std::format!("2026-batch-{}-{:02}", size, i));
             let root = BytesN::from_array(&env, &[i as u8; 32]);
-            client.submit_attestation(&business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
+            client.submit_attestation(&business, &period, &root, &1_700_000_000u64, &1u32, &None, &None, &0u64);
         }
 
         let after = BudgetSnapshot::capture(&env);
@@ -924,12 +924,12 @@ fn migration_does_not_accumulate() {
 
     // Initial submission
     let root1 = BytesN::from_array(&env, &[1u8; 32]);
-    client.submit_attestation(&business, &period, &root1, &1_700_000_000u64, &1u32, &None, &None);
+    client.submit_attestation(&business, &period, &root1, &1_700_000_000u64, &1u32, &None, &None, &0u64);
 
     // Multiple migrations
     for version in 2..=5 {
         let new_root = BytesN::from_array(&env, &[version as u8; 32]);
-        client.migrate_attestation(&admin, &business, &period, &new_root, &version);
+        client.migrate_attestation(&admin, &business, &period, &new_root, &version, &0u64);
     }
 
     // Should still have only one attestation stored
@@ -952,7 +952,7 @@ fn revocation_linear_storage() {
     for i in 0..10 {
         let period = String::from_str(&env, &std::format!("2026-rev-{:02}", i));
         let root = BytesN::from_array(&env, &[i as u8; 32]);
-        client.submit_attestation(&business, &period, &root, &1_700_000_000u64, &1u32, &None, &None);
+        client.submit_attestation(&business, &period, &root, &1_700_000_000u64, &1u32, &None, &None, &0u64);
         periods.push_back(period);
     }
 

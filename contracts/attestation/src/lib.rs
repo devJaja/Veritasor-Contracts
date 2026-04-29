@@ -409,35 +409,16 @@ impl AttestationContract {
         new_version: u32,
         _nonce: u64,
     ) {
-        admin.require_auth();
-        access_control::require_not_paused(&env);
-        dynamic_fees::require_admin(&env);
-
-        let key = DataKey::Attestation(business.clone(), period.clone());
-        let (old_root, ts, old_version, fee, ph, exp) = env
-            .storage()
-            .instance()
-            .get::<_, AttestationData>(&key)
-            .expect("attestation not found");
-
-        if new_version <= old_version {
-            panic!("new version must be greater than old version");
-        }
-
-        let data: AttestationData = (new_merkle_root.clone(), ts, new_version, fee, ph, exp);
-        env.storage().instance().set(&key, &data);
-
-        events::emit_attestation_migrated(
-            &env,
-            &business,
-            &period,
-            &old_root,
-            &new_merkle_root,
-            old_version,
-            new_version,
-            &admin,
-        );
+        // TODO: implement migration logic
+        unimplemented!("migrate_attestation not implemented");
     }
+
+    /// Submit a revenue attestation with extended metadata (currency and net/gross).
+    ///
+    /// Same as `submit_attestation` but also stores currency code and revenue basis.
+    /// * `currency_code` – ISO 4217-style code, e.g. "USD", "EUR". Alphabetic, max 3 chars.
+    /// * `is_net` – `true` for net revenue, `false` for gross revenue.
+
 
     pub fn submit_multi_period_attestation(
         env: Env,
@@ -551,6 +532,8 @@ impl AttestationContract {
         let record = Self::get_attestation(env, business, period);
         record.and_then(|(_, _, _, _, ph, _)| ph)
     }
+
+
 
     pub fn get_attestation_for_period(
         env: Env,

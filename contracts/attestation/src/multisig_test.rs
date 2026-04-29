@@ -564,3 +564,41 @@ fn test_threshold_rotation_invalid_exceeds_owners() {
     client.execute_proposal(&admin, &proposal_id, &1u64);
 }
 
+#[test]
+fn test_owner_cannot_approve_twice() {
+    let env = Env::default();
+
+    let owner = Address::generate(&env);
+
+    let id = create_proposal(&env, &owner, ProposalAction::Pause);
+
+    approve_proposal(&env, &owner, id);
+
+    let result = std::panic::catch_unwind(|| {
+        approve_proposal(&env, &owner, id);
+    });
+
+    assert!(result.is_err());
+}
+
+
+#[test]
+fn test_non_owner_cannot_approve() {
+    let env = Env::default();
+
+    let owner = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let id = create_proposal(&env, &owner, ProposalAction::Pause);
+
+    let result = std::panic::catch_unwind(|| {
+        approve_proposal(&env, &attacker, id);
+    });
+
+    assert!(result.is_err());
+}
+
+
+
+
+
