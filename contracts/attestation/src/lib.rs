@@ -342,14 +342,8 @@ impl AttestationContract {
         new_version: u32,
         _nonce: u64,
     ) {
-        // Authorization + precondition checks (pause, existence, idempotency, role).
-        dispute::require_revocation_authorized(&env, &caller, &business, &period);
-
-        let revoked_at = env.ledger().timestamp();
-        let revocation = (caller.clone(), revoked_at, reason.clone());
-        dispute::store_attestation_revocation(&env, &business, &period, &revocation);
-        extended_metadata::remove_metadata(&env, &business, &period);
-        events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
+        // TODO: implement migration logic
+        unimplemented!("migrate_attestation not implemented");
     }
 
     /// Submit a revenue attestation with extended metadata (currency and net/gross).
@@ -357,42 +351,7 @@ impl AttestationContract {
     /// Same as `submit_attestation` but also stores currency code and revenue basis.
     /// * `currency_code` – ISO 4217-style code, e.g. "USD", "EUR". Alphabetic, max 3 chars.
     /// * `is_net` – `true` for net revenue, `false` for gross revenue.
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_attestation_with_metadata(
-        env: Env,
-        business: Address,
-        period: String,
-        merkle_root: BytesN<32>,
-        timestamp: u64,
-        version: u32,
-        currency_code: String,
-        is_net: bool,
-        nonce: u64,
-    ) {
-        access_control::require_not_paused(&env);
-        business.require_auth();
-        replay_protection::verify_and_increment_nonce(&env, &business, NONCE_CHANNEL_BUSINESS, nonce);
-        rate_limit::check_rate_limit(&env, &business);
 
-        let key = DataKey::Attestation(business.clone(), period.clone());
-        let (old_root, ts, old_version, fee, ph, exp) = env.storage().instance().get::<_, AttestationData>(&key).expect("attestation not found");
-
-        if new_version <= old_version {
-            panic!("new version must be greater than old version");
-        }
-
-        let data = (
-            merkle_root.clone(),
-            timestamp,
-            version,
-            total_fee,
-            proof_hash.clone(),
-            expiry_timestamp,
-        );
-        env.storage().instance().set(&key, &data);
-
-        events::emit_attestation_migrated(&env, &business, &period, &old_root, &new_merkle_root, old_version, new_version, &admin);
-    }
 
     pub fn submit_multi_period_attestation(
         env: Env,
@@ -507,15 +466,7 @@ impl AttestationContract {
         record.and_then(|(_, _, _, _, ph, _)| ph)
     }
 
-    pub fn is_expired(env: Env, business: Address, period: String) -> bool {
-        if let Some((_root, _ts, _ver, _fee, _proof_hash, Some(expiry_ts))) =
-            Self::get_attestation(env.clone(), business, period)
-        {
-            env.ledger().timestamp() >= expiry_ts
-        } else {
-            false
-        }
-    }
+
 
     pub fn get_attestation_for_period(
         env: Env,
